@@ -1,0 +1,45 @@
+class Box {
+    public $items;
+    public func __construct() { $this->items = []; }
+    public func add($x) { $this->items[] = $x; }
+}
+func local() {
+    $tmp = [1, 2, 3];
+    $sum = 0;
+    foreach ($tmp as $t) { $sum += $t; }
+    echo($tmp, $sum);
+    return $sum;
+}
+func giveBack() {
+    $out = [1, 2];
+    $out[] = 3;
+    return $out;
+}
+func keep($b) {
+    $o = new Box();
+    $b->add($o);
+    $local = new Box();
+    echo(count($local));
+    return null;
+}
+func captured() {
+    $cfg = ["a" => 1];
+    $f = fn($x) => $x + $cfg["a"];
+    return $f(2);
+}
+func throws() {
+    $e = new Exception("x");
+    throw $e;
+}
+func alias() {
+    $a = [1];
+    $b = $a;
+    return $b;
+}
+func bad() {
+    return $missing + 1;
+}
+func closureBad() {
+    $g = fn() => $nowhere;
+    return $g();
+}
