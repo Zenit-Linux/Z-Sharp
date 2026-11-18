@@ -1,0 +1,3 @@
+import Workspace.parser;
+import Workspace.sema;
+echo(sema.report(sema.analyze(parser.parse(File.read(System.args()[1])))));
