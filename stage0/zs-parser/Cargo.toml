@@ -1,0 +1,7 @@
+[package]
+name = "zs-parser"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+zs-lexer = { path = "../zs-lexer" }
