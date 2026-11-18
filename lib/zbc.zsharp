@@ -1,0 +1,57 @@
+namespace zbc;
+
+import Workspace.parser;
+
+class ZbcTables {
+    const BUILTIN = ["System", "Math", "File", "Directory", "Process", "Task"];
+}
+
+class Bundler {
+    public $mods;
+    public $files;
+
+    public func __construct() {
+        $this->mods = [];
+        $this->files = [];
+    }
+
+    public func scan($stmts, $dir) {
+        foreach ($stmts as $s) {
+            if ($s[0] !== ":Import") { continue; }
+            $path = $s[2];
+            if (in_array($path[0], ZbcTables.BUILTIN)) { continue; }
+            $key = join($path, ".");
+            $file = System.resolveImport($path, $dir);
+            if ($file === null) { throw new Exception("nie znaleziono modułu " . $key . " (import w " . $dir . ")"); }
+            if (has_key($this->mods, $key)) {
+                if ($this->files[$key] !== $file) {
+                    throw new Exception("niejednoznaczny import `" . $key . "`: " . $this->files[$key] . " oraz " . $file);
+                }
+                continue;
+            }
+            $this->files[$key] = $file;
+            $this->mods[$key] = [];            # rezerwacja miejsca (importy cykliczne)
+            $ast = parser.parse(File.read($file));
+            $this->mods[$key] = $ast;
+            $this->scan($ast, System.dirname($file));
+        }
+    }
+}
+
+##
+ * Buduje zawartość `.zbc` dla pliku wejściowego (parsuje frontendem Z#, rozwiązuje importy przez Z#.toml).
+##
+func bundle($entryFile) {
+    $b = new Bundler();
+    $ast = parser.parse(File.read($entryFile));
+    $b->scan($ast, System.dirname($entryFile));
+    $lines = ["ZBC 1"];
+    foreach ($b->mods as $key => $stmts) {
+        $lines[] = "@@module " . $key;
+        foreach ($stmts as $s) { $lines[] = parser.dump($s); }
+    }
+    $lines[] = "@@entry";
+    foreach ($ast as $s) { $lines[] = parser.dump($s); }
+    $lines[] = "";
+    return join($lines, "\n");
+}
