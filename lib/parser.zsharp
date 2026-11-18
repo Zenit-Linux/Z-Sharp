@@ -1,0 +1,644 @@
+namespace parser;
+
+import Workspace.lexer;
+
+class ParseError extends Exception {
+    public $lineNo;
+    public $colNo;
+    public func __construct($message, $line, $col) {
+        parent.__construct($line . ":" . $col . ": " . $message);
+        $this->lineNo = $line;
+        $this->colNo = $col;
+    }
+}
+
+class Tables {
+    # lbp, rbp, rodzaj, nazwa operatora — identycznie jak w stage0/zs-parser/src/parser.rs
+    const BP = [
+        "="   => [5, 5, "assign", null],
+        "+="  => [5, 5, "assignop", "Add"], "-=" => [5, 5, "assignop", "Sub"], "*=" => [5, 5, "assignop", "Mul"],
+        "/="  => [5, 5, "assignop", "Div"], "%=" => [5, 5, "assignop", "Mod"], ".=" => [5, 5, "assignop", "Concat"],
+        "??=" => [5, 5, "assignop", "Coalesce"],
+        "?"   => [6, 7, "ternary", null],
+        "??"  => [8, 8, "bin", "Coalesce"],
+        "||"  => [9, 10, "bin", "Or"], "&&" => [10, 11, "bin", "And"],
+        "|"   => [11, 12, "bin", "BitOr"], "^" => [12, 13, "bin", "BitXor"], "&" => [13, 14, "bin", "BitAnd"],
+        "=="  => [14, 15, "bin", "Eq"], "!=" => [14, 15, "bin", "NotEq"],
+        "===" => [14, 15, "bin", "Identical"], "!==" => [14, 15, "bin", "NotIdentical"],
+        "<"   => [15, 16, "bin", "Lt"], ">" => [15, 16, "bin", "Gt"], "<=" => [15, 16, "bin", "Le"], ">=" => [15, 16, "bin", "Ge"],
+        "."   => [16, 17, "bin", "Concat"],
+        "<<"  => [17, 18, "bin", "Shl"], ">>" => [17, 18, "bin", "Shr"],
+        "+"   => [18, 19, "bin", "Add"], "-" => [18, 19, "bin", "Sub"],
+        "*"   => [19, 20, "bin", "Mul"], "/" => [19, 20, "bin", "Div"], "%" => [19, 20, "bin", "Mod"],
+        "**"  => [23, 22, "bin", "Pow"]
+    ];
+    const KWBP = [
+        "or" => [1, 2, "bin", "Or"], "xor" => [2, 3, "bin", "Xor"], "and" => [3, 4, "bin", "And"]
+    ];
+}
+
+func node($kind, $line, ...$rest) {
+    $a = [":" . $kind, $line];
+    foreach ($rest as $x) { $a[] = $x; }
+    return $a;
+}
+
+func isNode($v) {
+    return is_array($v) && count($v) > 1 && is_string($v[0]) && starts_with($v[0], ":");
+}
+
+func isNamePath($e) {
+    if ($e[0] === ":Name") { return true; }
+    if ($e[0] === ":Dot") { return isNamePath($e[2]); }
+    return false;
+}
+
+class Parser {
+    public $toks;
+    public $pos;
+    public $last;
+
+    public func __construct($toks) {
+        $this->toks = $toks;
+        $this->pos = 0;
+        $this->last = count($toks) - 1;
+    }
+
+    # ---------- narzędzia ----------
+    func cur() { return $this->toks[$this->pos < $this->last ? $this->pos : $this->last]; }
+    func at($n) { $i = $this->pos + $n; return $this->toks[$i < $this->last ? $i : $this->last]; }
+    func line() { return $this->cur()["line"]; }
+    func atEof() { return $this->cur()["kind"] === "eof"; }
+    func bump() { $t = $this->cur(); if ($this->pos < $this->last) { $this->pos++; } return $t; }
+    func back() { $this->pos--; }
+    func fail($msg) { $t = $this->cur(); throw new ParseError($msg, $t["line"], $t["col"]); }
+    func isOp($s) { $t = $this->cur(); return $t["kind"] === "op" && $t["text"] === $s; }
+    func isKw($s) { $t = $this->cur(); return $t["kind"] === "kw" && $t["text"] === $s; }
+    func isWord($s) { $t = $this->cur(); return $t["kind"] === "ident" && $t["text"] === $s; }
+    func isVar() { return $this->cur()["kind"] === "var"; }
+    func eatOp($s) { if ($this->isOp($s)) { $this->bump(); return true; } return false; }
+    func eatKw($s) { if ($this->isKw($s)) { $this->bump(); return true; } return false; }
+    func eatWord($s) { if ($this->isWord($s)) { $this->bump(); return true; } return false; }
+    func expectOp($s) {
+        if (!$this->eatOp($s)) { $this->fail("oczekiwano `" . $s . "`, jest `" . $this->cur()["text"] . "`"); }
+    }
+    func ident() {
+        $t = $this->bump();
+        if ($t["kind"] !== "ident") { $this->back(); $this->fail("oczekiwano identyfikatora, jest `" . $this->cur()["text"] . "`"); }
+        return $t["text"];
+    }
+    func varName() {
+        $t = $this->bump();
+        if ($t["kind"] !== "var") { $this->back(); $this->fail("oczekiwano zmiennej"); }
+        return $t["value"];
+    }
+    func isFuncKw() { return $this->isKw("func") || $this->isWord("function"); }
+
+    # ---------- instrukcje ----------
+    func block() {
+        $this->expectOp("{");
+        $v = [];
+        while (!$this->isOp("}")) {
+            if ($this->atEof()) { $this->fail("niezamknięty blok `{`"); }
+            $v[] = $this->stmt();
+        }
+        $this->bump();
+        return $v;
+    }
+
+    func body() {
+        if ($this->isOp("{")) { return $this->block(); }
+        return [$this->stmt()];
+    }
+
+    func parenExpr() {
+        $this->expectOp("(");
+        $e = $this->expr();
+        $this->expectOp(")");
+        return $e;
+    }
+
+    func path() {
+        $v = [$this->ident()];
+        while ($this->eatOp(".")) { $v[] = $this->ident(); }
+        return $v;
+    }
+
+    func stmt() {
+        $line = $this->line();
+        $t = $this->cur();
+        $k = $t["kind"];
+        $x = $t["text"];
+        if ($k === "op" && $x === "{") { return node("Block", $line, $this->block()); }
+        if ($k === "op" && $x === ";") { $this->bump(); return node("Block", $line, []); }
+        if ($k === "kw") {
+            if ($x === "if") { $this->bump(); return $this->ifRest($line); }
+            if ($x === "while") {
+                $this->bump(); $c = $this->parenExpr(); $b = $this->body();
+                return node("While", $line, $c, $b);
+            }
+            if ($x === "do") {
+                $this->bump(); $b = $this->body();
+                if (!$this->eatKw("while")) { $this->fail("oczekiwano `while` po `do`"); }
+                $c = $this->parenExpr(); $this->eatOp(";");
+                return node("DoWhile", $line, $b, $c);
+            }
+            if ($x === "for") { return $this->forStmt($line); }
+            if ($x === "foreach") { return $this->foreachStmt($line); }
+            if ($x === "switch") { return $this->switchStmt($line); }
+            if ($x === "return") {
+                $this->bump();
+                $e = $this->isOp(";") ? null : $this->expr();
+                $this->expectOp(";");
+                return node("Return", $line, $e);
+            }
+            if ($x === "break" || $x === "continue") {
+                $this->bump();
+                $n = 1;
+                if ($this->cur()["kind"] === "int") { $n = $this->bump()["value"]; }
+                $this->expectOp(";");
+                return node($x === "break" ? "Break" : "Continue", $line, $n);
+            }
+            if ($x === "throw") { $this->bump(); $e = $this->expr(); $this->expectOp(";"); return node("Throw", $line, $e); }
+            if ($x === "try") { return $this->tryStmt($line); }
+            if ($x === "echo") {
+                $this->bump();
+                $v = [$this->expr()];
+                while ($this->eatOp(",")) { $v[] = $this->expr(); }
+                $this->expectOp(";");
+                return node("Echo", $line, $v);
+            }
+            if ($x === "import") { $this->bump(); $p = $this->path(); $this->expectOp(";"); return node("Import", $line, $p); }
+            if ($x === "namespace") { $this->bump(); $p = $this->path(); $this->expectOp(";"); return node("Namespace", $line, $p); }
+            if ($x === "using") {
+                $this->bump();
+                $r = $this->expr();
+                if (!$this->eatKw("as")) { $this->fail("oczekiwano `as` w `using`"); }
+                $t2 = $this->bump();
+                if ($t2["kind"] !== "var") { $this->back(); $this->fail("oczekiwano zmiennej po `as`"); }
+                $b = $this->block();
+                return node("Using", $line, $r, $t2["value"], $b);
+            }
+            if ($x === "extern") { return $this->externStmt($line); }
+            if ($x === "class" || $x === "interface" || $x === "abstract") { return $this->classDecl($line); }
+        }
+        if ($this->isFuncKw() && $this->at(1)["kind"] === "ident") {
+            $this->bump();
+            return node("FuncStmt", $line, $this->funcRest(true));
+        }
+        $e = $this->expr();
+        $this->expectOp(";");
+        return node("Expr", $line, $e);
+    }
+
+    func ifRest($line) {
+        $c = $this->parenExpr();
+        $then = $this->body();
+        $els = null;
+        if ($this->isKw("elseif")) {
+            $l = $this->line(); $this->bump(); $els = [$this->ifRest($l)];
+        } else if ($this->isKw("else")) {
+            $this->bump();
+            if ($this->isKw("if")) { $l = $this->line(); $this->bump(); $els = [$this->ifRest($l)]; }
+            else { $els = $this->body(); }
+        }
+        return node("If", $line, $c, $then, $els);
+    }
+
+    func exprList($close) {
+        $v = [];
+        if (!$this->isOp($close)) {
+            $v[] = $this->expr();
+            while ($this->eatOp(",")) { $v[] = $this->expr(); }
+        }
+        return $v;
+    }
+
+    func forStmt($line) {
+        $this->bump(); $this->expectOp("(");
+        $init = $this->exprList(";");
+        $this->expectOp(";");
+        $cond = $this->isOp(";") ? null : $this->expr();
+        $this->expectOp(";");
+        $step = $this->exprList(")");
+        $this->expectOp(")");
+        $b = $this->body();
+        return node("For", $line, $init, $cond, $step, $b);
+    }
+
+    func foreachStmt($line) {
+        $this->bump(); $this->expectOp("(");
+        $iter = $this->expr();
+        if (!$this->eatKw("as")) { $this->fail("oczekiwano `as` w foreach"); }
+        $first = $this->varName();
+        $key = null;
+        $value = $first;
+        if ($this->eatOp("=>")) { $key = $first; $value = $this->varName(); }
+        $this->expectOp(")");
+        $b = $this->body();
+        return node("Foreach", $line, $iter, $key, $value, $b);
+    }
+
+    func switchStmt($line) {
+        $this->bump();
+        $subject = $this->parenExpr();
+        $this->expectOp("{");
+        $cases = [];
+        while (!$this->isOp("}")) {
+            $cond = null;
+            if ($this->eatKw("case")) { $cond = $this->expr(); }
+            else if ($this->eatKw("default")) { $cond = null; }
+            else { $this->fail("oczekiwano `case` lub `default`"); }
+            if (!$this->eatOp(":")) { $this->expectOp(";"); }
+            $body = [];
+            while (!$this->isKw("case") && !$this->isKw("default") && !$this->isOp("}")) {
+                if ($this->atEof()) { $this->fail("niezamknięty switch"); }
+                $body[] = $this->stmt();
+            }
+            $cases[] = node("Case", 0, $cond, $body);
+        }
+        $this->bump();
+        return node("Switch", $line, $subject, $cases);
+    }
+
+    func tryStmt($line) {
+        $this->bump();
+        $body = $this->block();
+        $catches = [];
+        while ($this->eatKw("catch")) {
+            $this->expectOp("(");
+            $types = [$this->ident()];
+            while ($this->eatOp("|")) { $types[] = $this->ident(); }
+            $var = null;
+            if ($this->isVar()) { $var = $this->varName(); }
+            $this->expectOp(")");
+            $b = $this->block();
+            $catches[] = node("Catch", 0, $types, $var, $b);
+        }
+        $finally = null;
+        if ($this->eatKw("finally")) { $finally = $this->block(); }
+        if (count($catches) === 0 && $finally === null) { $this->fail("try wymaga catch lub finally"); }
+        return node("Try", $line, $body, $catches, $finally);
+    }
+
+    func externStmt($line) {
+        $this->bump();
+        $t = $this->bump();
+        if ($t["kind"] !== "str") { $this->back(); $this->fail("extern wymaga nazwy biblioteki w cudzysłowie"); }
+        $lib = $t["value"];
+        $items = [];
+        if ($this->eatOp(";")) { return node("Extern", $line, $lib, $items); }
+        $this->expectOp("{");
+        while (!$this->isOp("}")) {
+            if (!$this->isFuncKw()) { $this->fail("w extern oczekiwano `func`"); }
+            $this->bump();
+            $name = $this->ident();
+            $params = $this->params();
+            $ret = $this->eatOp(":") ? $this->types() : [];
+            $this->expectOp(";");
+            $items[] = node("ExternItem", 0, $name, $params, $ret);
+        }
+        $this->bump();
+        return node("Extern", $line, $lib, $items);
+    }
+
+    # ---------- funkcje, typy, klasy ----------
+    func types() {
+        $v = [];
+        if ($this->eatOp("?")) { $v[] = "null"; }
+        while (true) {
+            $t = $this->bump();
+            if ($t["kind"] === "ident") { $v[] = $t["text"]; }
+            else if ($t["kind"] === "kw" && $t["text"] === "null") { $v[] = "null"; }
+            else if ($t["kind"] === "kw" && $t["text"] === "static") { $v[] = "static"; }
+            else if ($t["kind"] === "kw" && ($t["text"] === "fn" || $t["text"] === "func")) { $v[] = "function"; }
+            else { $this->back(); $this->fail("oczekiwano nazwy typu"); }
+            if (!$this->eatOp("|")) { break; }
+        }
+        return $v;
+    }
+
+    func params() {
+        $this->expectOp("(");
+        $ps = [];
+        while (!$this->isOp(")")) {
+            $types = ($this->isVar() || $this->isOp("...")) ? [] : $this->types();
+            $variadic = $this->eatOp("...");
+            $name = $this->varName();
+            $default = $this->eatOp("=") ? $this->expr() : null;
+            $ps[] = node("Param", 0, $name, $types, $default, $variadic);
+            if (!$this->eatOp(",")) { break; }
+        }
+        $this->expectOp(")");
+        return $ps;
+    }
+
+    func funcRest($named) {
+        $line = $this->line();
+        $name = $named ? $this->ident() : null;
+        $params = $this->params();
+        $ret = $this->eatOp(":") ? $this->types() : [];
+        $body = $this->block();
+        return node("Func", $line, $name, $params, $ret, $body, false);
+    }
+
+    func classDecl($line) {
+        $isAbstract = $this->eatKw("abstract");
+        $isInterface = false;
+        if ($this->eatKw("interface")) { $isInterface = true; }
+        else if (!$this->eatKw("class")) { $this->fail("oczekiwano `class`"); }
+        $name = $this->ident();
+        $parent = null;
+        $ifaces = [];
+        if ($this->eatKw("extends")) {
+            if ($isInterface) {
+                $ifaces[] = $this->ident();
+                while ($this->eatOp(",")) { $ifaces[] = $this->ident(); }
+            } else { $parent = $this->ident(); }
+        }
+        if ($this->eatKw("implements")) {
+            $ifaces[] = $this->ident();
+            while ($this->eatOp(",")) { $ifaces[] = $this->ident(); }
+        }
+        $this->expectOp("{");
+        $props = [];
+        $consts = [];
+        $methods = [];
+        while (!$this->isOp("}")) {
+            if ($this->atEof()) { $this->fail("niezamknięta klasa"); }
+            $isStatic = false;
+            $abs = false;
+            while (true) {
+                if ($this->eatKw("public") || $this->eatKw("private") || $this->eatKw("protected") || $this->eatWord("final")) { }
+                else if ($this->eatKw("static")) { $isStatic = true; }
+                else if ($this->eatKw("abstract")) { $abs = true; }
+                else { break; }
+            }
+            if ($this->eatWord("const")) {
+                $n = $this->ident(); $this->expectOp("="); $e = $this->expr(); $this->expectOp(";");
+                $consts[] = node("Const", 0, $n, $e);
+            } else if ($this->isFuncKw()) {
+                $this->bump();
+                $l = $this->line();
+                $n = $this->ident();
+                $params = $this->params();
+                $ret = $this->eatOp(":") ? $this->types() : [];
+                $isAbs = false;
+                $mbody = [];
+                if ($this->eatOp(";")) { $isAbs = true; } else { $mbody = $this->block(); }
+                $decl = node("Func", $l, $n, $params, $ret, $mbody, false);
+                $methods[] = node("Method", 0, $decl, $isStatic, $abs || $isAbs);
+            } else {
+                if (!$this->isVar()) { $this->types(); }
+                $n = $this->varName();
+                $default = $this->eatOp("=") ? $this->expr() : null;
+                $this->expectOp(";");
+                $props[] = node("Prop", 0, $n, $default, $isStatic);
+            }
+        }
+        $this->bump();
+        return node("ClassStmt", $line, node("Class", $line, $name, $parent, $ifaces, $isInterface, $isAbstract, $props, $consts, $methods));
+    }
+
+    # ---------- wyrażenia ----------
+    func expr() { return $this->exprBp(0); }
+
+    func checkLvalue($e) {
+        $k = $e[0];
+        if ($k === ":Var" || $k === ":Index" || $k === ":Prop" || $k === ":Dot") { return; }
+        $this->fail("lewa strona przypisania nie jest l-wartością");
+    }
+
+    func exprBp($min) {
+        $lhs = $this->unary();
+        while (true) {
+            $line = $this->line();
+            $t = $this->cur();
+            $ent = null;
+            if ($t["kind"] === "op") { $ent = Tables.BP[$t["text"]] ?? null; }
+            else if ($t["kind"] === "kw") { $ent = Tables.KWBP[$t["text"]] ?? null; }
+            else if ($t["kind"] === "ident" && $t["text"] === "instanceof") { $ent = [16, 17, "instanceof", null]; }
+            if ($ent === null) { break; }
+            $lbp = $ent[0];
+            $rbp = $ent[1];
+            $kind = $ent[2];
+            if ($lbp < $min) { break; }
+            $this->bump();
+            if ($kind === "bin") {
+                $r = $this->exprBp($rbp);
+                $lhs = node("Binary", $line, $ent[3], $lhs, $r);
+            } else if ($kind === "assign") {
+                $this->checkLvalue($lhs);
+                $r = $this->exprBp($rbp);
+                $lhs = node("Assign", $line, $lhs, $r);
+            } else if ($kind === "assignop") {
+                $this->checkLvalue($lhs);
+                $r = $this->exprBp($rbp);
+                $lhs = node("AssignOp", $line, $ent[3], $lhs, $r);
+            } else if ($kind === "ternary") {
+                $then = $this->isOp(":") ? null : $this->exprBp(0);
+                $this->expectOp(":");
+                $els = $this->exprBp($rbp);
+                $lhs = node("Ternary", $line, $lhs, $then, $els);
+            } else {
+                $n = $this->ident();
+                $lhs = node("InstanceOf", $line, $lhs, $n);
+            }
+        }
+        return $lhs;
+    }
+
+    func unary() {
+        $line = $this->line();
+        $t = $this->cur();
+        if ($t["kind"] === "op") {
+            $x = $t["text"];
+            if ($x === "!" || $x === "-" || $x === "+" || $x === "~") {
+                $this->bump();
+                $e = $this->exprBp(21);
+                $name = $x === "!" ? "Not" : ($x === "-" ? "Neg" : ($x === "+" ? "Plus" : "BitNot"));
+                return node("Unary", $line, $name, $e);
+            }
+            if ($x === "++" || $x === "--") {
+                $this->bump();
+                $e = $this->unary();
+                $this->checkLvalue($e);
+                return node("IncDec", $line, $e, $x === "++", true);
+            }
+        }
+        if ($t["kind"] === "kw" && $t["text"] === "await") {
+            $this->bump();
+            $e = $this->unary();
+            return node("Await", $line, $e);
+        }
+        return $this->postfix();
+    }
+
+    func args() {
+        $this->expectOp("(");
+        $v = [];
+        while (!$this->isOp(")")) {
+            $spread = $this->eatOp("...");
+            $name = null;
+            if ($this->cur()["kind"] === "ident" && $this->at(1)["kind"] === "op" && $this->at(1)["text"] === ":") {
+                $name = $this->ident();
+                $this->bump();
+            }
+            $v[] = node("Arg", 0, $name, $this->expr(), $spread);
+            if (!$this->eatOp(",")) { break; }
+        }
+        $this->expectOp(")");
+        return $v;
+    }
+
+    func postfix() {
+        $e = $this->primary();
+        while (true) {
+            $line = $this->line();
+            $t = $this->cur();
+            if ($t["kind"] !== "op") { break; }
+            $x = $t["text"];
+            if ($x === "(") {
+                $a = $this->args();
+                $e = node("Call", $line, $e, $a);
+            } else if ($x === "[") {
+                $this->bump();
+                $idx = $this->isOp("]") ? null : $this->expr();
+                $this->expectOp("]");
+                $e = node("Index", $line, $e, $idx);
+            } else if ($x === "->") {
+                $this->bump();
+                $n = $this->ident();
+                $e = node("Prop", $line, $e, $n);
+            } else if ($x === "." && isNamePath($e) && $this->at(1)["kind"] === "ident") {
+                $this->bump();
+                $n = $this->ident();
+                $e = node("Dot", $line, $e, $n);
+            } else if ($x === "++" || $x === "--") {
+                $this->bump();
+                $this->checkLvalue($e);
+                $e = node("IncDec", $line, $e, $x === "++", false);
+            } else { break; }
+        }
+        return $e;
+    }
+
+    func primary() {
+        $line = $this->line();
+        $t = $this->bump();
+        $k = $t["kind"];
+        $x = $t["text"];
+        if ($k === "int") { return node("Int", $line, $t["value"]); }
+        if ($k === "float") { return node("Float", $line, $t["value"]); }
+        if ($k === "str") { return node("Str", $line, $t["value"]); }
+        if ($k === "var") { return node("Var", $line, $t["value"]); }
+        if ($k === "kw") {
+            if ($x === "true") { return node("Bool", $line, true); }
+            if ($x === "false") { return node("Bool", $line, false); }
+            if ($x === "null") { return node("Null", $line); }
+            if ($x === "static") { return node("Name", $line, "static"); }
+            if ($x === "new") {
+                $n = $this->ident();
+                $a = $this->isOp("(") ? $this->args() : [];
+                return node("New", $line, $n, $a);
+            }
+            if ($x === "match") { return $this->matchExpr($line); }
+            if ($x === "fn") {
+                $params = $this->params();
+                $ret = $this->eatOp(":") ? $this->types() : [];
+                $this->expectOp("=>");
+                $body = $this->exprBp(5);
+                $d = node("Func", $line, null, $params, $ret, [node("Return", $body[1], $body)], true);
+                return node("Closure", $line, $d);
+            }
+            if ($x === "func") { return node("Closure", $line, $this->funcRest(false)); }
+        }
+        if ($k === "ident") {
+            if ($x === "function" && $this->isOp("(")) { return node("Closure", $line, $this->funcRest(false)); }
+            return node("Name", $line, $x);
+        }
+        if ($k === "op" && $x === "(") {
+            $e = $this->expr();
+            $this->expectOp(")");
+            return $e;
+        }
+        if ($k === "op" && $x === "[") {
+            $items = [];
+            while (!$this->isOp("]")) {
+                $first = $this->expr();
+                if ($this->eatOp("=>")) { $v = $this->expr(); $items[] = node("Item", 0, $first, $v); }
+                else { $items[] = node("Item", 0, null, $first); }
+                if (!$this->eatOp(",")) { break; }
+            }
+            $this->expectOp("]");
+            return node("Array", $line, $items);
+        }
+        $this->back();
+        $this->fail("nieoczekiwany token w wyrażeniu: `" . $x . "`");
+    }
+
+    func matchExpr($line) {
+        $subj = $this->parenExpr();
+        $this->expectOp("{");
+        $arms = [];
+        while (!$this->isOp("}")) {
+            $conds = null;
+            if (!$this->eatKw("default")) {
+                $conds = [$this->expr()];
+                while ($this->eatOp(",")) {
+                    if ($this->isOp("=>")) { break; }
+                    $conds[] = $this->expr();
+                }
+            }
+            $this->expectOp("=>");
+            $body = $this->expr();
+            $arms[] = node("Arm", 0, $conds, $body);
+            if (!$this->eatOp(",")) { break; }
+        }
+        $this->expectOp("}");
+        return node("Match", $line, $subj, $arms);
+    }
+}
+
+##
+ * Parsuje źródło Z# do listy instrukcji. Rzuca ParseError (lineNo/colNo) lub lexer.LexError.
+##
+func parse($src) {
+    $all = lexer.tokenize($src);
+    $toks = [];
+    foreach ($all as $t) {
+        if ($t["kind"] !== "shebang" && $t["kind"] !== "doc") { $toks[] = $t; }
+    }
+    $p = new Parser($toks);
+    $out = [];
+    while (!$p->atEof()) { $out[] = $p->stmt(); }
+    return $out;
+}
+
+func escapeStr($s) {
+    $s = replace($s, "\\", "\\\\");
+    $s = replace($s, "\"", "\\\"");
+    $s = replace($s, "\n", "\\n");
+    $s = replace($s, "\t", "\\t");
+    $s = replace($s, "\r", "\\r");
+    return "\"" . $s . "\"";
+}
+
+##
+ * Kanoniczny zapis S-expression drzewa (identyczny z `zsc0 --sexp`), używany w testach parytetu.
+##
+func dump($v) {
+    if ($v === null) { return "_"; }
+    if (is_bool($v)) { return $v ? "true" : "false"; }
+    if (is_int($v)) { return "" . $v; }
+    if (is_float($v)) { return "" . $v; }
+    if (is_string($v)) { return escapeStr($v); }
+    if (isNode($v)) {
+        $s = "(" . substr($v[0], 1) . "@" . $v[1];
+        for ($i = 2; $i < count($v); $i++) { $s = $s . " " . dump($v[$i]); }
+        return $s . ")";
+    }
+    $parts = [];
+    foreach ($v as $x) { $parts[] = dump($x); }
+    return "[" . join($parts, " ") . "]";
+}
