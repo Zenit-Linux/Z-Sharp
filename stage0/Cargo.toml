@@ -1,0 +1,9 @@
+[package]
+name = "zsc0"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+zs-lexer = { path = "zs-lexer" }
+zs-parser = { path = "zs-parser" }
+zs-interp = { path = "zs-interp" }
