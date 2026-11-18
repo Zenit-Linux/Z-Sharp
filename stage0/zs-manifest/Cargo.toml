@@ -1,0 +1,4 @@
+[package]
+name = "zs-manifest"
+version.workspace = true
+edition.workspace = true
