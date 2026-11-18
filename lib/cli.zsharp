@@ -1,7 +1,3 @@
-#( Wspólny parser argumentów dla zsc / zsi / zst (workspace member `cli`).
-   $r = cli.parse(System.args(), ["o", "target"]);   # opcje przyjmujące wartość
-   $r["positional"], $r["flags"]["--release"], $r["options"]["o"] )#
-
 namespace cli;
 
 ##
