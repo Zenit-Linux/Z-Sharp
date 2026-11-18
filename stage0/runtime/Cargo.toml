@@ -1,0 +1,11 @@
+[package]
+name = "zs-runtime"
+version.workspace = true
+edition.workspace = true
+description = "Natywny runtime Z#: wartości dynamiczne, napisy, tablice, zasoby — na ZAMM, z ABI C (libzs_runtime.a)"
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+zamm = { path = "../zamm" }
