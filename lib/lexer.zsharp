@@ -1,9 +1,3 @@
-#( Samohostowany lekser Z# (workspace member `lexer`).
-   Zachowuje się jak crates/zs-lexer w Rust: te same tokeny, te same pozycje.
-   Użycie:  import Workspace.lexer;  $tokens = lexer.tokenize($src);
-   Token: ["kind","text","value","line","col","start","end"]
-   kind: shebang | doc | comment (tylko gdy $keep) | ident | var | kw | int | float | str | op | eof )#
-
 namespace lexer;
 
 class LexError extends Exception {
