@@ -1,0 +1,283 @@
+namespace sema;
+
+import Workspace.parser;
+
+class SemaTables {
+    # funkcje, które nie zatrzymują argumentów
+    const PURE = [
+        "println" => true, "print" => true, "eprintln" => true, "count" => true, "strlen" => true, "has_key" => true,
+        "keys" => true, "join" => true, "in_array" => true, "index_of" => true, "starts_with" => true,
+        "ends_with" => true, "trim" => true, "substr" => true, "intval" => true, "typeof" => true, "is_int" => true,
+        "is_float" => true, "is_string" => true, "is_bool" => true, "is_array" => true, "is_null" => true,
+        "is_object" => true, "is_callable" => true, "replace" => true, "pad_left" => true, "pad_right" => true,
+        "ord" => true, "chr" => true, "floatval" => true
+    ];
+    const LEVEL = ["No", "Caller", "Unknown"];
+    const ZAMM = ["Frame", "Frame + przeniesienie przy return", "Persistent"];
+}
+
+class SemaScope {
+    public $name;
+    public $line;
+    public $assigned;
+    public $reads;
+    public $sites;
+    public $level;
+    public $edges;
+    public $children;      # domknięcia: [ [free-reads...], line ]
+    public $isClosure;
+
+    public func __construct($name, $line, $isClosure) {
+        $this->name = $name;
+        $this->line = $line;
+        $this->assigned = [];
+        $this->reads = [];
+        $this->sites = [];
+        $this->level = [];
+        $this->edges = [];
+        $this->children = [];
+        $this->isClosure = $isClosure;
+    }
+
+    public func raise($v, $lv) {
+        $cur = $this->level[$v] ?? 0;
+        if ($lv > $cur) { $this->level[$v] = $lv; }
+    }
+}
+
+class Analyzer {
+    public $warnings;
+    public $functions;
+
+    public func __construct() {
+        $this->warnings = [];
+        $this->functions = [];
+    }
+
+    func baseVar($e) {
+        while ($e[0] === ":Index" || $e[0] === ":Prop") { $e = $e[2]; }
+        return $e[0] === ":Var" ? $e[2] : null;
+    }
+
+    func allocKind($e) {
+        if ($e[0] === ":Array") { return "array"; }
+        if ($e[0] === ":New") { return "object " . $e[2]; }
+        if ($e[0] === ":Closure") { return "closure"; }
+        return null;
+    }
+
+    # zmienne wchodzące wprost do wartości wyrażenia (przez tablice, ?:, ??)
+    func valueVars($e) {
+        $out = [];
+        if ($e[0] === ":Var") { $out[] = $e[2]; }
+        else if ($e[0] === ":Array") {
+            foreach ($e[2] as $it) { foreach ($this->valueVars($it[3]) as $x) { $out[] = $x; } }
+        } else if ($e[0] === ":Ternary") {
+            if ($e[3] !== null) { foreach ($this->valueVars($e[3]) as $x) { $out[] = $x; } }
+            foreach ($this->valueVars($e[4]) as $x) { $out[] = $x; }
+        } else if ($e[0] === ":Binary" && $e[2] === "Coalesce") {
+            foreach ($this->valueVars($e[3]) as $x) { $out[] = $x; }
+            foreach ($this->valueVars($e[4]) as $x) { $out[] = $x; }
+        }
+        return $out;
+    }
+
+    func visitAny($x, $sc, $prefix) {
+        if (parser.isNode($x)) { $this->visit($x, $sc, $prefix); }
+        else if (is_array($x)) { foreach ($x as $y) { $this->visitAny($y, $sc, $prefix); } }
+    }
+
+    func visitChildren($n, $sc, $prefix) {
+        for ($i = 2; $i < count($n); $i++) { $this->visitAny($n[$i], $sc, $prefix); }
+    }
+
+    func visit($n, $sc, $prefix) {
+        $k = $n[0];
+        if ($k === ":Var") { $sc->reads[] = [$n[2], $n[1]]; return; }
+        if ($k === ":Assign") {
+            $lhs = $n[2];
+            $rhs = $n[3];
+            if ($lhs[0] === ":Var") {
+                $name = $lhs[2];
+                $sc->assigned[$name] = true;
+                $ak = $this->allocKind($rhs);
+                if ($ak !== null) { $sc->sites[] = [$name, $ak, $n[1]]; }
+                foreach ($this->valueVars($rhs) as $v) {
+                    if ($rhs[0] === ":Var") { $sc->edges[] = [$v, $name]; $sc->edges[] = [$name, $v]; }
+                    else { $sc->edges[] = [$v, $name]; }
+                }
+            } else {
+                $b = $this->baseVar($lhs);
+                if ($b !== null) {
+                    if ($lhs[0] === ":Index") { $sc->assigned[$b] = true; }
+                    else { $sc->reads[] = [$b, $n[1]]; }
+                    foreach ($this->valueVars($rhs) as $v) { $sc->edges[] = [$v, $b]; }
+                }
+                # wyrażenia indeksów/obiektów po drodze
+                $e = $lhs;
+                while ($e[0] === ":Index" || $e[0] === ":Prop") {
+                    if ($e[0] === ":Index" && $e[3] !== null) { $this->visit($e[3], $sc, $prefix); }
+                    $e = $e[2];
+                }
+                if ($e[0] !== ":Var") { $this->visit($e, $sc, $prefix); }
+            }
+            $this->visit($rhs, $sc, $prefix);
+            return;
+        }
+        if ($k === ":AssignOp" || $k === ":IncDec") {
+            $t = $k === ":AssignOp" ? $n[3] : $n[2];
+            $b = $this->baseVar($t);
+            if ($b !== null) { $sc->assigned[$b] = true; $sc->reads[] = [$b, $n[1]]; }
+            if ($k === ":AssignOp") { $this->visit($n[4], $sc, $prefix); }
+            return;
+        }
+        if ($k === ":Return") {
+            if ($n[2] !== null) {
+                $ak = $this->allocKind($n[2]);
+                if ($ak !== null) { $sc->sites[] = ["<return>", $ak, $n[1]]; $sc->level["<return>"] = 1; }
+                foreach ($this->valueVars($n[2]) as $v) { $sc->raise($v, 1); }
+                $this->visit($n[2], $sc, $prefix);
+            }
+            return;
+        }
+        if ($k === ":Throw") {
+            foreach ($this->valueVars($n[2]) as $v) { $sc->raise($v, 2); }
+            $this->visit($n[2], $sc, $prefix);
+            return;
+        }
+        if ($k === ":Call" || $k === ":New") {
+            $callee = $k === ":Call" ? $n[2] : null;
+            $args = $k === ":Call" ? $n[3] : $n[3];
+            $pure = false;
+            if ($callee !== null && $callee[0] === ":Name") { $pure = has_key(SemaTables.PURE, $callee[2]); }
+            if ($callee !== null) {
+                if ($callee[0] === ":Name") { }
+                else if ($callee[0] === ":Dot") { $c = $callee; while ($c[0] === ":Dot") { $c = $c[2]; } if ($c[0] !== ":Name") { $this->visit($c, $sc, $prefix); } }
+                else { $this->visit($callee, $sc, $prefix); }
+            }
+            foreach ($args as $a) {
+                if (!$pure) { foreach ($this->valueVars($a[3]) as $v) { $sc->raise($v, 2); } }
+                $this->visit($a[3], $sc, $prefix);
+            }
+            return;
+        }
+        if ($k === ":Foreach") {
+            $this->visit($n[2], $sc, $prefix);
+            if ($n[3] !== null) { $sc->assigned[$n[3]] = true; }
+            $sc->assigned[$n[4]] = true;
+            $this->visitAny($n[5], $sc, $prefix);
+            return;
+        }
+        if ($k === ":Try") {
+            $this->visitAny($n[2], $sc, $prefix);
+            foreach ($n[3] as $c) {
+                if ($c[3] !== null) { $sc->assigned[$c[3]] = true; }
+                $this->visitAny($c[4], $sc, $prefix);
+            }
+            if ($n[4] !== null) { $this->visitAny($n[4], $sc, $prefix); }
+            return;
+        }
+        if ($k === ":Using") {
+            $this->visit($n[2], $sc, $prefix);
+            $sc->assigned[$n[3]] = true;
+            $this->visitAny($n[4], $sc, $prefix);
+            return;
+        }
+        if ($k === ":FuncStmt") { $this->fnScope($n[2], $prefix, false, null); return; }
+        if ($k === ":Closure") { $this->fnScope($n[2], $prefix, true, $sc); return; }
+        if ($k === ":ClassStmt") {
+            $c = $n[2];
+            foreach ($c[9] as $m) { $this->fnScope($m[2], $c[2], false, null); }
+            return;
+        }
+        $this->visitChildren($n, $sc, $prefix);
+    }
+
+    # $parent !== null => domknięcie (przechwytuje zmienne z $parent)
+    func fnScope($decl, $prefix, $isClosure, $parent) {
+        $name = $decl[2];
+        $label = $isClosure ? "{closure}" : ($prefix !== "" && $name !== null ? $prefix . "." . $name : ($name ?? "{anon}"));
+        $sc = new SemaScope($label, $decl[1], $isClosure);
+        foreach ($decl[3] as $p) { $sc->assigned[$p[2]] = true; }
+        $sc->assigned["this"] = true;
+        $this->visitAny($decl[5], $sc, $prefix);
+        if ($isClosure) {
+            $free = [];
+            foreach ($sc->reads as $r) { if (!has_key($sc->assigned, $r[0])) { $free[] = $r; } }
+            $parent->children[] = [$free, $decl[1]];
+            $this->finish($sc, false);
+        } else {
+            $this->finish($sc, true);
+        }
+    }
+
+    func resolveChildren($sc) {
+        # domknięcia: wolne odczyty muszą być przypisane w rodzicu (wtedy zmienna jest przechwytywana -> Unknown)
+        foreach ($sc->children as $ch) {
+            foreach ($ch[0] as $r) {
+                if (has_key($sc->assigned, $r[0])) { $sc->raise($r[0], 2); }
+                else if ($sc->isClosure) { $sc->reads[] = $r; }
+                else { $this->warnings[] = [$r[1], "zmienna $" . $r[0] . " w domknięciu nie jest przypisana w otaczającej funkcji"]; }
+            }
+        }
+    }
+
+    func finish($sc, $report) {
+        $this->resolveChildren($sc);
+        if ($report) {
+            foreach ($sc->reads as $r) {
+                if (!has_key($sc->assigned, $r[0])) {
+                    $this->warnings[] = [$r[1], "zmienna $" . $r[0] . " jest czytana, ale nigdy nie przypisana w " . $sc->name];
+                }
+            }
+        }
+        # propagacja poziomów po krawędziach (v -> b: v żyje co najmniej tak długo jak b)
+        $changed = true;
+        $guard = 0;
+        while ($changed && $guard < 64) {
+            $changed = false;
+            $guard++;
+            foreach ($sc->edges as $e) {
+                $a = $sc->level[$e[0]] ?? 0;
+                $b = $sc->level[$e[1]] ?? 0;
+                if ($b > $a) { $sc->level[$e[0]] = $b; $changed = true; }
+            }
+        }
+        $sites = [];
+        foreach ($sc->sites as $s) {
+            $lv = $sc->level[$s[0]] ?? 0;
+            $sites[] = ["var" => $s[0], "kind" => $s[1], "line" => $s[2], "escape" => SemaTables.LEVEL[$lv], "zamm" => SemaTables.ZAMM[$lv]];
+        }
+        if (count($sites) > 0 || !$sc->isClosure) {
+            $this->functions[] = ["name" => $sc->name, "line" => $sc->line, "sites" => $sites];
+        }
+    }
+}
+
+##
+ * Analizuje listę instrukcji (wynik parser.parse). Zwraca ["warnings" => [[linia, tekst]...], "functions" => [...]].
+ * Poziom najwyższy traktowany jest jak funkcja `{main}`.
+##
+func analyze($stmts) {
+    $an = new Analyzer();
+    $sc = new SemaScope("{main}", 1, false);
+    $an->visitAny($stmts, $sc, "");
+    $an->finish($sc, false);
+    return ["warnings" => $an->warnings, "functions" => $an->functions];
+}
+
+##
+ * Tekstowy raport (stabilny, używany w testach złotych).
+##
+func report($r) {
+    $out = [];
+    foreach ($r["warnings"] as $w) { $out[] = "warn " . $w[0] . ": " . $w[1]; }
+    foreach ($r["functions"] as $f) {
+        if (count($f["sites"]) === 0) { continue; }
+        $out[] = "fn " . $f["name"] . " @" . $f["line"];
+        foreach ($f["sites"] as $s) {
+            $out[] = "  " . $s["line"] . ": $" . $s["var"] . " = " . $s["kind"] . " -> Escape::" . $s["escape"] . " => " . $s["zamm"];
+        }
+    }
+    return join($out, "\n");
+}
