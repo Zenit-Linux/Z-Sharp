@@ -1,0 +1,18 @@
+warn 40: zmienna $missing jest czytana, ale nigdy nie przypisana w bad
+warn 43: zmienna $nowhere w domknięciu nie jest przypisana w otaczającej funkcji
+fn local @6
+  7: $tmp = array -> Escape::No => Frame
+fn giveBack @13
+  14: $out = array -> Escape::Caller => Frame + przeniesienie przy return
+fn keep @18
+  19: $o = object Box -> Escape::Unknown => Persistent
+  21: $local = object Box -> Escape::No => Frame
+fn captured @25
+  26: $cfg = array -> Escape::Unknown => Persistent
+  27: $f = closure -> Escape::No => Frame
+fn throws @30
+  31: $e = object Exception -> Escape::Unknown => Persistent
+fn alias @34
+  35: $a = array -> Escape::Caller => Frame + przeniesienie przy return
+fn closureBad @42
+  43: $g = closure -> Escape::No => Frame
