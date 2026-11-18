@@ -65,6 +65,9 @@ pub struct Interp {
     pub loaded: HashSet<PathBuf>,
     pub externs: HashSet<Name>,
     pub dir_stack: Vec<PathBuf>,
+    /// moduły z kontenera .zbc (klucz = ścieżka importu); gdy obecne, import nie dotyka systemu plików
+    pub bundle: HashMap<String, Rc<Vec<Stmt>>>,
+    pub main_called: bool,
     pub cur_module: Option<Name>,
     pub line: u32,
     pub args: Vec<String>,
@@ -92,13 +95,43 @@ pub fn run_file(path: &str, args: Vec<String>) -> i32 {
     h.join().unwrap_or(1)
 }
 
+/// Uruchamia skompilowany program `.zbc` (bez parsowania źródeł); zwraca kod wyjścia procesu.
+pub fn run_zbc(text: String, args: Vec<String>) -> i32 {
+    let h = std::thread::Builder::new().stack_size(1 << 30).spawn(move || {
+        let z = match zs_parser::reader::parse_zbc(&text) { Ok(z) => z, Err(e) => { eprintln!("zbc: {e}"); return 1; } };
+        let mut it = Interp::new(args);
+        for (k, v) in z.modules { it.bundle.insert(k, Rc::new(v)); }
+        it.dir_stack.push(PathBuf::from("."));
+        let code = it.run_program(&z.entry);
+        it.flush();
+        code
+    }).unwrap();
+    h.join().unwrap_or(1)
+}
+
+/// Rozwiązuje ścieżkę importu do pliku względem katalogu `here` (workspace z Z#.toml, katalog, cwd, ZS_PATH).
+pub fn resolve_import_path(here: &Path, segs: &[&str]) -> Option<PathBuf> {
+    if segs.is_empty() { return None; }
+    if segs[0] == "Workspace" && segs.len() >= 2 { return zs_manifest::resolve_workspace_import(here, &segs[1..]); }
+    let mut dirs: Vec<PathBuf> = vec![here.to_path_buf()];
+    if let Ok(c) = std::env::current_dir() { dirs.push(c); }
+    if let Ok(p) = std::env::var("ZS_PATH") { dirs.extend(p.split(':').map(PathBuf::from)); }
+    for d in dirs {
+        let mut f = d.clone();
+        for s in &segs[..segs.len() - 1] { f.push(s); }
+        f.push(segs[segs.len() - 1]);
+        if let Some(found) = zs_manifest::with_source_ext(&f) { return Some(found); }
+    }
+    None
+}
+
 impl Interp {
     pub fn new(args: Vec<String>) -> Self {
         let mut it = Interp {
             frames: vec![Frame { vars: HashMap::new(), this: None, class: None, module: None }],
             funcs: HashMap::new(), classes: HashMap::new(), modules: HashMap::new(),
             aliases: HashMap::new(), loaded: HashSet::new(), externs: HashSet::new(),
-            dir_stack: vec![], cur_module: None, line: 0, args,
+            dir_stack: vec![], bundle: HashMap::new(), main_called: false, cur_module: None, line: 0, args,
             out: std::io::BufWriter::new(std::io::stdout()),
         };
         let prelude = zs_parser::parse(PRELUDE).expect("prelude");
@@ -110,6 +143,14 @@ impl Interp {
 
     fn run_program(&mut self, prog: &[Stmt]) -> i32 {
         let r = self.hoist(prog).and_then(|_| self.exec_block(prog));
+        // `main` nie jest wymagane: jeśli program je zdefiniował i nie wywołał go jawnie, uruchamiamy je po kodzie najwyższego poziomu;
+        // zwrócona liczba całkowita staje się kodem wyjścia.
+        let r = match r {
+            Ok(()) if !self.main_called && self.funcs.contains_key("main") => {
+                self.call_named(&rc("main"), vec![]).and_then(|v| match v { Value::Int(c) => Err(Flow::Exit(c as i32)), _ => Ok(()) })
+            }
+            o => o,
+        };
         match r {
             Ok(()) => 0,
             Err(Flow::Exit(c)) => c,
@@ -370,18 +411,23 @@ impl Interp {
     // ---------- import ----------
     fn import(&mut self, path: &[Name]) -> R<()> {
         if BUILTIN_MODULES.contains(&&*path[0]) { return Ok(()); }
-        let Some(file) = self.resolve_import(path) else {
-            return rt(format!("nie znaleziono modułu {}", path.iter().map(|p| &**p).collect::<Vec<_>>().join(".")));
-        };
-        let canon = file.canonicalize().unwrap_or(file.clone());
         let full = path.iter().map(|p| &**p).collect::<Vec<_>>().join(".");
-        self.aliases.insert(path.last().unwrap().to_string(), full.clone());
+        let (prog, canon, dir): (Rc<Vec<Stmt>>, PathBuf, PathBuf) = if let Some(p) = self.bundle.get(&full).cloned() {
+            self.aliases.insert(path.last().unwrap().to_string(), full.clone());
+            (p, PathBuf::from(format!("zbc:{full}")), PathBuf::from("."))
+        } else {
+            let Some(file) = self.resolve_import(path) else { return rt(format!("nie znaleziono modułu {full}")) };
+            let canon = file.canonicalize().unwrap_or(file.clone());
+            self.aliases.insert(path.last().unwrap().to_string(), full.clone());
+            if self.loaded.contains(&canon) { return Ok(()); }
+            let src = std::fs::read_to_string(&file).map_err(|e| Flow::Err(format!("{}: {}", file.display(), e)))?;
+            let prog = zs_parser::parse(&src).map_err(|e| Flow::Err(format!("{}:{}", file.display(), e)))?;
+            (Rc::new(prog), canon, file.parent().map(|p| p.to_path_buf()).unwrap_or_default())
+        };
         if !self.loaded.insert(canon) { return Ok(()); }
-        let src = std::fs::read_to_string(&file).map_err(|e| Flow::Err(format!("{}: {}", file.display(), e)))?;
-        let prog = zs_parser::parse(&src).map_err(|e| Flow::Err(format!("{}:{}", file.display(), e)))?;
         self.modules.entry(full.clone()).or_default();
         let saved_mod = self.cur_module.replace(rc(&full));
-        self.dir_stack.push(file.parent().map(|p| p.to_path_buf()).unwrap_or_default());
+        self.dir_stack.push(dir);
         self.frames.push(Frame { vars: HashMap::new(), this: None, class: None, module: Some(rc(&full)) });
         let saved_line = self.line;
         let r = self.hoist(&prog).and_then(|_| self.exec_block(&prog));
@@ -392,39 +438,10 @@ impl Interp {
         r
     }
 
-    fn workspace_members(&self) -> Option<(PathBuf, HashMap<String, String>)> {
-        let mut roots: Vec<PathBuf> = vec![];
-        if let Ok(r) = std::env::var("ZS_WORKSPACE") { roots.push(PathBuf::from(r)); }
-        if let Some(d) = self.dir_stack.last() {
-            for a in d.ancestors() { roots.push(a.to_path_buf()); roots.push(a.join("Z-Sharp")); }
-        }
-        for r in roots {
-            let m = r.join("zworkspace.json");
-            if let Ok(text) = std::fs::read_to_string(&m) { return Some((r, parse_members(&text))); }
-        }
-        None
-    }
-
     fn resolve_import(&self, path: &[Name]) -> Option<PathBuf> {
         let segs: Vec<&str> = path.iter().map(|p| &**p).collect();
-        if segs[0] == "Workspace" && segs.len() >= 2 {
-            let (root, members) = self.workspace_members()?;
-            let rel = members.get(segs[1])?;
-            let mut f = root.join(rel);
-            for extra in &segs[2..] { f = f.parent()?.join(format!("{}.zs", extra)); }
-            return if f.exists() { Some(f) } else { None };
-        }
-        let mut dirs: Vec<PathBuf> = vec![];
-        if let Some(d) = self.dir_stack.last() { dirs.push(d.clone()); }
-        if let Ok(c) = std::env::current_dir() { dirs.push(c); }
-        if let Ok(p) = std::env::var("ZS_PATH") { dirs.extend(p.split(':').map(PathBuf::from)); }
-        for d in dirs {
-            let mut f = d.clone();
-            for s in &segs[..segs.len() - 1] { f.push(s); }
-            f.push(format!("{}.zs", segs[segs.len() - 1]));
-            if f.exists() { return Some(f); }
-        }
-        None
+        let here = self.dir_stack.last().cloned().unwrap_or_else(|| PathBuf::from("."));
+        resolve_import_path(&here, &segs)
     }
 
     // ---------- wyrażenia ----------
@@ -721,7 +738,7 @@ impl Interp {
         let module = self.frames.last().unwrap().module.clone();
         let f = module.as_ref().and_then(|m| self.modules.get(&**m)).and_then(|m| m.funcs.get(n)).cloned()
             .or_else(|| self.funcs.get(n).cloned());
-        if let Some(f) = f { return self.call_closure(&f, args); }
+        if let Some(f) = f { if &**n == "main" { self.main_called = true; } return self.call_closure(&f, args); }
         if let Some(r) = self.call_builtin(n, &args) { return r; }
         if self.externs.contains(n) { return rt(format!("funkcja extern `{}`: linkowanie extern jest dostępne tylko w zsc (stage0 interpreter go nie obsługuje)", n)); }
         // zmienna o nazwie funkcji? nie — PHP-podobnie wymaga $f()
@@ -863,19 +880,4 @@ fn walk(cur: &mut Value, segs: &[Seg], f: &mut dyn FnMut(&mut Value) -> R<()>) -
             o => rt(format!("zapis właściwości `{}` na wartości typu {}", n, o.type_name())),
         },
     }
-}
-
-/// Minimalny odczyt sekcji "members" z zworkspace.json: pary "klucz": "wartość".
-fn parse_members(text: &str) -> HashMap<String, String> {
-    let mut out = HashMap::new();
-    let Some(i) = text.find("\"members\"") else { return out };
-    let rest = &text[i + 9..];
-    let (mut strs, mut cur, mut in_s) = (vec![], String::new(), false);
-    let mut depth = 0;
-    for ch in rest.chars() {
-        if in_s { if ch == '"' { in_s = false; strs.push(std::mem::take(&mut cur)); } else { cur.push(ch); } continue; }
-        match ch { '"' => in_s = true, '{' => depth += 1, '}' => { depth -= 1; if depth <= 0 { break; } } _ => {} }
-    }
-    for pair in strs.chunks(2) { if let [k, v] = pair { out.insert(k.clone(), v.clone()); } }
-    out
 }
