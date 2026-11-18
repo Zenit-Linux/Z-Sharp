@@ -1,0 +1,4 @@
+import Workspace.lexer;
+foreach (lexer.tokenize(File.read(System.args()[1])) as $t) {
+    if ($t["kind"] !== "shebang" && $t["kind"] !== "doc") { println($t["line"] . ":" . $t["col"]); }
+}
