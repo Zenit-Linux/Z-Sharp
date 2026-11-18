@@ -1,0 +1,260 @@
+#( Samohostowany lekser Z# (workspace member `lexer`).
+   Zachowuje się jak crates/zs-lexer w Rust: te same tokeny, te same pozycje.
+   Użycie:  import Workspace.lexer;  $tokens = lexer.tokenize($src);
+   Token: ["kind","text","value","line","col","start","end"]
+   kind: shebang | doc | comment (tylko gdy $keep) | ident | var | kw | int | float | str | op | eof )#
+
+namespace lexer;
+
+class LexError extends Exception {
+    public $lineNo;
+    public $colNo;
+    public func __construct($message, $line, $col) {
+        parent.__construct($message . " (" . $line . ":" . $col . ")");
+        $this->lineNo = $line;
+        $this->colNo = $col;
+    }
+}
+
+class LexTables {
+    const KEYWORDS = [
+        "func" => true, "fn" => true, "return" => true, "if" => true, "elseif" => true, "else" => true,
+        "switch" => true, "case" => true, "default" => true, "match" => true, "for" => true,
+        "foreach" => true, "while" => true, "do" => true, "break" => true, "continue" => true,
+        "as" => true, "import" => true, "namespace" => true, "extern" => true, "class" => true,
+        "interface" => true, "trait" => true, "extends" => true, "implements" => true, "new" => true,
+        "public" => true, "private" => true, "protected" => true, "static" => true, "abstract" => true,
+        "try" => true, "catch" => true, "finally" => true, "throw" => true, "using" => true,
+        "await" => true, "echo" => true, "true" => true, "false" => true, "null" => true,
+        "and" => true, "or" => true, "xor" => true
+    ];
+    const OPS3 = ["===" => true, "!==" => true, "??=" => true, "..." => true];
+    const OPS2 = [
+        "**" => true, "==" => true, "!=" => true, "<=" => true, ">=" => true, "&&" => true,
+        "||" => true, "??" => true, "->" => true, "=>" => true, "++" => true, "--" => true,
+        "+=" => true, "-=" => true, "*=" => true, "/=" => true, "%=" => true, ".=" => true,
+        "<<" => true, ">>" => true
+    ];
+    const OPS1 = "+-*/%.=<>!?:,;(){}[]&|^~";
+}
+
+class Lexer {
+    public $src;
+    public $n;
+    public $pos;
+    public $line;
+    public $col;
+    public $out;
+    public $keep;
+
+    public func __construct($src, $keep = false) {
+        $this->src = $src;
+        $this->n = strlen($src);
+        $this->pos = 0;
+        $this->line = 1;
+        $this->col = 1;
+        $this->out = [];
+        $this->keep = $keep;
+    }
+
+    func peek($k = 0) {
+        return $this->src[$this->pos + $k] ?? "";
+    }
+
+    func bump() {
+        $c = $this->src[$this->pos];
+        $this->pos += strlen($c);
+        if ($c === "\n") {
+            $this->line++;
+            $this->col = 1;
+        } else {
+            $this->col++;
+        }
+        return $c;
+    }
+
+    func fail($msg, $line, $col) { throw new LexError($msg, $line, $col); }
+
+    func emit($kind, $text, $start, $line, $col, $value = null) {
+        $this->out[] = ["kind" => $kind, "text" => $text, "value" => $value,
+                        "line" => $line, "col" => $col, "start" => $start, "end" => $this->pos];
+    }
+
+    public func run() {
+        if (starts_with($this->src, "#!")) {
+            $line = $this->line; $col = $this->col;
+            while ($this->pos < $this->n && $this->peek() !== "\n") { $this->bump(); }
+            $this->emit("shebang", substr($this->src, 2, $this->pos - 2), 0, $line, $col);
+        }
+        while (true) {
+            $this->skipTrivia();
+            if ($this->pos >= $this->n) { break; }
+            $c = $this->peek();
+            $start = $this->pos; $line = $this->line; $col = $this->col;
+            if ($c === "$") { $this->variable($start, $line, $col); }
+            else if ($c === "\"" || $c === "'") { $this->string($c, $start, $line, $col); }
+            else if (is_digit($c)) { $this->number($start, $line, $col); }
+            else if (is_alpha($c)) { $this->ident($start, $line, $col); }
+            else { $this->op($start, $line, $col); }
+        }
+        $this->emit("eof", "", $this->pos, $this->line, $this->col);
+        return $this->out;
+    }
+
+    func skipTrivia() {
+        while ($this->pos < $this->n) {
+            $c = $this->peek();
+            if ($c === " " || $c === "\t" || $c === "\r" || $c === "\n") { $this->bump(); continue; }
+            if ($c !== "#") { return; }
+            $start = $this->pos; $line = $this->line; $col = $this->col;
+            $c1 = $this->peek(1);
+            if ($c1 === "(") {
+                $this->bump(); $this->bump();
+                while (true) {
+                    if ($this->pos >= $this->n) { $this->fail("niezamknięty komentarz #( ... )#", $line, $col); }
+                    if ($this->peek() === ")" && $this->peek(1) === "#") { $this->bump(); $this->bump(); break; }
+                    $this->bump();
+                }
+                if ($this->keep) { $this->emit("comment", substr($this->src, $start, $this->pos - $start), $start, $line, $col); }
+            } else if ($c1 === "#") {
+                $this->bump(); $this->bump();
+                $e = $this->pos;
+                while ($e < $this->n && ($this->src[$e] ?? "") !== "\n") { $e++; }
+                $alone = trim(substr($this->src, $this->pos, $e - $this->pos)) === "";
+                $textStart = $this->pos;
+                if ($alone) {
+                    while (true) {
+                        if ($this->pos >= $this->n) { $this->fail("niezamknięty blok dokumentacyjny ##", $line, $col); }
+                        if ($this->peek() === "#" && $this->peek(1) === "#") { break; }
+                        $this->bump();
+                    }
+                    $text = substr($this->src, $textStart, $this->pos - $textStart);
+                    $this->bump(); $this->bump();
+                } else {
+                    while ($this->pos < $e) { $this->bump(); }
+                    $text = trim(substr($this->src, $textStart, $this->pos - $textStart));
+                }
+                $this->emit("doc", $text, $start, $line, $col, $text);
+            } else {
+                while ($this->pos < $this->n && $this->peek() !== "\n") { $this->bump(); }
+                if ($this->keep) { $this->emit("comment", substr($this->src, $start, $this->pos - $start), $start, $line, $col); }
+            }
+        }
+    }
+
+    func variable($start, $line, $col) {
+        $this->bump();
+        if (!is_alpha($this->peek())) { $this->fail("po `$` oczekiwano nazwy zmiennej", $line, $col); }
+        $s = $this->pos;
+        while (is_alnum($this->peek())) { $this->bump(); }
+        $name = substr($this->src, $s, $this->pos - $s);
+        $this->emit("var", "$" . $name, $start, $line, $col, $name);
+    }
+
+    func ident($start, $line, $col) {
+        while (is_alnum($this->peek())) { $this->bump(); }
+        $word = substr($this->src, $start, $this->pos - $start);
+        $this->emit(has_key(LexTables.KEYWORDS, $word) ? "kw" : "ident", $word, $start, $line, $col, $word);
+    }
+
+    func digitValue($c) {
+        if ($c === "") { return -1; }
+        $o = ord($c);
+        if ($o >= 48 && $o <= 57) { return $o - 48; }
+        if ($o >= 97 && $o <= 102) { return $o - 87; }
+        if ($o >= 65 && $o <= 70) { return $o - 55; }
+        return -1;
+    }
+
+    func digits() {
+        while (is_digit($this->peek()) || $this->peek() === "_") { $this->bump(); }
+    }
+
+    func number($start, $line, $col) {
+        if ($this->peek() === "0") {
+            $p = $this->peek(1);
+            $radix = 0;
+            if ($p === "x" || $p === "X") { $radix = 16; }
+            else if ($p === "b" || $p === "B") { $radix = 2; }
+            else if ($p === "o" || $p === "O") { $radix = 8; }
+            if ($radix !== 0) {
+                $this->bump(); $this->bump();
+                $v = 0; $count = 0;
+                while (true) {
+                    $c = $this->peek();
+                    if ($c === "_") { $this->bump(); continue; }
+                    $d = $this->digitValue($c);
+                    if ($d < 0 || $d >= $radix) { break; }
+                    $v = $v * $radix + $d; $count++;
+                    $this->bump();
+                }
+                if ($count === 0) { $this->fail("niepoprawny literał całkowity", $line, $col); }
+                $this->emit("int", substr($this->src, $start, $this->pos - $start), $start, $line, $col, $v);
+                return;
+            }
+        }
+        $this->digits();
+        $isFloat = false;
+        if ($this->peek() === "." && is_digit($this->peek(1))) {
+            $isFloat = true; $this->bump(); $this->digits();
+        }
+        $e = $this->peek();
+        if ($e === "e" || $e === "E") {
+            $sign = ($this->peek(1) === "+" || $this->peek(1) === "-") ? 1 : 0;
+            if (is_digit($this->peek(1 + $sign))) {
+                $isFloat = true;
+                for ($i = 0; $i <= $sign; $i++) { $this->bump(); }
+                $this->digits();
+            }
+        }
+        $text = substr($this->src, $start, $this->pos - $start);
+        $clean = replace($text, "_", "");
+        if ($isFloat) { $this->emit("float", $text, $start, $line, $col, floatval($clean)); }
+        else { $this->emit("int", $text, $start, $line, $col, intval($clean)); }
+    }
+
+    func string($q, $start, $line, $col) {
+        $this->bump();
+        $buf = "";
+        while (true) {
+            if ($this->pos >= $this->n) { $this->fail("niezamknięty literał tekstowy", $line, $col); }
+            $c = $this->bump();
+            if ($c === $q) { break; }
+            if ($c !== "\\") { $buf .= $c; continue; }
+            if ($this->pos >= $this->n) { $this->fail("niezamknięty literał tekstowy", $line, $col); }
+            $e = $this->bump();
+            if ($e === "\\") { $buf .= "\\"; }
+            else if ($e === $q) { $buf .= $q; }
+            else if ($q === "\"" && $e === "n") { $buf .= "\n"; }
+            else if ($q === "\"" && $e === "t") { $buf .= "\t"; }
+            else if ($q === "\"" && $e === "r") { $buf .= "\r"; }
+            else if ($q === "\"" && $e === "0") { $buf .= chr(0); }
+            else if ($q === "\"" && $e === "$") { $buf .= "$"; }
+            else { $buf .= "\\" . $e; }
+        }
+        $this->emit("str", substr($this->src, $start, $this->pos - $start), $start, $line, $col, $buf);
+    }
+
+    func op($start, $line, $col) {
+        $s3 = substr($this->src, $this->pos, 3);
+        $s2 = substr($this->src, $this->pos, 2);
+        $s1 = substr($this->src, $this->pos, 1);
+        $len = 0;
+        if (has_key(LexTables.OPS3, $s3)) { $len = 3; }
+        else if (has_key(LexTables.OPS2, $s2)) { $len = 2; }
+        else if (contains(LexTables.OPS1, $s1)) { $len = 1; }
+        if ($len === 0) { $this->fail("nieoczekiwany znak `" . $s1 . "`", $line, $col); }
+        for ($i = 0; $i < $len; $i++) { $this->bump(); }
+        $text = substr($this->src, $start, $len);
+        $this->emit("op", $text, $start, $line, $col, $text);
+    }
+}
+
+##
+ * Tokenizuje źródło Z#. Ostatni token ma kind "eof".
+ * @param keep czy zwracać też zwykłe komentarze (dla transpilatorów/formatterów)
+##
+func tokenize($src, $keep = false) {
+    $lx = new Lexer($src, $keep);
+    return $lx->run();
+}
