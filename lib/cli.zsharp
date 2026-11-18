@@ -1,0 +1,38 @@
+#( Wspólny parser argumentów dla zsc / zsi / zst (workspace member `cli`).
+   $r = cli.parse(System.args(), ["o", "target"]);   # opcje przyjmujące wartość
+   $r["positional"], $r["flags"]["--release"], $r["options"]["o"] )#
+
+namespace cli;
+
+##
+ * Rozbija argumenty. args[0] to ścieżka skryptu i jest pomijana.
+ * Obsługuje: --flaga, --opcja=wartość, -o wartość (dla nazw w $valueOpts), "--" kończy opcje.
+##
+func parse($args, $valueOpts = []) {
+    $positional = [];
+    $flags = [];
+    $options = [];
+    $i = 1;
+    $n = count($args);
+    $rest = false;
+    while ($i < $n) {
+        $a = $args[$i];
+        if ($rest || !starts_with($a, "-") || $a === "-") {
+            $positional[] = $a;
+        } else if ($a === "--") {
+            $rest = true;
+        } else if (starts_with($a, "--")) {
+            $body = substr($a, 2);
+            $eq = index_of($body, "=");
+            if ($eq >= 0) { $options[substr($body, 0, $eq)] = substr($body, $eq + 1); }
+            else if (in_array($body, $valueOpts) && $i + 1 < $n) { $i++; $options[$body] = $args[$i]; }
+            else { $flags[$a] = true; }
+        } else {
+            $name = substr($a, 1);
+            if (in_array($name, $valueOpts) && $i + 1 < $n) { $i++; $options[$name] = $args[$i]; }
+            else { $flags[$a] = true; }
+        }
+        $i++;
+    }
+    return ["positional" => $positional, "flags" => $flags, "options" => $options];
+}
