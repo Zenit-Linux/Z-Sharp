@@ -1,1 +1,27 @@
+[package]
+name = "Z-Sharp"
+version = "0.0.1"
+kind = "lib"
+description = "Rdzeń bootstrapu Z#: stage0 (Rust), runtime + ZAMM, biblioteki wspólne dla zsc/zsi/zst/zzc"
+license = "GPL-3.0"
 
+# `import Workspace.<człon>;` rozwiązuje się przez tę tabelę (ścieżki względem tego pliku).
+[workspace.members]
+lexer  = "lib/lexer.zsharp"
+parser = "lib/parser.zsharp"
+cli    = "lib/cli.zsharp"
+zbc    = "lib/zbc.zsharp"
+sema   = "lib/sema.zsharp"
+
+[bootstrap]
+stage0 = "stage0"             # interpreter AST w Rust (zsc0)
+stage1 = "lib/parser.zsharp"  # frontend napisany w Z#, uruchamiany przez stage0
+zbc    = "lib/zbc.zsharp"     # kontener .zbc: program bez źródeł, wykonywany przez `zsc0 exec`
+parity = ["tests/lexer_parity.sh", "tests/parser_parity.sh"]
+fixpoint = "scripts/fixpoint.sh"   # zsc kompiluje sam siebie; stage1 == stage2 == stage3
+
+[memory]                      # domyślna konfiguracja ZAMM (zob. zamm/README.md)
+chunk-kib       = 64
+max-chunk-kib   = 1024
+large-object-kib = 256
+retain-chunks   = 4
