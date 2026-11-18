@@ -1,0 +1,14 @@
+import System;
+
+##
+ * Demo.
+##
+func main(): void {
+    $name = "Z#";
+    $numbers = [10, 20, 30];
+    $sum = 0;
+    foreach ($numbers as $n) { $sum += $n; } # suma
+    echo "Hello from " . $name . " " . System.cpuCount();
+}
+
+main();
