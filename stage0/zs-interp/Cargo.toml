@@ -6,3 +6,4 @@ edition.workspace = true
 [dependencies]
 zs-lexer = { path = "../zs-lexer" }
 zs-parser = { path = "../zs-parser" }
+zs-manifest = { path = "../zs-manifest" }
