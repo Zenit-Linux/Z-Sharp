@@ -142,6 +142,15 @@ impl Interp {
             ("System", "args") => Ok(Value::array(self.args.iter().map(|s| Value::str(s)).collect())),
             ("System", "env") => s_arg(a, 0, f).map(|k| std::env::var(&*k).map(Value::string).unwrap_or(Value::Null)),
             ("System", "time") => Ok(Value::Float(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64()))),
+            ("System", "version") => Ok(Value::str(env!("CARGO_PKG_VERSION"))),
+            ("System", "dirname") => s_arg(a, 0, f).map(|p| Value::string(std::path::Path::new(&*p).parent().map(|d| d.to_string_lossy().into_owned()).filter(|d| !d.is_empty()).unwrap_or_else(|| ".".into()))),
+            // rozwiązuje ścieżkę importu (tablica nazw) względem katalogu — ta sama logika co `import` (Z#.toml, ZS_PATH)
+            ("System", "resolveImport") => (|| {
+                let segs = a_arg(a, 0, f)?; let dir = s_arg(a, 1, f)?;
+                let names: Vec<String> = segs.entries.iter().map(|(_, v)| to_text(v)).collect();
+                let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+                Ok(resolve_import_path(std::path::Path::new(&*dir), &refs).map(|p| Value::string(p.to_string_lossy().into_owned())).unwrap_or(Value::Null))
+            })(),
             ("System", "exit") => Err(Flow::Exit(match a.first() { Some(Value::Int(c)) => *c as i32, _ => 0 })),
             ("Math", "sqrt") => f_arg(a, 0, f).map(|x| Value::Float(x.sqrt())),
             ("Math", "floor") => f_arg(a, 0, f).map(|x| Value::Int(x.floor() as i64)),
