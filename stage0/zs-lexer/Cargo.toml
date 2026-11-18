@@ -1,0 +1,4 @@
+[package]
+name = "zs-lexer"
+version.workspace = true
+edition.workspace = true
