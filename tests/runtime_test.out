@@ -1,0 +1,17 @@
+ok   napisy: new/concat (UTF-8)
+ok   napisy: długość w bajtach
+ok   napisy: concat z nie-napisem = E_TYPE
+ok   tablice: push z wieloma wzrostami
+ok   tablice: granice i typ
+ok   tablice: set
+ok   zakresy: pop OK, drugi pop E_SCOPE
+ok   zakresy: alokacja bez ramki = E_SCOPE
+ok   zasoby: retain blokuje zakres (E_REFERENCED)
+ok   zasoby: po release zakres zamyka zasób
+ok   zasoby: trwały — ostatni release zamyka
+ok   zasoby: zamknięcie runtime zamyka pozostałe
+ok   zadania: kod >= 16
+ok   zadania: napis w arenie zadania
+ok   zadania: end_task, potem nieznane
+ok   statystyki
+wynik: 0 niepowodzeń
