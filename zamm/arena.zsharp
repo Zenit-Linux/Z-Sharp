@@ -1,0 +1,217 @@
+namespace zamm_arena;
+
+import Workspace.zamm_config;
+import Workspace.zamm_errors;
+import Workspace.zamm_chunk;
+
+func align_up($x, $a) { return ($x + $a - 1) & ~($a - 1); }
+
+func is_pow2($n) { return $n > 0 && ($n & ($n - 1)) === 0; }
+
+##
+ * Chained arena (port stage0/zamm/src/arena.rs): alokacja przez przesunięcie wskaźnika,
+ * chunki dołączane w miarę potrzeby, `mark`/`rewind`/`reset`, destruktory LIFO.
+ * Adresy są liczbami całkowitymi (symulowana przestrzeń z `zamm_chunk`).
+##
+class ZArena {
+    public $pool;
+    public $chunks;       # lista ZChunk
+    public $idx;
+    public $cur;
+    public $next_size;
+    public $dtors;        # lista [adres, funkcja(adres)]
+    public $used;
+    public $thread_bound;
+
+    public func __construct($pool) {
+        $this->pool = $pool;
+        $this->chunks = [];
+        $this->idx = 0;
+        $this->cur = 0;
+        $this->next_size = $pool->cfg->chunk_size;
+        $this->dtors = [];
+        $this->used = 0;
+        $this->thread_bound = false;
+    }
+
+    ##
+     * Surowa alokacja; zwraca adres. Rozmiar 0 daje `align` (jak NonNull::new(align)).
+    ##
+    public func alloc_raw($size, $align) {
+        if (!is_pow2($align)) { throw new Exception("wyrównanie musi być potęgą dwójki"); }
+        if ($size === 0) { return $align; }
+        # 1) bieżący chunk, 2) kolejne zatrzymane chunki, 3) nowy chunk
+        while ($this->idx < count($this->chunks)) {
+            $c = $this->chunks[$this->idx];
+            $start = align_up($c->base + $this->cur, $align);
+            $end = $start + $size;
+            if ($end <= $c->base + $c->size) {
+                $this->cur = $end - $c->base;
+                $this->used += $size;
+                $this->unpoison($c, $end - $c->base);
+                return $start;
+            }
+            if ($this->idx + 1 < count($this->chunks)) { $this->idx++; $this->cur = 0; } else { break; }
+        }
+        $need = $size + $align + 16;
+        $want = $need > $this->next_size ? $need : $this->next_size;
+        $c = $this->pool->take($want);
+        $cfg = $this->pool->cfg;
+        $ns = $this->next_size * 2;
+        if ($ns > $cfg->max_chunk_size) { $ns = $cfg->max_chunk_size; }
+        if ($ns < $cfg->chunk_size) { $ns = $cfg->chunk_size; }
+        $this->next_size = $ns;
+        $c->poison_from = null;
+        $start = align_up($c->base, $align);
+        $this->cur = $start + $size - $c->base;
+        $this->used += $size;
+        $this->chunks[] = $c;
+        $this->idx = count($this->chunks) - 1;
+        return $start;
+    }
+
+    func unpoison($c, $upto) {
+        if ($c->poison_from !== null && $upto > $c->poison_from) { $c->poison_from = $upto; }
+    }
+
+    ##
+     * Alokuje wartość (zapis do pamięci) i opcjonalnie rejestruje destruktor ($dtor($addr, $value)),
+     * wykonywany LIFO przy rewind/reset/drop. `$bound` = wartość związana z wątkiem (nie można przenieść).
+    ##
+    public func alloc_val($v, $dtor = null, $bound = true) {
+        if ($bound) { $this->thread_bound = true; }
+        return $this->place($v, $dtor);
+    }
+
+    # jak alloc_val, ale wymaga wartości „Send” — arena pozostaje przenośna
+    public func alloc_send($v, $dtor = null) { return $this->place($v, $dtor); }
+
+    func place($v, $dtor) {
+        $p = $this->alloc_raw(8, 8);
+        $this->pool->write($p, $v);
+        if ($dtor !== null) { $this->dtors[] = [$p, $dtor]; }
+        return $p;
+    }
+
+    public func alloc_slice_copy($src) {
+        $n = count($src);
+        $p = $this->alloc_raw($n * 8, 8);
+        for ($i = 0; $i < $n; $i++) { $this->pool->write($p + $i * 8, $src[$i]); }
+        return $p;
+    }
+
+    public func read_slice($p, $n) {
+        $out = [];
+        for ($i = 0; $i < $n; $i++) { $out[] = $this->pool->read($p + $i * 8); }
+        return $out;
+    }
+
+    # napis w arenie: rozmiar to bajty UTF-8, a komórki pamięci trzymają znaki (stage0 nie ma surowych bajtów).
+    # Zwraca [adres, bajty, znaki].
+    public func alloc_str($s) {
+        $cs = chars($s);
+        $nb = strlen($s);
+        $p = $this->alloc_raw($nb, 1);
+        for ($i = 0; $i < count($cs); $i++) { $this->pool->write($p + $i, $cs[$i]); }
+        return [$p, $nb, count($cs)];
+    }
+
+    public func read_str($p, $nchars) {
+        $out = "";
+        for ($i = 0; $i < $nchars; $i++) { $out .= $this->pool->read($p + $i); }
+        return $out;
+    }
+
+    public func mark() { return ["idx" => $this->idx, "cur" => $this->cur, "dtors" => count($this->dtors), "used" => $this->used]; }
+
+    ##
+     * Zwalnia wszystko po `m`: najpierw destruktory (odwrotnie do kolejności alokacji), potem pamięć.
+    ##
+    public func rewind($m) {
+        $this->run_dtors($m["dtors"]);
+        $this->release_to($m["idx"], $m["cur"], $m["used"]);
+    }
+
+    func release_to($idx, $cur, $used) {
+        $cfg = $this->pool->cfg;
+        if ($cfg->poison && count($this->chunks) > 0) {
+            $last = $this->idx;
+            if ($last > count($this->chunks) - 1) { $last = count($this->chunks) - 1; }
+            for ($i = $idx; $i <= $last; $i++) {
+                $c = $this->chunks[$i];
+                $from = $i === $idx ? ($cur < $c->size ? $cur : $c->size) : 0;
+                foreach (keys($c->cells) as $k) {
+                    if ($k - $c->base >= $from) { $c->cells[$k] = 221; }
+                }
+                if ($c->poison_from === null || $from < $c->poison_from) { $c->poison_from = $from; }
+            }
+        }
+        $this->idx = $idx;
+        $this->cur = $cur;
+        $this->used = $used;
+        # nadmiarowe chunki (ponad `retain` za bieżącym) wracają do wspólnej puli
+        $keep = ($idx + 1) > $cfg->retain_chunks ? ($idx + 1) : $cfg->retain_chunks;
+        if ($keep > count($this->chunks)) { $keep = count($this->chunks); }
+        while (count($this->chunks) > $keep) {
+            $n = count($this->chunks) - 1;
+            $c = $this->chunks[$n];
+            $this->chunks = array_slice($this->chunks, 0, $n);
+            $this->pool->give($c);
+        }
+    }
+
+    ##
+     * Zwalnia całą zawartość; zatrzymuje do `retain_chunks` największych chunków.
+    ##
+    public func reset() {
+        $this->run_dtors(0);
+        $first = $this->pool->cfg->chunk_size;
+        $sorted = [];
+        foreach ($this->chunks as $c) { $sorted[] = $c; }
+        # sortowanie malejąco po rozmiarze (stabilne — wstawianie)
+        for ($i = 1; $i < count($sorted); $i++) {
+            $x = $sorted[$i];
+            $j = $i - 1;
+            while ($j >= 0 && $sorted[$j]->size < $x->size) { $sorted[$j + 1] = $sorted[$j]; $j--; }
+            $sorted[$j + 1] = $x;
+        }
+        $this->chunks = $sorted;
+        $this->release_to(0, 0, 0);
+        $this->next_size = $first;
+    }
+
+    func run_dtors($down_to) {
+        while (count($this->dtors) > $down_to) {
+            $n = count($this->dtors) - 1;
+            $d = $this->dtors[$n];
+            $this->dtors = array_slice($this->dtors, 0, $n);
+            $f = $d[1];
+            $f($d[0]);
+        }
+    }
+
+    public func stats() {
+        $reserved = 0;
+        foreach ($this->chunks as $c) { $reserved += $c->size; }
+        return ["chunks" => count($this->chunks), "reserved" => $reserved, "used" => $this->used, "destructors" => count($this->dtors)];
+    }
+
+    ##
+     * Przekazanie własności innemu wątkowi. Zwraca false, jeśli arena zawiera wartości związane z wątkiem.
+    ##
+    public func transferable() { return !$this->thread_bound; }
+
+    # deterministyczne zamknięcie (odpowiednik Drop)
+    public func drop() {
+        $this->run_dtors(0);
+        while (count($this->chunks) > 0) {
+            $n = count($this->chunks) - 1;
+            $c = $this->chunks[$n];
+            $this->chunks = array_slice($this->chunks, 0, $n);
+            $this->pool->give($c);
+        }
+        $this->idx = 0;
+        $this->cur = 0;
+        $this->used = 0;
+    }
+}
