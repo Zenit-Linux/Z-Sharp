@@ -1,0 +1,14 @@
+import Workspace.manifest;
+
+func main(): int {
+    $a = System.args();
+    $dir = $a[1];
+    $root = manifest.find_manifest($dir);
+    if ($root === null) { eecho("brak Z#.toml w " . $dir . " ani w katalogach nadrzędnych"); return 1; }
+    try { $m = manifest.load($root); }
+    catch (Exception $e) { eecho($e->getMessage()); return 1; }
+    $r = manifest.report($root, $m);
+    foreach ($r[0] as $l) { echo $l; }
+    return $r[1] > 0 ? 1 : 0;
+}
+exit(main());
