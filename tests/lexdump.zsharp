@@ -1,5 +1,5 @@
 import Workspace.lexer;
 $file = System.args()[1];
 foreach (lexer.tokenize(File.read($file)) as $t) {
-    println($t["line"] . ":" . $t["col"]);
+    echo $t["line"] . ":" . $t["col"];
 }
