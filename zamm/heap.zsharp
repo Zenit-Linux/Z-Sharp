@@ -1,0 +1,444 @@
+namespace zamm_heap;
+
+import Workspace.zamm_config;
+import Workspace.zamm_errors;
+import Workspace.zamm_chunk;
+import Workspace.zamm_arena;
+
+##
+ * Heap ZAMM (port stage0/zamm/src/heap.rs): uchwyty z generacją, zakresy (ramki/temp), zadania,
+ * Large Object Space, retain/release, promote, adaptacyjne `classify`.
+ *
+ * Czas życia (Lifetime): "frame" | "temp" | "persistent" | "task:<id>".
+ * Escape: "No" | "Statement" | "Caller" | "Task" | "Program" | "Unknown".
+ * Uchwyt = liczba (gen << 32) | idx. Wartości przechowuje slot (`value`), destruktor: func($value).
+##
+class ZSlot {
+    public $gen;
+    public $live;
+    public $ptr;
+    public $size;
+    public $align;
+    public $store;     # "arena" | "los"
+    public $dtor;
+    public $refs;
+    public $owner;     # frame | temp | task | persistent
+    public $ty;
+    public $value;
+
+    public func __construct() {
+        $this->gen = 0;
+        $this->live = false;
+        $this->ptr = 0;
+        $this->size = 0;
+        $this->align = 1;
+        $this->store = "arena";
+        $this->dtor = null;
+        $this->refs = 0;
+        $this->owner = "persistent";
+        $this->ty = null;
+        $this->value = null;
+    }
+}
+
+class ZScope {
+    public $items;
+    public func __construct() { $this->items = []; }
+}
+
+class ZTask {
+    public $arena;
+    public $scope;
+    public func __construct($arena) { $this->arena = $arena; $this->scope = new ZScope(); }
+}
+
+func hint($size, $escape, $shared = false, $task = null) {
+    return ["size" => $size, "escape" => $escape, "shared" => $shared, "task" => $task];
+}
+
+func handle_idx($h) { return $h & 4294967295; }
+func handle_gen($h) { return ($h >> 32) & 4294967295; }
+func make_handle($idx, $gen) { return ($gen << 32) | $idx; }
+
+class ZHeap {
+    public $cfg;
+    public $pool;
+    public $frames;          # ZArena
+    public $frame_marks;     # lista [mark, ZScope]
+    public $temps;
+    public $temp_marks;
+    public $tasks;           # id => ZTask
+    public $task_ids;        # kolejność tworzenia
+    public $persistent;      # ZArena
+    public $persistent_scope;
+    public $slots;
+    public $free;
+    public $next_task;
+    public $large_bytes;
+    public $large_blocks;
+    public $large_peak;
+    public $allocs;
+    public $promoted;
+
+    public func __construct($cfg, $pool) {
+        $this->cfg = $cfg;
+        $this->pool = $pool;
+        $this->frames = new ZArena($pool);
+        $this->frame_marks = [];
+        $this->temps = new ZArena($pool);
+        $this->temp_marks = [];
+        $this->tasks = [];
+        $this->task_ids = [];
+        $this->persistent = new ZArena($pool);
+        $this->persistent_scope = new ZScope();
+        $this->slots = [];
+        $this->free = [];
+        $this->next_task = 1;
+        $this->large_bytes = 0;
+        $this->large_blocks = 0;
+        $this->large_peak = 0;
+        $this->allocs = 0;
+        $this->promoted = 0;
+    }
+
+    # ───────────── adaptacyjny wybór klasy ─────────────
+    # Rozmiar NIE wpływa na czas życia (tylko na magazyn).
+    public func classify($h) {
+        if ($h["shared"]) { return "shared"; }
+        $frame_ok = count($this->frame_marks) > 0;
+        $temp_ok = count($this->temp_marks) > 0;
+        $e = $h["escape"];
+        if (($e === "No" || $e === "Caller") && $frame_ok) { return "frame"; }
+        if ($e === "Statement" && $temp_ok) { return "temp"; }
+        if ($e === "Statement" && $frame_ok) { return "frame"; }
+        if ($e === "Task") {
+            if ($h["task"] !== null && has_key($this->tasks, $h["task"])) { return "task:" . $h["task"]; }
+            return "persistent";
+        }
+        return "persistent";
+    }
+
+    # ───────────── zakresy ─────────────
+    public func push_frame() { $this->frame_marks[] = [$this->frames->mark(), new ZScope()]; }
+    public func frame_depth() { return count($this->frame_marks); }
+    public func begin_temp() { $this->temp_marks[] = [$this->temps->mark(), new ZScope()]; }
+    public func temp_depth() { return count($this->temp_marks); }
+
+    # Jeśli któryś obiekt ma legalne odwołania (retain): Referenced(n) i NIC nie zwalnia.
+    public func pop_frame() { $this->end_stack(false, []); }
+    public func end_temp() { $this->end_stack(true, []); }
+
+    # Zamyka ramkę, przenosząc `rets` do ramki wywołującego (formalny transfer własności).
+    public func pop_frame_returning($rets) { return $this->end_stack(false, $rets); }
+
+    func end_stack($temp, $rets) {
+        $marks = $temp ? $this->temp_marks : $this->frame_marks;
+        if (count($marks) === 0) { zamm_errors.fail("NoScope"); }
+        $entry = $marks[count($marks) - 1];
+        $scope = $entry[1];
+        $owner = $temp ? "temp" : "frame";
+        foreach ($rets as $r) {
+            if (!$this->is_live($r) || $this->slots[handle_idx($r)]->owner !== $owner) { zamm_errors.fail("Stale"); }
+        }
+        $blocked = 0;
+        foreach ($scope->items as $h) {
+            $s = $this->slots[handle_idx($h)];
+            if ($s->live && $s->gen === handle_gen($h) && $s->refs > 0 && !in_array($h, $rets)) { $blocked++; }
+        }
+        if ($blocked > 0) { zamm_errors.fail("Referenced", $blocked); }
+        # zachowujemy zawartość zwracanych wartości — ich pamięć zniknie z ramką
+        $moved = [];
+        foreach ($rets as $r) {
+            $s = $this->slots[handle_idx($r)];
+            $moved[] = ["value" => $s->value, "size" => $s->size, "align" => $s->align, "dtor" => $s->dtor, "ty" => $s->ty];
+            $s->dtor = null;
+        }
+        if ($temp) { $this->temp_marks = array_slice($this->temp_marks, 0, count($this->temp_marks) - 1); }
+        else { $this->frame_marks = array_slice($this->frame_marks, 0, count($this->frame_marks) - 1); }
+        $this->destroy_scope($scope);
+        if ($temp) { $this->temps->rewind($entry[0]); } else { $this->frames->rewind($entry[0]); }
+        $out = [];
+        foreach ($moved as $m) {
+            $lt = $this->classify(hint($m["size"], $temp ? "Statement" : "Caller"));
+            if ($lt === "shared") { zamm_errors.fail("BadLayout"); }
+            $h = $this->alloc_layout($lt, $m["size"], $m["align"], $m["dtor"], $m["ty"]);
+            $this->slots[handle_idx($h)]->value = $m["value"];
+            $this->promoted++;
+            $out[] = $h;
+        }
+        return $out;
+    }
+
+    # ───────────── zadania ─────────────
+    public func new_task() {
+        $id = $this->next_task;
+        $this->next_task++;
+        $this->tasks[$id] = new ZTask(new ZArena($this->pool));
+        $this->task_ids[] = $id;
+        return $id;
+    }
+
+    public func task_arena($id) { return has_key($this->tasks, $id) ? $this->tasks[$id]->arena : null; }
+
+    func task_blocked($t) {
+        $blocked = 0;
+        foreach ($t->scope->items as $h) {
+            $s = $this->slots[handle_idx($h)];
+            if ($s->live && $s->gen === handle_gen($h) && $s->refs > 0) { $blocked++; }
+        }
+        return $blocked;
+    }
+
+    func forget_task($id) {
+        $t = $this->tasks[$id];
+        $new = [];
+        foreach ($this->task_ids as $x) { if ($x !== $id) { $new[] = $x; } }
+        $this->task_ids = $new;
+        $m = [];
+        foreach ($this->tasks as $k => $v) { if ($k !== $id) { $m[$k] = $v; } }
+        $this->tasks = $m;
+        return $t;
+    }
+
+    # Kończy zadanie: niszczy jego obiekty i oddaje chunki do puli.
+    public func end_task($id) {
+        if (!has_key($this->tasks, $id)) { zamm_errors.fail("UnknownTask"); }
+        $b = $this->task_blocked($this->tasks[$id]);
+        if ($b > 0) { zamm_errors.fail("Referenced", $b); }
+        $t = $this->forget_task($id);
+        $this->destroy_scope($t->scope);
+        $t->arena->drop();
+    }
+
+    # Odłącza arenę zadania do przekazania innemu wątkowi (własność przechodzi, bez kopiowania).
+    public func detach_task($id) {
+        if (!has_key($this->tasks, $id)) { zamm_errors.fail("UnknownTask"); }
+        $t = $this->tasks[$id];
+        foreach ($t->scope->items as $h) { if ($this->is_live($h)) { zamm_errors.fail("NotTransferable"); } }
+        if (!$t->arena->transferable()) { zamm_errors.fail("NotTransferable"); }
+        $this->forget_task($id);
+        return $t->arena;
+    }
+
+    public func attach_task($arena) {
+        $id = $this->next_task;
+        $this->next_task++;
+        $this->tasks[$id] = new ZTask($arena);
+        $this->task_ids[] = $id;
+        return $id;
+    }
+
+    # ───────────── alokacja ─────────────
+    func arena_of($lt) {
+        if ($lt === "frame") {
+            if (count($this->frame_marks) === 0) { zamm_errors.fail("NoScope"); }
+            return ["frame", $this->frames];
+        }
+        if ($lt === "temp") {
+            if (count($this->temp_marks) === 0) { zamm_errors.fail("NoScope"); }
+            return ["temp", $this->temps];
+        }
+        if ($lt === "persistent") { return ["persistent", $this->persistent]; }
+        if (starts_with($lt, "task:")) {
+            $id = intval(substr($lt, 5));
+            if (!has_key($this->tasks, $id)) { zamm_errors.fail("UnknownTask"); }
+            return ["task", $this->tasks[$id]->arena];
+        }
+        zamm_errors.fail("BadLayout");
+    }
+
+    ##
+     * Alokacja zerowana, zarządzana uchwytem. `persistent` startuje z refs = 1 (właściciel);
+     * pozostałe z refs = 0 (należą do zakresu).
+    ##
+    public func alloc_layout($lt, $size, $align, $dtor = null, $ty = null) {
+        $large = $size >= $this->cfg->large_object;
+        $oa = $this->arena_of($lt);
+        $owner = $oa[0];
+        $arena = $oa[1];
+        if ($large) {
+            $ptr = $this->pool->los_alloc($size, $align);
+            $store = "los";
+            $this->large_bytes += $size;
+            $this->large_blocks++;
+            if ($this->large_bytes > $this->large_peak) { $this->large_peak = $this->large_bytes; }
+        } else {
+            $ptr = $arena->alloc_raw($size, $align);
+            $store = "arena";
+            if ($size > 0) { $this->pool->zero($ptr, $size); }
+        }
+        $s = new ZSlot();
+        $s->live = true;
+        $s->ptr = $ptr;
+        $s->size = $size;
+        $s->align = $align;
+        $s->store = $store;
+        $s->dtor = $dtor;
+        $s->refs = $owner === "persistent" ? 1 : 0;
+        $s->owner = $owner;
+        $s->ty = $ty;
+        if (count($this->free) > 0) {
+            $n = count($this->free) - 1;
+            $idx = $this->free[$n];
+            $this->free = array_slice($this->free, 0, $n);
+            $s->gen = $this->slots[$idx]->gen;
+            $this->slots[$idx] = $s;
+        } else {
+            $this->slots[] = $s;
+            $idx = count($this->slots) - 1;
+        }
+        $h = make_handle($idx, $s->gen);
+        if ($lt === "frame") { $this->frame_marks[count($this->frame_marks) - 1][1]->items[] = $h; }
+        else if ($lt === "temp") { $this->temp_marks[count($this->temp_marks) - 1][1]->items[] = $h; }
+        else if ($owner === "task") { $this->tasks[intval(substr($lt, 5))]->scope->items[] = $h; }
+        else { $this->persistent_scope->items[] = $h; }
+        $this->allocs++;
+        return $h;
+    }
+
+    # Alokuje wartość (niszczoną deterministycznie przy końcu zakresu lub `release`).
+    public func alloc_value($lt, $v, $dtor = null, $ty = null) {
+        $h = $this->alloc_layout($lt, 8, 8, $dtor, $ty);
+        $this->slots[handle_idx($h)]->value = $v;
+        return $h;
+    }
+
+    public func alloc_hinted($hint, $v, $dtor = null, $ty = null) {
+        $c = $this->classify($hint);
+        if ($c === "shared") { zamm_errors.fail("BadLayout"); }
+        return $this->alloc_value($c, $v, $dtor, $ty);
+    }
+
+    # Szybka ścieżka dla danych o udowodnionym czasie życia: bez uchwytu i licznika (duże bloki dostają uchwyt).
+    public func alloc_in($lt, $size, $align) {
+        if ($size < $this->cfg->large_object) {
+            $oa = $this->arena_of($lt);
+            $p = $oa[1]->alloc_raw($size, $align);
+            if ($size > 0) { $this->pool->zero($p, $size); }
+            return $p;
+        }
+        $h = $this->alloc_layout($lt, $size, $align, null, null);
+        return $this->slots[handle_idx($h)]->ptr;
+    }
+
+    # ───────────── uchwyty ─────────────
+    func slot_of($h) {
+        $i = handle_idx($h);
+        if ($i >= count($this->slots)) { return null; }
+        $s = $this->slots[$i];
+        if (!$s->live || $s->gen !== handle_gen($h)) { return null; }
+        return $s;
+    }
+
+    public func is_live($h) { return $this->slot_of($h) !== null; }
+    public func ptr($h) { $s = $this->slot_of($h); return $s === null ? null : $s->ptr; }
+    public func layout($h) { $s = $this->slot_of($h); return $s === null ? null : ["size" => $s->size, "align" => $s->align]; }
+    public func refs($h) { $s = $this->slot_of($h); return $s === null ? null : $s->refs; }
+
+    # typ niezgodny albo uchwyt nieaktualny -> null (jak Option::None)
+    public func get($h, $ty = null) {
+        $s = $this->slot_of($h);
+        if ($s === null) { return null; }
+        if ($s->ty !== null && $ty !== null && $s->ty !== $ty) { return null; }
+        return $s->value;
+    }
+
+    public func set($h, $v) {
+        $s = $this->slot_of($h);
+        if ($s === null) { return false; }
+        $s->value = $v;
+        return true;
+    }
+
+    # Silne odwołanie: blokuje zwolnienie zakresu, dopóki nie zostanie `release`.
+    public func retain($h) {
+        $s = $this->slot_of($h);
+        if ($s === null) { return false; }
+        $s->refs++;
+        return true;
+    }
+
+    # Dla `persistent` spadek do 0 niszczy obiekt natychmiast (słabe uchwyty wygasają). true = zniszczono.
+    public func release($h) {
+        $s = $this->slot_of($h);
+        if ($s === null || $s->refs === 0) { return false; }
+        $s->refs--;
+        if ($s->refs === 0 && $s->owner === "persistent") { $this->destroy($h); return true; }
+        return false;
+    }
+
+    # Przenosi wartość do innego czasu życia (przekazanie destruktora).
+    public func promote($h, $to) {
+        $s = $this->slot_of($h);
+        if ($s === null) { zamm_errors.fail("Stale"); }
+        $nh = $this->alloc_layout($to, $s->size, $s->align, $s->dtor, $s->ty);
+        $this->slots[handle_idx($nh)]->value = $s->value;
+        $s->dtor = null;
+        $this->promoted++;
+        return $nh;
+    }
+
+    func destroy($h) {
+        $s = $this->slot_of($h);
+        if ($s === null) { return; }
+        $dtor = $s->dtor;
+        $value = $s->value;
+        $s->dtor = null;
+        $s->live = false;
+        $s->gen = ($s->gen + 1) & 4294967295;
+        $s->refs = 0;
+        $s->value = null;
+        $this->free[] = handle_idx($h);
+        if ($dtor !== null) { $dtor($value); }
+        if ($s->store === "los") {
+            $this->pool->los_free($s->ptr, $s->size);
+            $this->large_bytes -= $s->size;
+            $this->large_blocks--;
+        }
+    }
+
+    func destroy_scope($scope) {
+        for ($i = count($scope->items) - 1; $i >= 0; $i--) { $this->destroy($scope->items[$i]); }
+    }
+
+    public func stats() {
+        $t = ["chunks" => 0, "reserved" => 0, "used" => 0, "destructors" => 0];
+        foreach ($this->tasks as $task) {
+            $s = $task->arena->stats();
+            foreach ($s as $k => $v) { $t[$k] += $v; }
+        }
+        $live = 0;
+        foreach ($this->slots as $s) { if ($s->live) { $live++; } }
+        return [
+            "frame" => $this->frames->stats(), "temp" => $this->temps->stats(), "persistent" => $this->persistent->stats(), "tasks" => $t,
+            "frame_depth" => count($this->frame_marks), "temp_depth" => count($this->temp_marks), "live_tasks" => count($this->tasks),
+            "live_handles" => $live, "large_live_bytes" => $this->large_bytes, "large_live_blocks" => $this->large_blocks,
+            "large_peak_bytes" => $this->large_peak, "allocs" => $this->allocs, "promoted" => $this->promoted
+        ];
+    }
+
+    ##
+     * Deterministyczne zamknięcie: ramki, zakresy tymczasowe, zadania, potem obiekty trwałe (LIFO).
+    ##
+    public func drop() {
+        while (count($this->frame_marks) > 0) {
+            $e = $this->frame_marks[count($this->frame_marks) - 1];
+            $this->frame_marks = array_slice($this->frame_marks, 0, count($this->frame_marks) - 1);
+            $this->destroy_scope($e[1]);
+            $this->frames->rewind($e[0]);
+        }
+        while (count($this->temp_marks) > 0) {
+            $e = $this->temp_marks[count($this->temp_marks) - 1];
+            $this->temp_marks = array_slice($this->temp_marks, 0, count($this->temp_marks) - 1);
+            $this->destroy_scope($e[1]);
+            $this->temps->rewind($e[0]);
+        }
+        foreach ($this->task_ids as $id) {
+            if (has_key($this->tasks, $id)) { $this->destroy_scope($this->tasks[$id]->scope); }
+        }
+        $this->tasks = [];
+        $this->task_ids = [];
+        $this->destroy_scope($this->persistent_scope);
+        $this->persistent_scope = new ZScope();
+    }
+}
