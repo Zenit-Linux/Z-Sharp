@@ -1,1 +1,41 @@
+namespace zamm;
 
+import Workspace.zamm_config;
+import Workspace.zamm_errors;
+import Workspace.zamm_chunk;
+import Workspace.zamm_arena;
+import Workspace.zamm_heap;
+import Workspace.zamm_shared;
+
+##
+ * Z# Adaptive Memory Management napisany w Z# (bootstrap rdzenia: zamm/ + runtime/ + lib/).
+ * Fasada: jedna instancja = wspólna pula chunków + przestrzeń współdzielona; `heap()` i `arena()` tworzą
+ * niezależne heapy/areny nad tą pulą (jak zamm::Zamm w Rust).
+##
+class ZZamm {
+    public $cfg;
+    public $pool;
+    public $shared;
+
+    public func __construct($cfg) {
+        $this->cfg = $cfg;
+        $this->pool = new ZPool($cfg);
+        $this->shared = new ZShared($this->pool);
+    }
+
+    public func heap() { return new ZHeap($this->cfg, $this->pool); }
+    public func arena() { return new ZArena($this->pool); }
+}
+
+func create($cfg = null) {
+    if ($cfg === null) { $cfg = new ZConfig(); }
+    return new ZZamm($cfg);
+}
+
+# Konfiguracja z tabeli [memory] (np. wynik parsowania Z#.toml): ["chunk-kib" => 64, ...]. Zwraca [cfg, nieznane klucze].
+func config_from($memory) {
+    $cfg = new ZConfig();
+    $bad = [];
+    foreach ($memory as $k => $v) { if (!$cfg->set($k, $v)) { $bad[] = $k; } }
+    return [$cfg, $bad];
+}
