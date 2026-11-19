@@ -12,6 +12,17 @@ parser = "lib/parser.zsharp"
 cli    = "lib/cli.zsharp"
 zbc    = "lib/zbc.zsharp"
 sema   = "lib/sema.zsharp"
+zamm_config = "zamm/config.zsharp"
+zamm_errors = "zamm/errors.zsharp"
+zamm_chunk  = "zamm/chunk.zsharp"
+zamm_arena  = "zamm/arena.zsharp"
+zamm_heap   = "zamm/heap.zsharp"
+zamm_shared = "zamm/shared.zsharp"
+zamm        = "zamm/main.zsharp"
+runtime     = "runtime/main.zsharp"
+ir          = "lib/ir.zsharp"
+emit_c      = "lib/emit_c.zsharp"
+manifest    = "lib/manifest.zsharp"
 
 [bootstrap]
 stage0 = "stage0"             # interpreter AST w Rust (zsc0)
