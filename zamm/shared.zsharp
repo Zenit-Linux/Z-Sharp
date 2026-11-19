@@ -1,0 +1,97 @@
+namespace zamm_shared;
+
+import Workspace.zamm_errors;
+
+##
+ * Przestrzeń danych współdzielonych (port stage0/zamm/src/shared.rs): blok żyje, dopóki refs > 0.
+ * Uchwyt = (gen << 32) | idx. Destruktor: func($ptr).
+##
+class ZSharedSlot {
+    public $gen;
+    public $ptr;
+    public $size;
+    public $refs;
+    public $dtor;
+    public $live;
+    public func __construct() { $this->gen = 0; $this->ptr = 0; $this->size = 0; $this->refs = 0; $this->dtor = null; $this->live = false; }
+}
+
+class ZShared {
+    public $pool;
+    public $slots;
+    public $free;
+
+    public func __construct($pool) { $this->pool = $pool; $this->slots = []; $this->free = []; }
+
+    # Nowy blok (zerowany) z licznikiem 1.
+    public func alloc($size, $align, $dtor = null) {
+        $s = new ZSharedSlot();
+        $sz = $size < 1 ? 1 : $size;
+        $s->ptr = $this->pool->los_alloc($sz, $align < 1 ? 1 : $align);
+        $s->size = $sz;
+        $s->refs = 1;
+        $s->dtor = $dtor;
+        $s->live = true;
+        if (count($this->free) > 0) {
+            $n = count($this->free) - 1;
+            $idx = $this->free[$n];
+            $this->free = array_slice($this->free, 0, $n);
+            $s->gen = $this->slots[$idx]->gen;
+            $this->slots[$idx] = $s;
+        } else {
+            $this->slots[] = $s;
+            $idx = count($this->slots) - 1;
+        }
+        return ($s->gen << 32) | $idx;
+    }
+
+    func slot_of($h) {
+        $i = $h & 4294967295;
+        if ($i >= count($this->slots)) { return null; }
+        $s = $this->slots[$i];
+        if (!$s->live || $s->gen !== (($h >> 32) & 4294967295)) { return null; }
+        return $s;
+    }
+
+    public func ptr($h) { $s = $this->slot_of($h); return $s === null ? null : $s->ptr; }
+
+    public func retain($h) {
+        $s = $this->slot_of($h);
+        if ($s === null) { return false; }
+        $s->refs++;
+        return true;
+    }
+
+    # true = to było ostatnie odwołanie i blok został zniszczony
+    public func release($h) {
+        $s = $this->slot_of($h);
+        if ($s === null) { return false; }
+        $s->refs--;
+        if ($s->refs > 0) { return false; }
+        $s->live = false;
+        $s->gen = ($s->gen + 1) & 4294967295;
+        $this->free[] = $h & 4294967295;
+        $d = $s->dtor;
+        $s->dtor = null;
+        if ($d !== null) { $d($s->ptr); }
+        $this->pool->los_free($s->ptr, $s->size);
+        return true;
+    }
+
+    public func live_blocks() {
+        $n = 0;
+        foreach ($this->slots as $s) { if ($s->live) { $n++; } }
+        return $n;
+    }
+
+    public func drop() {
+        foreach ($this->slots as $s) {
+            if ($s->live) {
+                $s->live = false;
+                $d = $s->dtor;
+                $s->dtor = null;
+                if ($d !== null) { $d($s->ptr); }
+            }
+        }
+    }
+}
