@@ -1,0 +1,18 @@
+ok   toml: skalary
+ok   toml: tabele i tablice
+ok   toml: klucze kropkowane i inline
+ok   toml: tablica tabel
+ok   toml: hex, podkreślenia, wykładnik, \u, puste
+ok   toml: błędy mają linie
+ok   toml: nieznana wartość i napis wieloliniowy
+ok   manifest: model
+ok   manifest: [memory] -> konfiguracja ZAMM
+ok   manifest -> ZAMM: [memory] ustawia ZConfig
+ok   manifest -> ZAMM: nieznane klucze zgłaszane
+ok   manifest: walidacja wersji
+ok   manifest: bin bez entry
+ok   manifest: lib bez entry OK
+ok   manifest: zły identyfikator członka
+ok   manifest: brak sekcji
+ok   manifest: błąd składni niesie numer linii
+wynik: 0 niepowodzeń
