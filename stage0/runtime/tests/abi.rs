@@ -78,3 +78,19 @@ fn tasks_and_stats() {
         zs_runtime_free(rt);
     }
 }
+
+#[test]
+fn array_set_overwrites_and_checks_bounds() {
+    unsafe {
+        let rt = zs_runtime_new(0, 0);
+        let mut arr = ZValue::NULL;
+        assert_eq!(zs_array_new(rt, ZS_PERSISTENT as i64, 4, &mut arr), ZS_OK);
+        assert_eq!(zs_array_push(rt, ZS_PERSISTENT as i64, arr, ZValue::int(1)), ZS_OK);
+        assert_eq!(zs_array_set(arr, 0, ZValue::int(9)), ZS_OK);
+        let mut v = ZValue::NULL;
+        assert_eq!(zs_array_get(arr, 0, &mut v), ZS_OK); assert_eq!(v.as_int(), Some(9));
+        assert_eq!(zs_array_set(arr, 1, ZValue::int(0)), ZS_E_BOUNDS);
+        assert_eq!(zs_array_set(ZValue::int(1), 0, ZValue::int(0)), ZS_E_TYPE);
+        zs_runtime_free(rt);
+    }
+}
