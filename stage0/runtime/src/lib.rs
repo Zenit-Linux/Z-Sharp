@@ -106,6 +106,15 @@ impl Runtime {
         if arr.tag != ZS_ARRAY { return None; }
         unsafe { let h = arr.bits as *const ArrHdr; if (i as u64) < (*h).len { Some(*(*h).data.add(i)) } else { None } }
     }
+    pub fn array_set(arr: &ZValue, i: usize, v: ZValue) -> Result<(), Error> {
+        if arr.tag != ZS_ARRAY { return Err(Error::BadLayout); }
+        unsafe {
+            let h = arr.bits as *mut ArrHdr;
+            if (i as u64) >= (*h).len { return Err(Error::Stale); }
+            (*h).data.add(i).write(v);
+        }
+        Ok(())
+    }
     pub fn resource(&mut self, l: Lifetime, ctx: *mut c_void, close: Option<extern "C" fn(*mut c_void)>) -> Result<Handle, Error> {
         self.heap.alloc_value(l, Resource { ctx, close })
     }
@@ -163,6 +172,10 @@ macro_rules! guard { ($e:expr) => { catch_unwind(AssertUnwindSafe(|| $e)).unwrap
 #[no_mangle] pub unsafe extern "C" fn zs_array_len(arr: ZValue) -> i64 { Runtime::array_len(&arr).map_or(-1, |n| n as i64) }
 #[no_mangle] pub unsafe extern "C" fn zs_array_get(arr: ZValue, i: usize, out: *mut ZValue) -> i32 {
     match Runtime::array_get(&arr, i) { Some(v) => { *out = v; ZS_OK } None => if arr.tag == ZS_ARRAY { ZS_E_BOUNDS } else { ZS_E_TYPE } }
+}
+/// Nadpisuje element `i` (< len). ZS_E_TYPE dla nie-tablicy, ZS_E_BOUNDS poza zakresem.
+#[no_mangle] pub unsafe extern "C" fn zs_array_set(arr: ZValue, i: usize, v: ZValue) -> i32 {
+    match Runtime::array_set(&arr, i, v) { Ok(()) => ZS_OK, Err(Error::BadLayout) => ZS_E_TYPE, Err(_) => ZS_E_BOUNDS }
 }
 /// Rejestruje zasób; `close(ctx)` wykona się deterministycznie przy końcu zakresu (LIFO) lub `zs_release`.
 #[no_mangle] pub unsafe extern "C" fn zs_resource_new(rt: *mut Runtime, life: i64, ctx: *mut c_void, close: Option<extern "C" fn(*mut c_void)>, out: *mut u64) -> i32 {
