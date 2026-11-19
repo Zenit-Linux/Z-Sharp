@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "stage0",
+    "stage0/zs-lexer",
+    "stage0/zs-parser",
+    "stage0/zs-interp",
+    "stage0/zs-manifest",
+    "stage0/zamm",
+    "stage0/runtime",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "GPL-3.0"
+
+[profile.release]
+opt-level = 3
+debug = false
