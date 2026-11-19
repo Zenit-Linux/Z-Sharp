@@ -17,32 +17,32 @@ func fib(int $n): int { return $n < 2 ? $n : fib($n - 1) + fib($n - 2); }
 func greet($name = "World") { return "Hello, " . $name; }
 func sum(...$xs) { $t = 0; foreach ($xs as $x) { $t += $x; } return $t; }
 
-echo greet(), "\n";
-echo greet(name: "Z#"), "\n";
-println(fib(20));
-println(sum(1, 2, 3, 4));
+echo greet();
+echo greet(name: "Z#");
+echo fib(20);
+echo sum(1, 2, 3, 4);
 $d = new Puppy("Rex");
-println($d->speak());
-println(Dog.KIND);
+echo $d->speak();
+echo Dog.KIND;
 $a = [10, 20, 30];
 $a[] = 40;
 $m = ["x" => ["y" => 1]];
 $m["x"]["z"] = 2;
-println($a, $m);
+echo $a, $m;
 $sq = fn($x) => $x * $x;
-println(map($a, $sq));
+echo map($a, $sq);
 $n = 0;
 for ($i = 0; $i < 5; $i++) { if ($i == 3) { continue; } $n += $i; }
-println($n);
-println(match (3) { 1, 2 => "low", 3 => "three", default => "other" });
-try { throw new Exception("boom"); } catch (Exception $e) { println("caught " . $e->getMessage()); } finally { println("fin"); }
-try { $z = 1 / 0; } catch (Throwable $e) { println("runtime: " . $e->getMessage()); }
-println(System.os(), " ", Math.sqrt(16), " ", 7 / 2, " ", 8 / 2, " ", 2 ** 10);
-println(System.cpuCount() > 0 ? "cpu ok" : "cpu?");
+echo $n;
+echo match (3) { 1, 2 => "low", 3 => "three", default => "other" };
+try { throw new Exception("boom"); } catch (Exception $e) { echo "caught " . $e->getMessage(); } finally { echo "fin"; }
+try { $z = 1 / 0; } catch (Throwable $e) { echo "runtime: " . $e->getMessage(); }
+echo System.os(), " ", Math.sqrt(16), " ", 7 / 2, " ", 8 / 2, " ", 2 ** 10;
+echo System.cpuCount() > 0 ? "cpu ok" : "cpu?";
 $u = null;
-println($u ?? "default", $m["q"] ?? "none");
+echo $u ?? "default", $m["q"] ?? "none";
 $c = 0; $inc = func() { return 1; };
-println($inc());
-println(null ?? 5, isset_test());
+echo $inc();
+echo null ?? 5, isset_test();
 func isset_test() { return "ok"; }
-println("static: " . Dog.count);
+echo "static: " . Dog.count;
