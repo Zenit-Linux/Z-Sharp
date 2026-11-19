@@ -35,9 +35,8 @@ impl Interp {
         let a: Vec<Value> = args.iter().map(|(_, v)| v.clone()).collect();
         let a = &a[..];
         Some(match name {
-            "println" => { let s: Vec<String> = a.iter().map(to_text).collect(); let _ = writeln!(self.out, "{}", s.join(" ")); Ok(Value::Null) }
-            "print" => { for v in a { let _ = write!(self.out, "{}", to_text(v)); } Ok(Value::Null) }
-            "eprintln" => { self.flush(); let s: Vec<String> = a.iter().map(to_text).collect(); eprintln!("{}", s.join(" ")); Ok(Value::Null) }
+            "necho" => { for v in a { let _ = write!(self.out, "{}", to_text(v)); } Ok(Value::Null) }
+            "eecho" => { self.flush(); let s: Vec<String> = a.iter().map(to_text).collect(); eprintln!("{}", s.join(" ")); Ok(Value::Null) }
             "dump" => { for v in a { let _ = writeln!(self.out, "{}", dump(v)); } Ok(Value::Null) }
             "exit" => { let c = match a.first() { Some(Value::Int(c)) => *c as i32, _ => 0 }; Err(Flow::Exit(c)) }
             "assert" => { if arg(a, 0, name).map(|v| v.truthy()).unwrap_or(false) { Ok(Value::Null) } else {
