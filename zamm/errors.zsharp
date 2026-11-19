@@ -1,0 +1,29 @@
+namespace zamm_errors;
+
+##
+ * Błędy ZAMM (odpowiednik zamm::Error). `kind`:
+ * OutOfMemory | NoScope | UnknownTask | Referenced | Stale | NotTransferable | BadLayout
+ * `n` — liczba zablokowanych obiektów dla Referenced.
+##
+class ZammError extends Exception {
+    public $kind;
+    public $n;
+    public func __construct($kind, $n = 0) {
+        parent.__construct($kind);
+        $this->kind = $kind;
+        $this->n = $n;
+    }
+}
+
+func fail($kind, $n = 0) { throw new ZammError($kind, $n); }
+
+# kody ABI C (runtime/include/zs_runtime.h)
+func abi_code($kind) {
+    if ($kind === "OutOfMemory") { return 1; }
+    if ($kind === "NoScope" || $kind === "UnknownTask") { return 2; }
+    if ($kind === "Referenced") { return 3; }
+    if ($kind === "Stale") { return 4; }
+    if ($kind === "TypeMismatch") { return 5; }
+    if ($kind === "Bounds") { return 6; }
+    return 7;
+}
