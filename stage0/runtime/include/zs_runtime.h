@@ -36,6 +36,7 @@ int32_t zs_array_new(ZRuntime *rt, int64_t life, size_t cap, ZValue *out);
 int32_t zs_array_push(ZRuntime *rt, int64_t life, ZValue arr, ZValue v);
 int64_t zs_array_len(ZValue arr);
 int32_t zs_array_get(ZValue arr, size_t i, ZValue *out);
+int32_t zs_array_set(ZValue arr, size_t i, ZValue v);   /* i < len; ZS_E_BOUNDS poza zakresem */
 
 int32_t zs_resource_new(ZRuntime *rt, int64_t life, void *ctx, void (*close)(void *), uint64_t *out_handle);
 int32_t zs_retain(ZRuntime *rt, uint64_t h);
