@@ -3,8 +3,8 @@ import Workspace.lexer;
 
 $file = System.args()[1];
 try {
-    foreach (parser.parse(File.read($file)) as $s) { println(parser.dump($s)); }
+    foreach (parser.parse(File.read($file)) as $s) { echo parser.dump($s); }
 } catch (Exception $e) {
     # ParseError i LexError niosą lineNo/colNo
-    println("ERR " . $e->lineNo . ":" . $e->colNo);
+    echo "ERR " . $e->lineNo . ":" . $e->colNo;
 }
