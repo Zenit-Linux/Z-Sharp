@@ -1,0 +1,46 @@
+import Workspace.manifest;
+import Workspace.zamm;
+import Workspace.zamm_config;
+
+class Cnt { public static $fails = 0; }
+func check($name, $cond) { if (!$cond) { Cnt.fails++; } echo ($cond ? "ok   " : "FAIL ") . $name; }
+func toml_err($text) { try { manifest.parse_toml($text); } catch (TomlError $e) { return $e->line; } return 0; }
+func man_err($text) { try { manifest.parse($text, "."); } catch (ManifestError $e) { return $e->getMessage(); } return ""; }
+
+$t = manifest.parse_toml("a = 1\nb = \"x\\ny\"\nc = true # k\nd = 1.5\n[s]\nk = 'lit'\n[s.u]\nz = [1, 2,\n 3, # c\n]\n");
+$s = $t->get("s");
+check("toml: skalary", $t->get("a") === 1 && $t->get("b") === "x\ny" && $t->get("c") === true && $t->get("d") === 1.5);
+check("toml: tabele i tablice", $s->get("k") === "lit" && count($s->get("u")->get("z")) === 3);
+
+$t = manifest.parse_toml("a.b.c = 1\nx = { y = 2, z = \"q\" }\n");
+check("toml: klucze kropkowane i inline", $t->get("a")->get("b")->get("c") === 1 && $t->get("x")->get("y") === 2 && $t->get("x")->get("z") === "q");
+
+$t = manifest.parse_toml("[[p]]\nn = 1\n[[p]]\nn = 2\n[p.sub]\nq = 3\n");
+$p = $t->get("p");
+check("toml: tablica tabel", count($p) === 2 && $p[1]->get("sub")->get("q") === 3 && $p[0]->get("n") === 1);
+
+$t = manifest.parse_toml("h = 0xFF\nn = -1_000\nf = 2.5e3\nu = \"\\u0105\\u00e9\"\ne = []\ni = {}\n");
+check("toml: hex, podkreślenia, wykładnik, \\u, puste", $t->get("h") === 255 && $t->get("n") === -1000 && $t->get("f") === 2500.0 && $t->get("u") === "ąé" && count($t->get("e")) === 0 && $t->get("i")->count() === 0);
+
+check("toml: błędy mają linie", toml_err("a = 1\nb = \n") === 2 && toml_err("a = 1\na = 2\n") === 2 && toml_err("a = \"abc\n") === 1 && toml_err("[t]\nx = 1 y\n") === 2);
+check("toml: nieznana wartość i napis wieloliniowy", toml_err("a = foo\n") === 1 && toml_err("a = \"\"\"x\"\"\"\n") === 1);
+
+$m = manifest.parse("[package]\nname = \"zsc\"\nversion = \"0.0.1\"\nentry = \"src/main.zsharp\"\n[workspace.members]\nlexer = \"lib/lexer.zsharp\"\n[dependencies]\nZ-Sharp = { path = \"Z-Sharp\" }\n[extern.sqlite]\nkind = \"static\"\npath = \"vendor/libsqlite3.a\"\n[memory]\nchunk-kib = 64\n", ".");
+check("manifest: model", $m["name"] === "zsc" && $m["members"]->get("lexer") === "lib/lexer.zsharp" && $m["dependencies"][0]["path"] === "Z-Sharp"
+    && $m["externs"][0]["kind"] === "static" && $m["memory"]->get("chunk-kib") === 64);
+check("manifest: [memory] -> konfiguracja ZAMM", manifest.memory_map($m)["chunk-kib"] === 64);
+
+$cfg = zamm.config_from(manifest.memory_map($m));
+check("manifest -> ZAMM: [memory] ustawia ZConfig", $cfg[0]->chunk_size === 65536 && count($cfg[1]) === 0);
+$m2 = manifest.parse("[package]\nname=\"a\"\nkind=\"lib\"\nversion=\"0.0.1\"\n[memory]\nchunk-kib = 8\nbogus = 1\n", ".");
+$cfg2 = zamm.config_from(manifest.memory_map($m2));
+check("manifest -> ZAMM: nieznane klucze zgłaszane", $cfg2[0]->chunk_size === 8192 && count($cfg2[1]) === 1 && $cfg2[1][0] === "bogus");
+check("manifest: walidacja wersji", man_err("[package]\nname=\"a\"\nversion=\"1.0\"\nentry=\"x\"\n") !== "");
+check("manifest: bin bez entry", man_err("[package]\nname=\"a\"\nversion=\"1.0.0\"\n") === "Z#.toml: pakiet typu bin wymaga [package].entry");
+check("manifest: lib bez entry OK", man_err("[package]\nname=\"a\"\nkind=\"lib\"\nversion=\"1.0.0\"\n") === "");
+check("manifest: zły identyfikator członka", man_err("[workspace.members]\n\"bad name\" = \"x\"\n") !== "");
+check("manifest: brak sekcji", man_err("x = 1\n") === "Z#.toml: wymagana sekcja [package] lub [workspace]");
+check("manifest: błąd składni niesie numer linii", man_err("[package]\nname = \n") === "Z#.toml:2: brak wartości");
+
+echo "wynik: " . Cnt.fails . " niepowodzeń";
+exit(Cnt.fails > 0 ? 1 : 0);
