@@ -1,0 +1,319 @@
+namespace ir;
+
+import Workspace.parser;
+
+##
+ * Z# IR (strukturalne) — etap między AST a backendem.
+ * Wejście: lista instrukcji z parser.parse. Wyjście:
+ *   ["funcs" => [nazwa => ["name","line","params","ret","body","locals"]], "order" => [nazwy],
+ *    "top" => [instrukcje], "toplocals" => [nazwy], "calls_main" => bool, "errors" => [[linia, kod, tekst]]]
+ * Błędy dotyczą konstrukcji niedostępnych w backendzie natywnym 0.0.1 (zgłaszane jawnie, nie ignorowane).
+##
+class IrTables {
+    # nazwa => arność [min, max]; -1 = zmienna liczba argumentów
+    const BUILTINS = [
+        "count" => [1, 1], "strlen" => [1, 1], "typeof" => [1, 1], "is_int" => [1, 1], "is_float" => [1, 1],
+        "is_string" => [1, 1], "is_bool" => [1, 1], "is_array" => [1, 1], "is_null" => [1, 1], "strval" => [1, 1],
+        "boolval" => [1, 1], "intval" => [1, 1], "floatval" => [1, 1], "ord" => [1, 1], "chr" => [1, 1],
+        "contains" => [2, 2], "starts_with" => [2, 2], "ends_with" => [2, 2], "index_of" => [2, 2], "repeat" => [2, 2],
+        "substr" => [2, 3], "trim" => [1, 1], "join" => [2, 2], "in_array" => [2, 2], "range" => [2, 2], "keys" => [1, 1], "values" => [1, 1], "has_key" => [2, 2],
+        "necho" => [1, -1], "eecho" => [0, -1], "exit" => [0, 1]
+    ];
+    const MATH = ["sqrt" => 1, "floor" => 1, "ceil" => 1, "round" => 1, "abs" => 1, "min" => 2, "max" => 2];
+    const SIMPLE_TYPES = ["int", "float", "string", "bool", "array"];
+}
+
+class Lowerer {
+    public $funcs;
+    public $order;
+    public $errors;
+
+    public func __construct() {
+        $this->funcs = [];
+        $this->order = [];
+        $this->errors = [];
+    }
+
+    func err($line, $code, $msg) { $this->errors[] = [$line, $code, $msg]; }
+
+    # ── lokalne zmienne ──
+    func addLocal($locals, $name) {
+        if (!in_array($name, $locals)) { $locals[] = $name; }
+        return $locals;
+    }
+
+    func collectExpr($e, $locals) {
+        if (!parser.isNode($e)) { return $locals; }
+        $k = $e[0];
+        if ($k === ":Assign") { $locals = $this->collectTarget($e[2], $locals); }
+        else if ($k === ":AssignOp") { $locals = $this->collectTarget($e[3], $locals); }
+        else if ($k === ":IncDec") { $locals = $this->collectTarget($e[2], $locals); }
+        for ($i = 2; $i < count($e); $i++) { $locals = $this->collectAny($e[$i], $locals); }
+        return $locals;
+    }
+
+    func collectTarget($t, $locals) {
+        while ($t[0] === ":Index" || $t[0] === ":Prop") { $t = $t[2]; }
+        if ($t[0] === ":Var") { $locals = $this->addLocal($locals, $t[2]); }
+        return $locals;
+    }
+
+    func collectAny($x, $locals) {
+        if (parser.isNode($x)) {
+            if ($x[0] === ":Catch" && $x[3] !== null) { $locals = $this->addLocal($locals, $x[3]); }
+            if ($x[0] === ":Foreach") {
+                if ($x[3] !== null) { $locals = $this->addLocal($locals, $x[3]); }
+                $locals = $this->addLocal($locals, $x[4]);
+            }
+            return $this->collectExpr($x, $locals);
+        }
+        if (is_array($x)) { foreach ($x as $y) { $locals = $this->collectAny($y, $locals); } }
+        return $locals;
+    }
+
+    # ── walidacja ──
+    func checkStmts($list, $depth) { foreach ($list as $s) { $this->checkStmt($s, $depth); } }
+
+    func checkStmt($s, $depth) {
+        $k = $s[0];
+        $line = $s[1];
+        if ($k === ":Expr") { $this->checkExpr($s[2]); }
+        else if ($k === ":Echo") { foreach ($s[2] as $e) { $this->checkExpr($e); } }
+        else if ($k === ":Block") { $this->checkStmts($s[2], $depth); }
+        else if ($k === ":If") {
+            $this->checkExpr($s[2]);
+            $this->checkStmts($s[3], $depth);
+            if ($s[4] !== null) { $this->checkStmts($s[4], $depth); }
+        }
+        else if ($k === ":While") { $this->checkExpr($s[2]); $this->checkStmts($s[3], $depth); }
+        else if ($k === ":DoWhile") { $this->checkStmts($s[2], $depth); $this->checkExpr($s[3]); }
+        else if ($k === ":For") {
+            foreach ($s[2] as $e) { $this->checkExpr($e); }
+            if ($s[3] !== null) { $this->checkExpr($s[3]); }
+            foreach ($s[4] as $e) { $this->checkExpr($e); }
+            $this->checkStmts($s[5], $depth);
+        }
+        else if ($k === ":Foreach") { $this->checkExpr($s[2]); $this->checkStmts($s[5], $depth); }
+        else if ($k === ":Switch") {
+            $this->checkExpr($s[2]);
+            foreach ($s[3] as $c) {
+                if ($c[2] !== null) { $this->checkExpr($c[2]); }
+                $this->checkStmts($c[3], $depth);
+            }
+        }
+        else if ($k === ":Return") { if ($s[2] !== null) { $this->checkExpr($s[2]); } }
+        else if ($k === ":Break" || $k === ":Continue") { }
+        else if ($k === ":Try") {
+            $this->checkStmts($s[2], $depth);
+            foreach ($s[3] as $c) {
+                foreach ($c[2] as $t) {
+                    if (!in_array($t, ["Exception", "Error", "Throwable"])) { $this->err($line, "E0107", "klasa wyjątku `" . $t . "` niedostępna w backendzie natywnym 0.0.1 (obsługiwane: Exception, Error, Throwable)"); }
+                }
+                $this->checkStmts($c[4], $depth);
+            }
+            if ($s[4] !== null) { $this->checkStmts($s[4], $depth); }
+        }
+        else if ($k === ":Throw") {
+            $x = $s[2];
+            if ($x[0] === ":New") { $this->checkNew($x); }
+            else if ($x[0] === ":Var") { }
+            else { $this->err($line, "E0107", "throw obsługuje `new Exception(...)`/`new Error(...)` lub zmienną z wyjątkiem"); }
+        }
+        else if ($k === ":FuncStmt") { $this->err($line, "E0101", "funkcje zagnieżdżone nie są obsługiwane (deklaruj funkcje na najwyższym poziomie)"); }
+        else { $this->err($line, "E0101", "instrukcja " . substr($k, 1) . " niedostępna w backendzie natywnym 0.0.1"); }
+    }
+
+    func checkNew($x) {
+        if (!in_array($x[2], ["Exception", "Error"])) { $this->err($x[1], "E0107", "new " . $x[2] . ": tylko Exception i Error w backendzie natywnym 0.0.1"); }
+        if (count($x[3]) > 1) { $this->err($x[1], "E0104", "new " . $x[2] . ": oczekiwano co najwyżej 1 argumentu"); }
+        foreach ($x[3] as $a) { $this->checkExpr($a[3]); }
+    }
+
+    func containsTry($x) {
+        if (parser.isNode($x)) {
+            if ($x[0] === ":Try") { return true; }
+            if ($x[0] === ":FuncStmt") { return false; }
+            for ($i = 2; $i < count($x); $i++) { if ($this->containsTry($x[$i])) { return true; } }
+            return false;
+        }
+        if (is_array($x)) { foreach ($x as $y) { if ($this->containsTry($y)) { return true; } } }
+        return false;
+    }
+
+    func calleeName($c) {
+        if ($c[0] === ":Name") { return $c[2]; }
+        return null;
+    }
+
+    func checkExpr($e) {
+        if (!parser.isNode($e)) { return; }
+        $k = $e[0];
+        $line = $e[1];
+        if ($k === ":Null" || $k === ":Bool" || $k === ":Int" || $k === ":Float" || $k === ":Str" || $k === ":Var") { return; }
+        if ($k === ":Array") {
+            foreach ($e[2] as $it) {
+                if ($it[2] !== null) { $this->checkExpr($it[2]); }
+                $this->checkExpr($it[3]);
+            }
+            return;
+        }
+        if ($k === ":Index") {
+            $this->checkExpr($e[2]);
+            if ($e[3] !== null) { $this->checkExpr($e[3]); }
+            return;
+        }
+        if ($k === ":Unary") {
+            if ($e[2] === "BitNot") { $this->err($line, "E0102", "operatory bitowe niedostępne w backendzie natywnym 0.0.1"); }
+            $this->checkExpr($e[3]);
+            return;
+        }
+        if ($k === ":Binary") {
+            $op = $e[2];
+            if (in_array($op, ["BitAnd", "BitOr", "BitXor", "Shl", "Shr"])) { $this->err($line, "E0102", "operatory bitowe niedostępne w backendzie natywnym 0.0.1"); }
+            $this->checkExpr($e[3]);
+            $this->checkExpr($e[4]);
+            return;
+        }
+        if ($k === ":Assign") { $this->checkLvalue($e[2]); $this->checkExpr($e[3]); return; }
+        if ($k === ":AssignOp") { $this->checkLvalue($e[3]); $this->checkExpr($e[4]); return; }
+        if ($k === ":IncDec") { $this->checkLvalue($e[2]); return; }
+        if ($k === ":Ternary") {
+            $this->checkExpr($e[2]);
+            if ($e[3] !== null) { $this->checkExpr($e[3]); }
+            $this->checkExpr($e[4]);
+            return;
+        }
+        if ($k === ":Call") { $this->checkCall($e); return; }
+        $this->err($line, "E0102", "wyrażenie " . substr($k, 1) . " niedostępne w backendzie natywnym 0.0.1");
+    }
+
+    func checkLvalue($t) {
+        if ($t[0] === ":Var") { return; }
+        if ($t[0] === ":Index") { $this->checkExpr($t[2]); if ($t[3] !== null) { $this->checkExpr($t[3]); } return; }
+        $this->err($t[1], "E0102", "przypisanie do " . substr($t[0], 1) . " niedostępne w backendzie natywnym 0.0.1");
+    }
+
+    func checkCall($e) {
+        $line = $e[1];
+        $callee = $e[2];
+        $args = $e[3];
+        foreach ($args as $a) {
+            if ($a[2] !== null) { $this->err($line, "E0104", "argumenty nazwane niedostępne w backendzie natywnym 0.0.1"); }
+            if ($a[4]) { $this->err($line, "E0104", "operator ... (spread) niedostępny w backendzie natywnym 0.0.1"); }
+            $this->checkExpr($a[3]);
+        }
+        $n = count($args);
+        if ($callee[0] === ":Prop") {
+            if ($callee[3] === "getMessage" && $n === 0) { $this->checkExpr($callee[2]); return; }
+            $this->err($line, "E0102", "metoda `" . $callee[3] . "` niedostępna w backendzie natywnym 0.0.1 (obsługiwane: getMessage na wyjątku)");
+            return;
+        }
+        $name = $this->calleeName($callee);
+        if ($name !== null) {
+            if (has_key($this->funcs, $name)) {
+                $f = $this->funcs[$name];
+                $min = 0;
+                foreach ($f["params"] as $p) { if ($p[4] === null) { $min++; } }
+                if ($n < $min || $n > count($f["params"])) {
+                    $this->err($line, "E0104", "funkcja " . $name . " oczekuje " . ($min === count($f["params"]) ? $min : $min . ".." . count($f["params"])) . " argumentów, podano " . $n);
+                }
+            } else if (has_key(IrTables.BUILTINS, $name)) {
+                $ar = IrTables.BUILTINS[$name];
+                if ($n < $ar[0] || ($ar[1] >= 0 && $n > $ar[1])) { $this->err($line, "E0104", "funkcja wbudowana " . $name . ": zła liczba argumentów (" . $n . ")"); }
+            } else {
+                $this->err($line, "E0103", "nieznana funkcja `" . $name . "` (backend natywny 0.0.1 obsługuje funkcje użytkownika i podzbiór wbudowanych)");
+            }
+            return;
+        }
+        if ($callee[0] === ":Dot" && $callee[2][0] === ":Name") {
+            $m = $callee[2][2];
+            $f = $callee[3];
+            if ($m === "Math" && has_key(IrTables.MATH, $f)) {
+                if ($n !== IrTables.MATH[$f]) { $this->err($line, "E0104", "Math." . $f . ": zła liczba argumentów"); }
+                return;
+            }
+            if ($m === "System" && $f === "exit") { return; }
+            $this->err($line, "E0103", "funkcja " . $m . "." . $f . " niedostępna w backendzie natywnym 0.0.1");
+            return;
+        }
+        $this->err($line, "E0102", "wywołanie wartości niedostępne w backendzie natywnym 0.0.1");
+    }
+
+    func topCallsMain($x) {
+        if (parser.isNode($x)) {
+            if ($x[0] === ":Call" && $x[2][0] === ":Name" && $x[2][2] === "main") { return true; }
+            if ($x[0] === ":FuncStmt") { return false; }
+            for ($i = 2; $i < count($x); $i++) { if ($this->topCallsMain($x[$i])) { return true; } }
+            return false;
+        }
+        if (is_array($x)) { foreach ($x as $y) { if ($this->topCallsMain($y)) { return true; } } }
+        return false;
+    }
+}
+
+##
+ * Zwraca IR dla listy instrukcji (wynik parser.parse).
+##
+func lower($ast) {
+    $lw = new Lowerer();
+    $top = [];
+    # 1) deklaracje funkcji (aby wywołania w przód były znane)
+    foreach ($ast as $s) {
+        if ($s[0] === ":FuncStmt") {
+            $f = $s[2];
+            $name = $f[2];
+            if (has_key($lw->funcs, $name)) { $lw->errors[] = [$s[1], "E0101", "funkcja " . $name . " zdefiniowana wielokrotnie"]; continue; }
+            foreach ($f[3] as $p) {
+                if ($p[5]) { $lw->errors[] = [$s[1], "E0104", "parametry variadic (...) niedostępne w backendzie natywnym 0.0.1"]; }
+            }
+            $lw->funcs[$name] = ["name" => $name, "line" => $s[1], "params" => $f[3], "ret" => $f[4], "body" => $f[5], "locals" => [], "has_try" => false];
+            $lw->order[] = $name;
+        }
+    }
+    # 2) walidacja i lokalne
+    foreach ($ast as $s) {
+        $k = $s[0];
+        if ($k === ":FuncStmt") { continue; }
+        if ($k === ":Import") {
+            $path = $s[2];
+            if (!in_array($path[0], ["System", "Math"])) {
+                $lw->errors[] = [$s[1], "E0106", "import " . join($path, ".") . ": moduły Z# nie są jeszcze obsługiwane w backendzie natywnym 0.0.1 (użyj `zsc build --emit zbc`)"];
+            }
+            continue;
+        }
+        $top[] = $s;
+    }
+    foreach ($lw->order as $name) {
+        $f = $lw->funcs[$name];
+        $lw->checkStmts($f["body"], 0);
+        $loc = [];
+        foreach ($f["params"] as $p) { $loc = $lw->addLocal($loc, $p[2]); }
+        $loc = $lw->collectAny($f["body"], $loc);
+        $f["locals"] = $loc;
+        $f["has_try"] = $lw->containsTry($f["body"]);
+        $lw->funcs[$name] = $f;
+    }
+    $lw->checkStmts($top, 0);
+    $toploc = $lw->collectAny($top, []);
+    $callsMain = false;
+    foreach ($top as $s) { if ($lw->topCallsMain($s)) { $callsMain = true; } }
+    return ["funcs" => $lw->funcs, "order" => $lw->order, "top" => $top, "top_has_try" => $lw->containsTry($top), "toplocals" => $toploc, "calls_main" => $callsMain, "errors" => $lw->errors];
+}
+
+##
+ * Tekstowy zrzut IR (stabilny).
+##
+func report($ir) {
+    $out = [];
+    foreach ($ir["order"] as $name) {
+        $f = $ir["funcs"][$name];
+        $ps = [];
+        foreach ($f["params"] as $p) { $ps[] = "$" . $p[2] . (count($p[3]) > 0 ? ":" . join($p[3], "|") : "") . ($p[4] !== null ? "=…" : ""); }
+        $out[] = "fn " . $name . "(" . join($ps, ", ") . ")" . (count($f["ret"]) > 0 ? ": " . join($f["ret"], "|") : "") . " @" . $f["line"];
+        $out[] = "  locals: " . join($f["locals"], ", ");
+        $out[] = "  stmts: " . count($f["body"]);
+    }
+    $out[] = "top: " . count($ir["top"]) . " instrukcji, locals: " . join($ir["toplocals"], ", ");
+    $out[] = "main: " . (has_key($ir["funcs"], "main") ? ($ir["calls_main"] ? "wywołane jawnie" : "wywoływane automatycznie") : "brak");
+    return join($out, "\n");
+}
