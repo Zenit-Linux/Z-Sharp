@@ -1,0 +1,154 @@
+namespace zamm_chunk;
+
+import Workspace.zamm_config;
+import Workspace.zamm_errors;
+
+##
+ * Symulowana przestrzeń adresowa i pamięć: chunki dostają unikalne, rosnące, 16-bajtowo wyrównane adresy
+ * bazowe; zawartość to rzadka mapa adres -> wartość (komórka = bajt/słowo, zależnie od użytkownika).
+ * Dzięki temu cała logika ZAMM (przesuwanie wskaźnika, rewind, pula, poison) jest realnym kodem Z#,
+ * bez zależności od Rusta.
+##
+class ZChunk {
+    public $base;
+    public $size;
+    public $cells;         # adres => wartość
+    public $poison_from;   # offset >= tej wartości jest „zatruty” (null = brak)
+
+    public func __construct($base, $size) {
+        $this->base = $base;
+        $this->size = $size;
+        $this->cells = [];
+        $this->poison_from = null;
+    }
+}
+
+class ZPool {
+    public $cfg;
+    public $free;       # lista ZChunk
+    public $bytes;
+    public $hits;
+    public $misses;
+    public $next_addr;
+    public $all;        # wszystkie kiedykolwiek utworzone chunki, rosnąco po base
+    public $los;        # adres => wartość dla Large Object Space
+    public $los_next;
+
+    public func __construct($cfg) {
+        $this->cfg = $cfg;
+        $this->free = [];
+        $this->bytes = 0;
+        $this->hits = 0;
+        $this->misses = 0;
+        $this->next_addr = 4096;
+        $this->all = [];
+        $this->los = [];
+        $this->los_next = 1099511627776;   # 1 << 40
+    }
+
+    # najmniejszy pasujący z puli, inaczej świeży (jak ChunkPool::take)
+    public func take($min) {
+        $best = -1;
+        $bsize = 0;
+        for ($i = 0; $i < count($this->free); $i++) {
+            $c = $this->free[$i];
+            if ($c->size >= $min && ($best < 0 || $c->size < $bsize)) { $best = $i; $bsize = $c->size; }
+        }
+        if ($best >= 0) {
+            $c = $this->free[$best];
+            $last = count($this->free) - 1;
+            $this->free[$best] = $this->free[$last];      # swap_remove
+            $this->free = array_slice($this->free, 0, $last);
+            $this->bytes -= $c->size;
+            $this->hits++;
+            return $c;
+        }
+        $this->misses++;
+        $size = $min < 16 ? 16 : $min;
+        $c = new ZChunk($this->next_addr, $size);
+        $this->next_addr = (($this->next_addr + $size + 16) + 15) & ~15;
+        $this->all[] = $c;
+        return $c;
+    }
+
+    # oddaje chunk; gdy pula pełna — pamięć „wraca do systemu” (chunk znika z puli)
+    public func give($c) {
+        if ($this->bytes + $c->size <= $this->cfg->pool_cap_bytes) {
+            $this->bytes += $c->size;
+            $this->free[] = $c;
+        }
+    }
+
+    # [wolne chunki, wolne bajty, trafienia, chybienia]
+    public func stats() { return [count($this->free), $this->bytes, $this->hits, $this->misses]; }
+    public func trim() { $this->free = []; $this->bytes = 0; }
+
+    # ── dostęp do pamięci ──
+    func find($addr) {
+        $lo = 0;
+        $hi = count($this->all) - 1;
+        while ($lo <= $hi) {
+            $mid = ($lo + $hi) >> 1;
+            $c = $this->all[$mid];
+            if ($addr < $c->base) { $hi = $mid - 1; }
+            else if ($addr >= $c->base + $c->size) { $lo = $mid + 1; }
+            else { return $c; }
+        }
+        return null;
+    }
+
+    public func write($addr, $v) {
+        if ($addr >= 1099511627776) { $this->los[$addr] = $v; return; }
+        $c = $this->find($addr);
+        if ($c === null) { zamm_errors.fail("BadLayout"); }
+        $c->cells[$addr] = $v;
+    }
+
+    # nieznane/świeże = 0; zatrute = 0xDD
+    public func read($addr) {
+        if ($addr >= 1099511627776) { return $this->los[$addr] ?? 0; }
+        $c = $this->find($addr);
+        if ($c === null) { return null; }
+        if (has_key($c->cells, $addr)) { return $c->cells[$addr]; }
+        if ($c->poison_from !== null && $addr - $c->base >= $c->poison_from) { return 221; }
+        return 0;
+    }
+
+    public func write_bytes($addr, $size, $byte) {
+        for ($i = 0; $i < $size; $i++) { $this->write($addr + $i, $byte); }
+    }
+
+    public func write_slice($addr, $values) {
+        for ($i = 0; $i < count($values); $i++) { $this->write($addr + $i, $values[$i]); }
+    }
+
+    public func read_slice($addr, $n) {
+        $out = [];
+        for ($i = 0; $i < $n; $i++) { $out[] = $this->read($addr + $i); }
+        return $out;
+    }
+
+    # pamięć [addr, addr+size) staje się zerowa (jak write_bytes(p, 0, size) w Heap)
+    public func zero($addr, $size) {
+        if ($addr >= 1099511627776) {
+            foreach (keys($this->los) as $k) { if ($k >= $addr && $k < $addr + $size) { $this->los[$k] = 0; } }
+            return;
+        }
+        $c = $this->find($addr);
+        if ($c === null) { return; }
+        foreach (keys($c->cells) as $k) { if ($k >= $addr && $k < $addr + $size) { $c->cells[$k] = 0; } }
+    }
+
+    # LOS: nowy blok (adresy nigdy nie są ponownie używane)
+    public func los_alloc($size, $align) {
+        $a = $align < 1 ? 1 : $align;
+        $start = (($this->los_next + $a - 1) / $a);
+        $start = intval($start) * $a;
+        $this->los_next = $start + ($size < 1 ? 1 : $size) + 16;
+        return $start;
+    }
+
+    public func los_free($addr, $size) {
+        foreach (keys($this->los) as $k) { if ($k >= $addr && $k < $addr + $size) { $this->los[$k] = null; } }
+    }
+}
