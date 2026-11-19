@@ -1158,3 +1158,13 @@ stage0 plan jest taki ze bedzie napisany w rust (bedzie to sam zsc) natomiast zs
 3. zst - tak samo jak zsc roznica jest tylko taka ze to transpilator
 4. zsi - tak jak zsc tez osobne repo ale to jest interpreter jit (wydajnosciowe ambicje gdzies w okolicach lua jit)
 5. zzc - tak samo jak zsc ale cos czuje ze tu bedzie trzeba kombinowac skoro to frontend dla gcc ale jakos damy rade w prszyszlosci
+
+
+---
+
+## Dodatek: wyjście (`echo`, `necho`, `eecho`) — stage0 0.0.1
+
+- `echo a, b, c;` — wypisuje argumenty rozdzielone pojedynczą spacją i kończy nową linią.
+- `necho(a, b)` — wypisuje teksty jeden za drugim, bez separatora i bez nowej linii.
+- `eecho(a, b)` — jak `echo`, ale na standardowe wyjście błędów.
+- Tekst wartości: `null`, `true`/`false`, liczby całkowite, float z `.0` dla całkowitych < 1e15, tablice jako `[1, "a"]`.
