@@ -1,0 +1,26 @@
+[package]
+name = "demo"
+version = "1.2.3"
+kind = "lib"
+description = "pakiet testowy"
+
+[workspace.members]
+beta = "src/beta.zsharp"
+alpha = "src/alpha.zsharp"
+
+[dependencies]
+Z-Sharp = { path = "..", git = "https://example.com/Z-Sharp" }
+other = "1.0.0"
+absent = { path = "nie-ma" }
+
+[extern.sqlite]
+kind = "static"
+path = "vendor/libsqlite3.a"
+headers = ["sqlite3.h"]
+
+[memory]
+chunk-kib = 64
+poison = 1
+note = "tekst \"z cudzysłowem\""
+ratio = 2.5
+list = [1, "a", 2.0]
