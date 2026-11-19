@@ -1,0 +1,40 @@
+ok   config.set ok
+ok   config.set bad
+ok   arena: wyrównanie, wzrost, brak nakładania
+ok   arena: duże żądanie dostaje własny chunk
+ok   arena: rewind — destruktory LIFO
+ok   arena: pamięć po rewind ponownie używana
+ok   arena: drop niszczy resztę
+ok   arena: rewind oddaje chunki do puli
+ok   arena: kolejna arena trafia w pulę
+ok   arena: reset zatrzymuje chunki
+ok   arena: pierwsza alokacja po reset w tym samym chunku
+ok   arena: poison oznacza zwolnioną pamięć
+ok   arena: napisy i slice
+ok   arena: transfer tylko bez wartości związanych z wątkiem
+ok   heap: ramka — destruktory LIFO, uchwyty nieaktualne
+ok   heap: pop_frame bez ramki = NoScope
+ok   heap: obiekt z retain blokuje zakres
+ok   heap: po release zakres się zamyka
+ok   heap: zwracana wartość przenosi się do wywołującego
+ok   heap: zwracana wartość niszczona dokładnie raz
+ok   heap: licznik i słabe uchwyty
+ok   heap: cykl ze słabą krawędzią bez GC (A)
+ok   heap: cykl ze słabą krawędzią bez GC (B, brak żywych)
+ok   heap: LOS — duży blok poza areną
+ok   heap: LOS zwolniony z zakresem
+ok   heap: rozmiar nie decyduje o czasie życia
+ok   heap: bez ramki -> bezpiecznie trwała
+ok   heap: uchwyty typowane
+ok   heap: promote przenosi destruktor
+ok   heap: promote — destruktor po release
+ok   heap: zakresy temp niezależne od ramek
+ok   heap: zadanie odłączane do innego heapa
+ok   heap: zadanie dołączone, dane zachowane
+ok   heap: zakończone zadanie nieznane
+ok   heap: obiekt zadania blokuje detach
+ok   heap: end_task niszczy obiekty
+ok   heap: drop — ramki, temp, zadania, potem trwałe
+ok   shared: licznik odwołań
+ok   shared: nieaktualny uchwyt
+wynik: 0 niepowodzeń
