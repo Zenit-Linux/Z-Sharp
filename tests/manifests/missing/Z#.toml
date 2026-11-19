@@ -1,0 +1,6 @@
+[package]
+name = "m"
+version = "0.0.1"
+entry = "main.zsharp"
+[workspace.members]
+gone = "no/such.zsharp"
