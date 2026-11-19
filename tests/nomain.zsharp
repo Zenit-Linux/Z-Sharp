@@ -1,5 +1,5 @@
 echo("top-level");
 func main(): int {
-    println("main uruchomione automatycznie");
+    echo "main uruchomione automatycznie";
     return 7;
 }
