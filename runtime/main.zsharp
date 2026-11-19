@@ -1,1 +1,223 @@
+namespace runtime;
 
+import Workspace.zamm;
+import Workspace.zamm_config;
+import Workspace.zamm_errors;
+import Workspace.zamm_chunk;
+import Workspace.zamm_arena;
+import Workspace.zamm_heap;
+
+##
+ * Runtime Z# napisany w Z# (bootstrap: zastępuje Rustowy stage0/runtime jako definicja kontraktu).
+ * Ten sam model co `runtime/include/zs_runtime.h`: ZValue = [tag, bits], napisy i tablice w ZAMM,
+ * zasoby z deterministycznym zamknięciem, statystyki pamięci, kody błędów ZS_E_*.
+ *
+ * Czas życia (life): ZS_FRAME=0, ZS_TEMP=1, ZS_PERSISTENT=2, zadanie = 16 + id.
+##
+class ZS {
+    const NULL = 0;
+    const BOOL = 1;
+    const INT = 2;
+    const FLOAT = 3;
+    const STR = 4;
+    const ARRAY = 5;
+    const OBJ = 6;
+    const FRAME = 0;
+    const TEMP = 1;
+    const PERSISTENT = 2;
+    const TASK_BASE = 16;
+    const OK = 0;
+    const E_OOM = 1;
+    const E_SCOPE = 2;
+    const E_REFERENCED = 3;
+    const E_STALE = 4;
+    const E_TYPE = 5;
+    const E_BOUNDS = 6;
+    const E_INTERNAL = 7;
+}
+
+# ───────── ZValue ─────────
+func v_null() { return [0, 0]; }
+func v_bool($b) { return [1, $b ? 1 : 0]; }
+func v_int($i) { return [2, $i]; }
+func v_float($f) { return [3, $f]; }
+func v_tag($v) { return $v[0]; }
+func v_as_int($v) { return $v[0] === 2 ? $v[1] : null; }
+func v_as_float($v) { return $v[0] === 3 ? $v[1] : null; }
+
+##
+ * Nagłówek napisu/tablicy żyje w pamięci ZAMM pod adresem `bits`:
+ *   napis:   [addr] = długość w bajtach, [addr+8..] = znaki
+ *   tablica: [addr] = len, [addr+1] = cap, [addr+2] = adres bloku danych
+##
+class ZRuntime {
+    public $zamm;
+    public $heap;
+    public $pool;
+
+    public func __construct($chunkKib = 0, $largeKib = 0) {
+        $cfg = new ZConfig();
+        if ($chunkKib > 0) { $cfg->set("chunk-kib", $chunkKib); }
+        if ($largeKib > 0) { $cfg->set("large-object-kib", $largeKib); }
+        $this->zamm = zamm.create($cfg);
+        $this->heap = $this->zamm->heap();
+        $this->pool = $this->zamm->pool;
+    }
+
+    # life -> Lifetime ZAMM albo null (zły kod)
+    func lt($life) {
+        if ($life === 0) { return "frame"; }
+        if ($life === 1) { return "temp"; }
+        if ($life === 2) { return "persistent"; }
+        if ($life >= 16) {
+            $id = $life - 16;
+            if ($this->heap->task_arena($id) === null) { return null; }
+            return "task:" . $id;
+        }
+        return null;
+    }
+
+    # ───── zakresy ─────
+    public func frame_push() { $this->heap->push_frame(); }
+    public func frame_pop() { return $this->guard(func() { $this->heap->pop_frame(); }); }
+    public func temp_begin() { $this->heap->begin_temp(); }
+    public func temp_end() { return $this->guard(func() { $this->heap->end_temp(); }); }
+    public func task_new() { return 16 + $this->heap->new_task(); }
+    public func task_end($task) { return $this->guard(func() { $this->heap->end_task($task - 16); }); }
+
+    # wykonuje operację ZAMM i zamienia wyjątek na kod ZS_E_*
+    public func guard($f) {
+        try { $f(); }
+        catch (ZammError $e) { return zamm_errors.abi_code($e->kind); }
+        return 0;
+    }
+
+    # ───── napisy ─────
+    # zwraca [kod, ZValue]
+    public func str_new($life, $s) {
+        $l = $this->lt($life);
+        if ($l === null) { return [ZS.E_SCOPE, v_null()]; }
+        try {
+            $n = strlen($s);
+            $p = $this->heap->alloc_in($l, 8 + $n, 8);
+            $this->pool->write($p, $n);
+            $cs = chars($s);
+            for ($i = 0; $i < count($cs); $i++) { $this->pool->write($p + 8 + $i, $cs[$i]); }
+            $this->pool->write($p + 1, count($cs));       # liczba znaków (stage0 nie ma surowych bajtów)
+            return [0, [4, $p]];
+        } catch (ZammError $e) { return [zamm_errors.abi_code($e->kind), v_null()]; }
+    }
+
+    public func str_len($v) { return $v[0] === 4 ? $this->pool->read($v[1]) : -1; }
+
+    public func str_get($v) {
+        if ($v[0] !== 4) { return null; }
+        $p = $v[1];
+        $nc = $this->pool->read($p + 1);
+        $out = "";
+        for ($i = 0; $i < $nc; $i++) { $out .= $this->pool->read($p + 8 + $i); }
+        return $out;
+    }
+
+    public func str_concat($life, $a, $b) {
+        $x = $this->str_get($a);
+        $y = $this->str_get($b);
+        if ($x === null || $y === null) { return [ZS.E_TYPE, v_null()]; }
+        return $this->str_new($life, $x . $y);
+    }
+
+    # ───── tablice ─────
+    public func array_new($life, $cap) {
+        $l = $this->lt($life);
+        if ($l === null) { return [ZS.E_SCOPE, v_null()]; }
+        if ($cap < 4) { $cap = 4; }
+        try {
+            $h = $this->heap->alloc_in($l, 24, 8);
+            $d = $this->heap->alloc_in($l, $cap * 16, 8);
+            $this->pool->write($h, 0);
+            $this->pool->write($h + 1, $cap);
+            $this->pool->write($h + 2, $d);
+            return [0, [5, $h]];
+        } catch (ZammError $e) { return [zamm_errors.abi_code($e->kind), v_null()]; }
+    }
+
+    ##
+     * Dodaje element; przy zapełnieniu dane przenoszone są do większego bloku w tym samym czasie życia
+     * (stary blok wraca do puli razem z zakresem — koszt liniowo ograniczony: suma geometryczna).
+    ##
+    public func array_push($life, $arr, $v) {
+        $l = $this->lt($life);
+        if ($l === null) { return ZS.E_SCOPE; }
+        if ($arr[0] !== 5) { return ZS.E_TYPE; }
+        try {
+            $h = $arr[1];
+            $len = $this->pool->read($h);
+            $cap = $this->pool->read($h + 1);
+            $d = $this->pool->read($h + 2);
+            if ($len === $cap) {
+                $ncap = $cap * 2;
+                $nd = $this->heap->alloc_in($l, $ncap * 16, 8);
+                for ($i = 0; $i < $len; $i++) { $this->pool->write($nd + $i * 2, $this->pool->read($d + $i * 2)); $this->pool->write($nd + $i * 2 + 1, $this->pool->read($d + $i * 2 + 1)); }
+                $d = $nd;
+                $this->pool->write($h + 2, $d);
+                $this->pool->write($h + 1, $ncap);
+            }
+            $this->pool->write($d + $len * 2, $v[0]);
+            $this->pool->write($d + $len * 2 + 1, $v[1]);
+            $this->pool->write($h, $len + 1);
+            return 0;
+        } catch (ZammError $e) { return zamm_errors.abi_code($e->kind); }
+    }
+
+    public func array_len($arr) { return $arr[0] === 5 ? $this->pool->read($arr[1]) : -1; }
+
+    # [kod, ZValue]
+    public func array_get($arr, $i) {
+        if ($arr[0] !== 5) { return [ZS.E_TYPE, v_null()]; }
+        $h = $arr[1];
+        if ($i < 0 || $i >= $this->pool->read($h)) { return [ZS.E_BOUNDS, v_null()]; }
+        $d = $this->pool->read($h + 2);
+        return [0, [$this->pool->read($d + $i * 2), $this->pool->read($d + $i * 2 + 1)]];
+    }
+
+    public func array_set($arr, $i, $v) {
+        if ($arr[0] !== 5) { return ZS.E_TYPE; }
+        $h = $arr[1];
+        if ($i < 0 || $i >= $this->pool->read($h)) { return ZS.E_BOUNDS; }
+        $d = $this->pool->read($h + 2);
+        $this->pool->write($d + $i * 2, $v[0]);
+        $this->pool->write($d + $i * 2 + 1, $v[1]);
+        return 0;
+    }
+
+    # ───── zasoby (deterministyczne zamknięcie LIFO) ─────
+    # zwraca [kod, uchwyt]; close(ctx) wykona się przy końcu zakresu albo `release`
+    public func resource_new($life, $ctx, $close) {
+        $l = $this->lt($life);
+        if ($l === null) { return [ZS.E_SCOPE, 0]; }
+        try { return [0, $this->heap->alloc_value($l, $ctx, $close, "resource")]; }
+        catch (ZammError $e) { return [zamm_errors.abi_code($e->kind), 0]; }
+    }
+
+    public func retain($h) { return $this->heap->retain($h) ? ZS.OK : ZS.E_STALE; }
+    public func release($h) { return $this->heap->release($h) ? 1 : 0; }
+    public func handle_live($h) { return $this->heap->is_live($h) ? 1 : 0; }
+
+    # ───── statystyki (ZMemStats) ─────
+    public func mem_stats() {
+        $s = $this->heap->stats();
+        $p = $this->pool->stats();
+        return [
+            "frame_used" => $s["frame"]["used"], "temp_used" => $s["temp"]["used"], "persistent_used" => $s["persistent"]["used"],
+            "task_used" => $s["tasks"]["used"],
+            "arena_chunks" => $s["frame"]["chunks"] + $s["temp"]["chunks"] + $s["persistent"]["chunks"] + $s["tasks"]["chunks"],
+            "live_handles" => $s["live_handles"], "large_live_bytes" => $s["large_live_bytes"], "large_live_blocks" => $s["large_live_blocks"],
+            "allocs" => $s["allocs"], "promoted" => $s["promoted"],
+            "pool_free_chunks" => $p[0], "pool_hits" => $p[2], "pool_misses" => $p[3]
+        ];
+    }
+
+    public func free() { $this->heap->drop(); }
+}
+
+func create($chunkKib = 0, $largeKib = 0) { return new ZRuntime($chunkKib, $largeKib); }
