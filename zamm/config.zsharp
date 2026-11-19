@@ -1,0 +1,41 @@
+namespace zamm_config;
+
+##
+ * ZAMM — konfiguracja (port 1:1 z stage0/zamm/src/config.rs).
+ * Rozmiary w bajtach. `set` przyjmuje klucze z sekcji [memory] pliku Z#.toml (w KiB).
+##
+class ZConfig {
+    public $chunk_size;       # rozmiar pierwszego chunka areny
+    public $max_chunk_size;   # chunk rośnie 2x do tej granicy
+    public $large_object;     # alokacje >= tej wartości trafiają do LOS
+    public $retain_chunks;    # ile chunków arena zatrzymuje po reset
+    public $pool_cap_bytes;   # maks. pamięć w wolnej puli chunków
+    public $poison;           # wypełnianie zwolnionej pamięci wzorcem 0xDD
+
+    public func __construct() {
+        $this->chunk_size = 64 * 1024;
+        $this->max_chunk_size = 1024 * 1024;
+        $this->large_object = 256 * 1024;
+        $this->retain_chunks = 4;
+        $this->pool_cap_bytes = 16 * 1024 * 1024;
+        $this->poison = true;
+    }
+
+    ##
+     * Zwraca false dla nieznanej nazwy lub złej wartości.
+    ##
+    public func set($key, $val) {
+        if (!is_int($val) || $val < 0) { return false; }
+        if ($key === "chunk-kib" && $val >= 1) { $this->chunk_size = $val * 1024; }
+        else if ($key === "max-chunk-kib" && $val >= 1) { $this->max_chunk_size = $val * 1024; }
+        else if ($key === "large-object-kib" && $val >= 1) { $this->large_object = $val * 1024; }
+        else if ($key === "retain-chunks") { $this->retain_chunks = $val; }
+        else if ($key === "pool-cap-kib") { $this->pool_cap_bytes = $val * 1024; }
+        else if ($key === "poison") { $this->poison = $val !== 0; }
+        else { return false; }
+        if ($this->max_chunk_size < $this->chunk_size) { $this->max_chunk_size = $this->chunk_size; }
+        return true;
+    }
+}
+
+func default_config() { return new ZConfig(); }
