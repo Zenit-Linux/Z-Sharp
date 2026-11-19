@@ -313,7 +313,11 @@ impl Interp {
         match &s.kind {
             StmtKind::Expr(e) => { self.eval(e)?; }
             StmtKind::Echo(es) => {
-                for e in es { let v = self.eval(e)?; let _ = self.out.write_all(to_text(&v).as_bytes()); }
+                // `echo a, b;` — argumenty rozdzielone spacją, zakończone nową linią
+                let mut parts: Vec<String> = Vec::with_capacity(es.len());
+                for e in es { let v = self.eval(e)?; parts.push(to_text(&v)); }
+                let _ = self.out.write_all(parts.join(" ").as_bytes());
+                let _ = self.out.write_all(b"\n");
             }
             StmtKind::Block(b) => self.exec_block(b)?,
             StmtKind::If(c, t, e) => {
