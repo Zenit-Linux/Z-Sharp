@@ -1,0 +1,177 @@
+import Workspace.zamm;
+import Workspace.zamm_config;
+import Workspace.zamm_errors;
+import Workspace.zamm_chunk;
+import Workspace.zamm_arena;
+import Workspace.zamm_heap;
+
+class Log { public $v; public func __construct() { $this->v = []; } }
+
+func check($name, $cond) {
+    global_fail($cond);
+    echo ($cond ? "ok   " : "FAIL ") . $name;
+}
+class Counter { public static $fails = 0; }
+func global_fail($cond) { if (!$cond) { Counter.fails++; } }
+
+func small() {
+    $c = new ZConfig();
+    $c->chunk_size = 1024; $c->max_chunk_size = 8192; $c->large_object = 4096; $c->poison = true;
+    return zamm.create($c);
+}
+func noisy($log, $name) { return func($v) { $log->v[] = $name; }; }
+func err_kind($f) {
+    try { $f(); } catch (ZammError $e) { return $e->kind . ($e->n > 0 ? ":" . $e->n : ""); }
+    return "none";
+}
+
+# --- config ---
+$c = new ZConfig();
+check("config.set ok", $c->set("chunk-kib", 4) && $c->chunk_size === 4096 && $c->max_chunk_size >= 4096);
+check("config.set bad", !$c->set("nope", 1) && !$c->set("chunk-kib", 0) && !$c->set("retain-chunks", -1));
+
+# --- arena ---
+$z = small(); $a = $z->arena(); $ptrs = [];
+for ($i = 0; $i < 300; $i++) {
+    $align = 1 << ($i % 7); $size = 1 + ($i * 37) % 200;
+    $p = $a->alloc_raw($size, $align);
+    if ($p % $align !== 0) { check("align $align", false); }
+    $z->pool->write_bytes($p, $size, $i % 251);
+    $ptrs[] = [$p, $size, $i % 251];
+}
+$ok = true;
+foreach ($ptrs as $t) { for ($k = 0; $k < $t[1]; $k++) { if ($z->pool->read($t[0] + $k) !== $t[2]) { $ok = false; } } }
+$s = $a->stats();
+check("arena: wyrównanie, wzrost, brak nakładania", $ok && $s["chunks"] > 1 && $s["used"] > 0);
+
+$z = small(); $a = $z->arena(); $p = $a->alloc_raw(20000, 8); $z->pool->write_bytes($p, 20000, 7);
+check("arena: duże żądanie dostaje własny chunk", $a->stats()["reserved"] >= 20000 && $z->pool->read($p + 19999) === 7);
+
+$z = small(); $a = $z->arena(); $log = new Log();
+$a->alloc_val(1, noisy($log, "keep")); $m = $a->mark(); $p1 = $a->alloc_raw(64, 8);
+$a->alloc_val(1, noisy($log, "a")); $a->alloc_val(2, noisy($log, "b")); $a->alloc_val(3, noisy($log, "c"));
+$a->rewind($m);
+check("arena: rewind — destruktory LIFO", join($log->v, ",") === "c,b,a");
+check("arena: pamięć po rewind ponownie używana", $a->alloc_raw(64, 8) === $p1);
+$a->drop();
+check("arena: drop niszczy resztę", $log->v[count($log->v) - 1] === "keep");
+
+$c = new ZConfig(); $c->chunk_size = 512; $c->max_chunk_size = 512; $c->retain_chunks = 1; $z = zamm.create($c);
+$a = $z->arena(); $m = $a->mark();
+for ($i = 0; $i < 40; $i++) { $a->alloc_raw(256, 8); }
+$many = $a->stats()["chunks"] >= 10; $a->rewind($m);
+check("arena: rewind oddaje chunki do puli", $many && $a->stats()["chunks"] === 1 && $z->pool->stats()[0] >= 9);
+$b = $z->arena(); $b->alloc_raw(100, 8);
+check("arena: kolejna arena trafia w pulę", $z->pool->stats()[2] >= 1);
+
+$c = new ZConfig(); $c->chunk_size = 256; $c->max_chunk_size = 256; $c->retain_chunks = 3; $z = zamm.create($c);
+$a = $z->arena(); $first = $a->alloc_raw(200, 8);
+for ($i = 0; $i < 10; $i++) { $a->alloc_raw(200, 8); }
+$a->reset();
+check("arena: reset zatrzymuje chunki", $a->stats()["used"] === 0 && $a->stats()["chunks"] <= 3 && $a->stats()["chunks"] >= 1);
+check("arena: pierwsza alokacja po reset w tym samym chunku", $a->alloc_raw(200, 8) === $first);
+
+$z = small(); $a = $z->arena(); $m = $a->mark(); $p = $a->alloc_raw(32, 8);
+$z->pool->write_bytes($p, 32, 1); $a->rewind($m);
+check("arena: poison oznacza zwolnioną pamięć", $z->pool->read($p) === 221);
+
+$z = small(); $a = $z->arena(); $sp = $a->alloc_str("zażółć gęślą jaźń"); $sl = $a->alloc_slice_copy([1, 2, 3]);
+check("arena: napisy i slice", $a->read_str($sp[0], $sp[2]) === "zażółć gęślą jaźń" && join($a->read_slice($sl, 3), ",") === "1,2,3");
+
+$z = small(); $a = $z->arena(); $a->alloc_send(5);
+$b = $z->arena(); $b->alloc_val(1);
+check("arena: transfer tylko bez wartości związanych z wątkiem", $a->transferable() && !$b->transferable());
+
+# --- heap ---
+$z = small(); $h = $z->heap(); $log = new Log();
+$h->push_frame();
+$ha = $h->alloc_value("frame", 1, noisy($log, "a"), "Noisy"); $hb = $h->alloc_value("frame", 2, noisy($log, "b"), "Noisy");
+$live = $h->get($ha, "Noisy") === 1;
+$h->pop_frame();
+check("heap: ramka — destruktory LIFO, uchwyty nieaktualne", $live && join($log->v, ",") === "b,a" && $h->get($ha) === null && !$h->is_live($hb));
+check("heap: pop_frame bez ramki = NoScope", err_kind(func() { $h->pop_frame(); }) === "NoScope");
+
+$z = small(); $h = $z->heap(); $log = new Log(); $h->push_frame();
+$ha = $h->alloc_value("frame", 1, noisy($log, "a"));
+$h->retain($ha);
+check("heap: obiekt z retain blokuje zakres", err_kind(func() { $h->pop_frame(); }) === "Referenced:1" && count($log->v) === 0 && $h->is_live($ha));
+$h->release($ha); $h->pop_frame();
+check("heap: po release zakres się zamyka", join($log->v, ",") === "a");
+
+$z = small(); $h = $z->heap(); $log = new Log(); $h->push_frame(); $h->push_frame();
+$tmp = $h->alloc_value("frame", 0, noisy($log, "tmp")); $ret = $h->alloc_value("frame", 42, noisy($log, "ret"));
+$out = $h->pop_frame_returning([$ret]);
+check("heap: zwracana wartość przenosi się do wywołującego", join($log->v, ",") === "tmp" && !$h->is_live($tmp) && !$h->is_live($ret) && $h->get($out[0]) === 42);
+$h->pop_frame();
+check("heap: zwracana wartość niszczona dokładnie raz", join($log->v, ",") === "tmp,ret");
+
+$z = small(); $h = $z->heap(); $log = new Log();
+$strong = $h->alloc_value("persistent", 1, noisy($log, "p")); $weak = $strong; $h->retain($strong);
+$r1 = $h->release($strong); $still = $h->get($weak) !== null; $r2 = $h->release($strong);
+check("heap: licznik i słabe uchwyty", !$r1 && $still && $r2 && join($log->v, ",") === "p" && $h->get($weak) === null && !$h->release($strong));
+
+$z = small(); $h = $z->heap(); $log = new Log();
+$a = $h->alloc_value("persistent", ["name" => "A", "peer" => null], noisy($log, "A"));
+$b = $h->alloc_value("persistent", ["name" => "B", "peer" => null], noisy($log, "B"));
+$h->set($a, ["name" => "A", "peer" => $b]); $h->retain($b); $h->set($b, ["name" => "B", "peer" => $a]);
+$h->release($a);
+check("heap: cykl ze słabą krawędzią bez GC (A)", join($log->v, ",") === "A" && !$h->is_live($h->get($b)["peer"]));
+$h->release($b); $h->release($b);
+check("heap: cykl ze słabą krawędzią bez GC (B, brak żywych)", join($log->v, ",") === "A,B" && $h->stats()["live_handles"] === 0);
+
+$z = small(); $h = $z->heap(); $h->push_frame();
+$big = $h->alloc_layout("frame", 100000, 16); $p = $h->ptr($big); $z->pool->write_bytes($p, 1000, 5);
+$st = $h->stats();
+check("heap: LOS — duży blok poza areną", $st["large_live_blocks"] === 1 && $st["large_live_bytes"] === 100000 && $st["frame"]["used"] === 0 && $z->pool->read($p + 999) === 5);
+$h->pop_frame(); $st = $h->stats();
+check("heap: LOS zwolniony z zakresem", $st["large_live_blocks"] === 0 && $st["large_live_bytes"] === 0 && $st["large_peak_bytes"] === 100000);
+
+$z = small(); $h = $z->heap(); $h->push_frame();
+check("heap: rozmiar nie decyduje o czasie życia", $h->classify(zamm_heap.hint(1048576, "No")) === "frame" && $h->classify(zamm_heap.hint(8, "Unknown")) === "persistent"
+    && $h->classify(zamm_heap.hint(8, "Program")) === "persistent" && $h->classify(zamm_heap.hint(8, "No", true)) === "shared");
+$h->pop_frame();
+check("heap: bez ramki -> bezpiecznie trwała", $h->classify(zamm_heap.hint(8, "No")) === "persistent");
+
+$z = small(); $h = $z->heap(); $a = $h->alloc_value("persistent", 7, null, "u64");
+check("heap: uchwyty typowane", $h->get($a, "u64") === 7 && $h->get($a, "f64") === null);
+
+$z = small(); $h = $z->heap(); $log = new Log(); $h->push_frame();
+$a = $h->alloc_value("frame", 9, noisy($log, "a")); $p = $h->promote($a, "persistent"); $h->pop_frame();
+check("heap: promote przenosi destruktor", count($log->v) === 0 && $h->get($p) === 9);
+$h->release($p);
+check("heap: promote — destruktor po release", join($log->v, ",") === "a");
+
+$z = small(); $h = $z->heap(); $h->push_frame(); $h->begin_temp(); $h->begin_temp();
+$t = $h->alloc_value("temp", 1); $h->end_temp();
+check("heap: zakresy temp niezależne od ramek", !$h->is_live($t) && $h->stats()["temp_depth"] === 1);
+$h->end_temp(); $h->pop_frame();
+
+$z = small(); $h = $z->heap(); $t = $h->new_task();
+$ta = $h->task_arena($t); $sl = $ta->alloc_slice_copy([1, 2, 3, 4]);
+$det = $h->detach_task($t);
+check("heap: zadanie odłączane do innego heapa", $h->stats()["live_tasks"] === 0);
+$h2 = $z->heap(); $t2 = $h2->attach_task($det);
+check("heap: zadanie dołączone, dane zachowane", join($det->read_slice($sl, 4), ",") === "1,2,3,4");
+$h2->end_task($t2);
+check("heap: zakończone zadanie nieznane", err_kind(func() { $h2->end_task($t2); }) === "UnknownTask");
+
+$z = small(); $h = $z->heap(); $t = $h->new_task(); $log = new Log();
+$x = $h->alloc_value("task:" . $t, 5, noisy($log, "x"));
+check("heap: obiekt zadania blokuje detach", err_kind(func() { $h->detach_task($t); }) === "NotTransferable");
+$h->end_task($t);
+check("heap: end_task niszczy obiekty", join($log->v, ",") === "x" && !$h->is_live($x));
+
+$z = small(); $h = $z->heap(); $log = new Log(); $h->push_frame(); $h->begin_temp();
+$h->alloc_value("frame", 1, noisy($log, "f")); $h->alloc_value("temp", 1, noisy($log, "t")); $h->alloc_value("persistent", 1, noisy($log, "p"));
+$h->drop();
+check("heap: drop — ramki, temp, zadania, potem trwałe", join($log->v, ",") === "f,t,p");
+
+# --- shared ---
+$z = small(); $log = new Log();
+$s = $z->shared->alloc(64, 8, func($p) { $log->v[] = "shared"; });
+$z->shared->retain($s);
+check("shared: licznik odwołań", !$z->shared->release($s) && $z->shared->live_blocks() === 1 && $z->shared->release($s) && count($log->v) === 1 && $z->shared->live_blocks() === 0);
+check("shared: nieaktualny uchwyt", !$z->shared->release($s) && $z->shared->ptr($s) === null);
+
+echo "wynik: " . Counter.fails . " niepowodzeń";
+exit(Counter.fails > 0 ? 1 : 0);
