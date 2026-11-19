@@ -1,0 +1,56 @@
+import Workspace.runtime;
+
+class Cnt { public static $closed = 0; public static $fails = 0; }
+func check($name, $cond) { if (!$cond) { Cnt.fails++; } echo ($cond ? "ok   " : "FAIL ") . $name; }
+func close_cb($ctx) { Cnt.closed++; }
+
+$rt = runtime.create(1, 0);
+$rt->frame_push();
+$a = $rt->str_new(ZS.FRAME, "Hello, ");
+$b = $rt->str_new(ZS.FRAME, "Z# żółw");
+$c = $rt->str_concat(ZS.FRAME, $a[1], $b[1]);
+check("napisy: new/concat (UTF-8)", $a[0] === 0 && $b[0] === 0 && $c[0] === 0 && $rt->str_get($c[1]) === "Hello, Z# żółw");
+check("napisy: długość w bajtach", $rt->str_len($b[1]) === 10 && $rt->str_len(runtime.v_int(1)) === -1);
+check("napisy: concat z nie-napisem = E_TYPE", $rt->str_concat(ZS.FRAME, $a[1], runtime.v_int(1))[0] === ZS.E_TYPE);
+
+$arr = $rt->array_new(ZS.FRAME, 2)[1];
+$ok = true;
+for ($i = 0; $i < 300; $i++) { if ($rt->array_push(ZS.FRAME, $arr, runtime.v_int($i)) !== ZS.OK) { $ok = false; } }
+$g = $rt->array_get($arr, 299);
+check("tablice: push z wieloma wzrostami", $ok && $rt->array_len($arr) === 300 && $g[0] === 0 && runtime.v_as_int($g[1]) === 299);
+check("tablice: granice i typ", $rt->array_get($arr, 300)[0] === ZS.E_BOUNDS && $rt->array_get($a[1], 0)[0] === ZS.E_TYPE);
+$rt->array_set($arr, 0, runtime.v_int(-5));
+check("tablice: set", runtime.v_as_int($rt->array_get($arr, 0)[1]) === -5 && runtime.v_as_float(runtime.v_float(1.5)) === 1.5);
+check("zakresy: pop OK, drugi pop E_SCOPE", $rt->frame_pop() === ZS.OK && $rt->frame_pop() === ZS.E_SCOPE);
+check("zakresy: alokacja bez ramki = E_SCOPE", $rt->str_new(ZS.FRAME, "x")[0] === ZS.E_SCOPE);
+$rt->free();
+
+$rt = runtime.create();
+$rt->frame_push();
+$r = $rt->resource_new(ZS.FRAME, null, func($ctx) { Cnt.closed++; });
+$h = $r[1];
+$rt->retain($h);
+check("zasoby: retain blokuje zakres (E_REFERENCED)", $rt->frame_pop() === ZS.E_REFERENCED && Cnt.closed === 0);
+$rt->release($h);
+check("zasoby: po release zakres zamyka zasób", $rt->frame_pop() === ZS.OK && Cnt.closed === 1 && $rt->handle_live($h) === 0);
+$r = $rt->resource_new(ZS.PERSISTENT, null, func($ctx) { Cnt.closed++; });
+check("zasoby: trwały — ostatni release zamyka", $rt->release($r[1]) === 1 && Cnt.closed === 2);
+$rt->resource_new(ZS.PERSISTENT, null, func($ctx) { Cnt.closed++; });
+$rt->free();
+check("zasoby: zamknięcie runtime zamyka pozostałe", Cnt.closed === 3);
+
+$rt = runtime.create();
+$t = $rt->task_new();
+check("zadania: kod >= 16", $t >= 16);
+$s = $rt->str_new($t, "w zadaniu");
+check("zadania: napis w arenie zadania", $s[0] === 0 && $rt->str_get($s[1]) === "w zadaniu");
+check("zadania: end_task, potem nieznane", $rt->task_end($t) === ZS.OK && $rt->task_end($t) === ZS.E_SCOPE);
+
+$rt = runtime.create();
+$rt->frame_push(); $rt->str_new(ZS.FRAME, "abc"); $rt->str_new(ZS.PERSISTENT, "def");
+$st = $rt->mem_stats();
+check("statystyki", $st["frame_used"] > 0 && $st["persistent_used"] > 0 && $st["arena_chunks"] >= 2 && $st["pool_misses"] >= 2);
+$rt->free();
+
+echo "wynik: " . Cnt.fails . " niepowodzeń";
+exit(Cnt.fails > 0 ? 1 : 0);
