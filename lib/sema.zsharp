@@ -5,7 +5,7 @@ import Workspace.parser;
 class SemaTables {
     # funkcje, które nie zatrzymują argumentów
     const PURE = [
-        "println" => true, "print" => true, "eprintln" => true, "count" => true, "strlen" => true, "has_key" => true,
+        "necho" => true, "eecho" => true, "count" => true, "strlen" => true, "has_key" => true,
         "keys" => true, "join" => true, "in_array" => true, "index_of" => true, "starts_with" => true,
         "ends_with" => true, "trim" => true, "substr" => true, "intval" => true, "typeof" => true, "is_int" => true,
         "is_float" => true, "is_string" => true, "is_bool" => true, "is_array" => true, "is_null" => true,
