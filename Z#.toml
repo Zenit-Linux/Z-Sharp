@@ -21,7 +21,10 @@ zamm_shared = "zamm/shared.zsharp"
 zamm        = "zamm/main.zsharp"
 runtime     = "runtime/main.zsharp"
 ir          = "lib/ir.zsharp"
+link        = "lib/link.zsharp"
+classes     = "lib/classes.zsharp"
 emit_c      = "lib/emit_c.zsharp"
+emit_llvm   = "lib/emit_llvm.zsharp"
 manifest    = "lib/manifest.zsharp"
 
 [bootstrap]
