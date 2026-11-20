@@ -1,0 +1,7 @@
+[package]
+name = "z#"
+version = "0.0.1"
+kind = "bin"
+entry = "main.zsharp"
+description = "Wrapper narzędzi Z#: z# build/run/check/test/transpile/doctor nad zsc, zsi, zst, zzc"
+license = "GPL-3.0"
