@@ -23,6 +23,8 @@ cargo build --release         # target/release/zsc0 (stage0) + libzs_runtime.a
 | `lib/` | `lexer.zsharp`, `parser.zsharp` (parytet z Rust), `cli.zsharp`, `sema.zsharp` (analiza ucieczki → ZAMM), `zbc.zsharp` (pakiet `.zbc`), **`ir.zsharp`** (Z# IR + walidacja), **`emit_c.zsharp`** (backend C), **`manifest.zsharp`** (parser `Z#.toml`, parytet z `zs-manifest`) |
 | `zamm/` | **ZAMM w Z#** (`*.zsharp`: config, chunk, arena, heap, shared) — chained arenas, pula chunków, LOS, uchwyty z generacją, zakresy/zadania, przestrzeń współdzielona; testy `tests/zamm_test.zsharp` (`zamm/README.md`) |
 | `runtime/` | **runtime w Z#** (`main.zsharp`: `ZValue`, napisy, tablice, zasoby, statystyki) + nagłówki C: `include/zs_runtime.h` (ABI `libzs_runtime.a`), `include/zs_native.h` (operacje dla kodu generowanego przez zsc) |
+| `wrapper/` | źródło binarki `z#` (wrapper nad zsc/zsi/zst/zzc) |
+| `runtime/native/`, `runtime/include/` | natywny runtime w C (`zs_rt.c`, `zs_native.h`) dla backendów C i LLVM |
 | `tests/` | `basics`, `nomain`, sema, `zamm_test`, `runtime_test`, parytet leksera/parsera (`*_parity.sh`), `bad/`, `run_all.sh` |
 | `docs/` | `SPEC.md` (0.4), `AST.md`, `BOOTSTRAP.md` |
 
