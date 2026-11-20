@@ -9,9 +9,10 @@
 | **punkt stały** | `zsc` (z `.zbc`) kompiluje samego siebie: s1 == s2 == s3 | **działa** (`scripts/fixpoint.sh`) |
 | **stage1-core** | ZAMM (`zamm/*.zsharp`) i runtime (`runtime/main.zsharp`) napisane w Z#, 1:1 z referencją w Rust | działa; `tests/zamm_test.zsharp` (39 asercji), `tests/runtime_test.zsharp` (16) |
 | **stage1-ir** | Z# IR strukturalne (`lib/ir.zsharp`): lowering, walidacja, lokalne, `--emit ir` | działa (SSA i bytecode VM: do zrobienia) |
-| **stage2** | backend C (`lib/emit_c.zsharp`) → `cc` + `libzs_runtime.a`: `zsc build` daje binarkę natywną | działa dla podzbioru; testy różnicowe interpreter↔natywny (`zsc/tests/native/run_diff.sh`) |
-| stage2-llvm | backend LLVM | do zrobienia |
-| stage3 | brak zależności od Rusta jako wykonawcy: binarka `zsc` kompiluje `zsc` | cel — blokuje go brak klas/domknięć/map w backendzie natywnym |
+| **stage2** | backend C (`lib/emit_c.zsharp`) → `cc` + własny runtime w C (`runtime/native/zs_rt.c`, bez Rusta): `zsc build` daje binarkę natywną | działa dla podzbioru; testy różnicowe interpreter↔natywny (`zsc/tests/native/run_diff.sh`) |
+| **stage2-llvm** | backend LLVM (`lib/emit_llvm.zsharp`): tekstowy `.ll` → `clang`, ten sam runtime, `--target <triple>` | działa dla podzbioru; te same testy różnicowe (C i LLVM: 12/12) |
+| **stage3-bundle** | `zsc0 bundle`: binarka = runtime + wbudowany pakiet `.zbc`; `zsc`, `zsi`, `zst`, `zzc`, `z#` jako pojedyncze pliki wykonywalne bez źródeł | działa (`scripts/fixpoint.sh` kończy się budową standalone `zsc`) |
+| **stage3-native** | `zsc` skompilowany **natywnie** (C/LLVM) kompiluje `zsc` | **działa**: `scripts/stage3.sh` (zsc2→zsc3→zsc4, C identyczny z interpreterem) |
 
 ## Co dokładnie dowodzi punkt stały
 * s1: `zsc` uruchomiony **ze źródeł** (parsowanych przez Rust) pakuje własne źródła.
@@ -50,3 +51,7 @@ adresy chunków, rzadka mapa komórek, poison `0xDD`). Cała logika (przesuwanie
 ## Backend natywny (zsc)
 `zsc build x.zs` → AST → sema → IR → C (`emit_c`) → `cc` + `libzs_runtime.a`. Kolejność ewaluacji lewa→prawa, tablice mają semantykę wartości,
 komunikaty błędów i numery linii są takie jak w stage0 (testowane różnicowo). Konstrukcje spoza podzbioru kończą się błędem `E0101…E0107`. Wyjątki: `setjmp/longjmp`, lokalne `volatile` w funkcjach z `try`, hierarchia jak w stage0 (`Error extends Exception`).
+
+## Dwa rodzaje „niezależności" (uczciwie)
+1. **Standalone (jest):** wykonywalny plik zawiera runtime (kopię stage0) i program jako `.zbc`. Odbiorca nie potrzebuje źródeł ani zsc0, ale w pliku nadal wykonuje się interpreter z Rusta.
+2. **Natywna (częściowo):** kod natywny z C lub LLVM na runtime napisanym w C — bez Rusta w ogóle. Dziś tylko dla podzbioru języka (funkcje/tablice/napisy/wyjątki). Samokompilacja `zsc` natywnie wymaga klas, modułów i domknięć w backendach — patrz `docs/STATUS.md`.
