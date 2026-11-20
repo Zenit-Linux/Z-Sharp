@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Parytet parsera: S-expr Rust (--sexp) == parser w Z# (lib/parser.zsharp).
+. "$(dirname "$0")/../scripts/lib.sh"; ensure_stage0; n=0
+for f in "$ROOT"/tests/*.zsharp "$ROOT"/examples/*.zsharp "$ROOT"/lib/*.zsharp; do
+  diff <("$ZSC0" --sexp "$f" 2>&1) <("$ZSC0" run "$ROOT/tests/parse_cli.zsharp" "$f" 2>&1) >/dev/null || { echo "RÓŻNICA parsera: $f"; exit 1; }; n=$((n+1))
+done; echo "parser parity: $n plików OK"
