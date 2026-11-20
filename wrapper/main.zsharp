@@ -1,0 +1,404 @@
+#!/usr/bin/env zsi
+##
+ * z# — jednolity wrapper nad narzędziami Z#: zsc (AOT: C/LLVM), zsi (interpreter), zst (transpilator), zzc (frontend GCC).
+ * Plik celowo w podzbiorze Z# obsługiwanym przez backend natywny zsc (funkcje, tablice, napisy, try/catch, wbudowane):
+ *   zsc build wrapper/main.zsharp -o z#     # binarka z#
+##
+
+func version(): string { return "z# 0.0.1"; }
+
+# ───────────────── pomocnicze ─────────────────
+func fail(string $msg): int { eecho("z#: " . $msg); return 1; }
+
+func has_flag($flags, string $name): bool { return in_array($name, $flags); }
+
+func flag_value($args, string $name, $default) {
+    for ($i = 0; $i < count($args); $i++) {
+        if ($args[$i] === $name && $i + 1 < count($args)) { return $args[$i + 1]; }
+        if (starts_with($args[$i], $name . "=")) { return substr($args[$i], strlen($name) + 1); }
+    }
+    return $default;
+}
+
+# argumenty pozycyjne: bez flag i bez wartości flag z listy $valued
+func positionals($args, $valued) {
+    $out = [];
+    $i = 0;
+    while ($i < count($args)) {
+        $a = $args[$i];
+        if ($a === "--") { break; }
+        if (in_array($a, $valued)) { $i += 2; continue; }
+        if (starts_with($a, "-")) { $i++; continue; }
+        $out[] = $a;
+        $i++;
+    }
+    return $out;
+}
+
+func after_dashdash($args) {
+    for ($i = 0; $i < count($args); $i++) { if ($args[$i] === "--") { return array_slice($args, $i + 1); } }
+    return [];
+}
+
+func quote($s): string {
+    if ($s === "" || contains($s, " ") || contains($s, "\"") || contains($s, "$")) { return "'" . replace($s, "'", "'\\''") . "'"; }
+    return $s;
+}
+
+func show_cmd($cmd, $argv): string {
+    $parts = [quote($cmd)];
+    foreach ($argv as $a) { $parts[] = quote($a); }
+    return join($parts, " ");
+}
+
+# ───────────────── lokalizacja narzędzi ─────────────────
+func which($name) {
+    try {
+        $r = Process.run("sh", ["-c", "command -v " . $name]);
+        if ($r["status"] === 0) { return trim($r["stdout"]); }
+    } catch (Exception $e) { }
+    return null;
+}
+
+func z_home() {
+    $h = System.env("Z_HOME") ?? System.env("ZS_HOME");
+    if ($h !== null && $h !== "") { return $h; }
+    return null;
+}
+
+func self_dir() {
+    $a = System.args();
+    return System.dirname($a[0]);
+}
+
+# zwraca ["cmd" => ..., "pre" => [argumenty wstępne]] albo null
+func resolve_tool(string $tool) {
+    $envName = upper($tool);
+    $e = System.env($envName);
+    if ($e !== null && $e !== "") { return ["cmd" => $e, "pre" => [], "how" => "zmienna " . $envName]; }
+    $home = z_home();
+    $cands = [];
+    if ($home !== null) { $cands[] = $home . "/bin/" . $tool; }
+    $cands[] = self_dir() . "/" . $tool;
+    foreach ($cands as $c) { if (File.exists($c)) { return ["cmd" => $c, "pre" => [], "how" => $c]; } }
+    $w = which($tool);
+    if ($w !== null && $w !== "") { return ["cmd" => $w, "pre" => [], "how" => $w]; }
+    # tryb źródłowy: <repo>/src/main.zsharp uruchamiany przez stage0
+    $dirs = [];
+    if ($home !== null) { $dirs[] = $home . "/../" . $tool; $dirs[] = $home . "/" . $tool; }
+    $dirs[] = self_dir() . "/../../" . $tool;
+    foreach ($dirs as $d) {
+        $entry = $d . "/src/main.zsharp";
+        if (File.exists($entry)) {
+            $s0 = System.env("ZSC0") ?? which("zsc0");
+            if (($s0 === null || $s0 === "") && $home !== null && File.exists($home . "/target/release/zsc0")) { $s0 = $home . "/target/release/zsc0"; }
+            if ($s0 !== null && $s0 !== "") { return ["cmd" => $s0, "pre" => ["run", $entry], "how" => "źródło " . $entry . " (stage0)"]; }
+        }
+    }
+    return null;
+}
+
+func run_tool(string $tool, $argv, $ctx): int {
+    $t = resolve_tool($tool);
+    if ($t === null) { return fail("nie znaleziono narzędzia `" . $tool . "` (ustaw " . upper($tool) . " albo Z_HOME; zob. `z# doctor`)"); }
+    $full = [];
+    foreach ($t["pre"] as $p) { $full[] = $p; }
+    foreach ($argv as $a) { $full[] = $a; }
+    if ($ctx["verbose"] || $ctx["dry"]) { eecho("+ " . show_cmd($t["cmd"], $full)); }
+    if ($ctx["dry"]) { return 0; }
+    try { return Process.exec($t["cmd"], $full); }
+    catch (Exception $e) { return fail($e->getMessage()); }
+}
+
+# ───────────────── manifest Z#.toml ─────────────────
+func unquote($v): string {
+    $v = trim($v);
+    if (strlen($v) >= 2 && (substr($v, 0, 1) === "\"" || substr($v, 0, 1) === "'") && substr($v, strlen($v) - 1, 1) === substr($v, 0, 1)) {
+        return substr($v, 1, strlen($v) - 2);
+    }
+    return $v;
+}
+
+# prosty odczyt `[sekcja] klucz = "wartość"`; zwraca null gdy brak
+func manifest_get(string $text, string $section, string $key) {
+    $cur = "";
+    foreach (split($text, "\n") as $raw) {
+        $l = trim($raw);
+        if ($l === "" || starts_with($l, "#")) { continue; }
+        if (starts_with($l, "[")) { $cur = trim(substr($l, 1, index_of($l, "]") - 1)); continue; }
+        if ($cur !== $section) { continue; }
+        $eq = index_of($l, "=");
+        if ($eq < 0) { continue; }
+        if (trim(substr($l, 0, $eq)) === $key) {
+            $v = substr($l, $eq + 1);
+            $h = index_of($v, " #");
+            if ($h >= 0 && !contains(substr($v, 0, $h), "\"")) { $v = substr($v, 0, $h); }
+            return unquote($v);
+        }
+    }
+    return null;
+}
+
+func load_manifest(string $dir) {
+    $p = $dir . "/Z#.toml";
+    if (!File.exists($p)) { return null; }
+    $t = File.read($p);
+    $m = [];
+    $m["path"] = $p;
+    $m["name"] = manifest_get($t, "package", "name") ?? "app";
+    $m["version"] = manifest_get($t, "package", "version") ?? "0.0.0";
+    $m["kind"] = manifest_get($t, "package", "kind") ?? "bin";
+    $m["entry"] = manifest_get($t, "package", "entry") ?? "src/main.zsharp";
+    return $m;
+}
+
+# ───────────────── polecenia ─────────────────
+func usage(): void {
+    echo "z# — wrapper narzędzi Z# (zsc, zsi, zst, zzc)";
+    echo "użycie: z# [-v|--verbose] [-q|--quiet] [--dry-run] <polecenie> [opcje]";
+    echo "  new <nazwa> [--lib]            nowy projekt (Z#.toml, src/, tests/)";
+    echo "  init [--lib]                   projekt w bieżącym katalogu";
+    echo "  build [--release] [--backend c|llvm|gcc] [-o plik]   kompilacja natywna wg Z#.toml";
+    echo "  run [--native] [--backend ..] [-- argumenty]         uruchom (domyślnie zsi; --native: build + start)";
+    echo "  check [--strict]               składnia + sema (zsc check)";
+    echo "  test                           uruchom tests/*.zsharp (porównanie z *.out)";
+    echo "  transpile --to php|js|c <plik> [-o wyjście]          transpilator zst";
+    echo "  clean                          usuń target/";
+    echo "  doctor                         diagnostyka środowiska";
+    echo "  stages                         stan etapów kompilatora (zsc stages)";
+    echo "  version | help [polecenie]";
+    echo "zmienne: ZSC ZSI ZST ZZC (ścieżki narzędzi), Z_HOME/ZS_HOME, ZSC0 (stage0)";
+    echo "kody wyjścia: 0 ok, 1 błąd, 2 użycie; kod narzędzia jest propagowany";
+}
+
+func help_for(string $cmd): int {
+    if ($cmd === "build") { echo "z# build [--release] [--backend c|llvm|gcc] [-o plik] — wejście z [package].entry; wynik: target/<debug|release>/<nazwa>"; return 0; }
+    if ($cmd === "run") { echo "z# run [--native] [--backend c|llvm|gcc] [-- argumenty] — bez --native uruchamia przez zsi"; return 0; }
+    if ($cmd === "test") { echo "z# test — dla każdego tests/*.zsharp porównuje wyjście zsi z plikiem .out (jeśli istnieje); inaczej wymaga kodu 0"; return 0; }
+    if ($cmd === "transpile") { echo "z# transpile --to php|js|c <plik> [-o wyjście] — zst"; return 0; }
+    usage();
+    return 0;
+}
+
+func hello_src(string $name): string {
+    return "#!/usr/bin/env zsi\nfunc main(): int {\n    echo \"Hello from " . $name . "!\";\n    return 0;\n}\n";
+}
+
+func lib_src(string $name): string {
+    return "namespace " . $name . ";\n\nfunc greet(string \$who): string {\n    return \"Hello, \" . \$who . \"!\";\n}\n";
+}
+
+func scaffold(string $dir, string $name, bool $lib): int {
+    if (File.exists($dir . "/Z#.toml")) { return fail("Z#.toml już istnieje w " . $dir); }
+    Directory.create($dir . "/src");
+    Directory.create($dir . "/tests");
+    $entry = $lib ? "src/lib.zsharp" : "src/main.zsharp";
+    $toml = "[package]\nname = \"" . $name . "\"\nversion = \"0.1.0\"\nkind = \"" . ($lib ? "lib" : "bin") . "\"\nentry = \"" . $entry . "\"\nlicense = \"GPL-3.0\"\n\n[dependencies]\n";
+    File.write($dir . "/Z#.toml", $toml);
+    File.write($dir . "/" . $entry, $lib ? lib_src($name) : hello_src($name));
+    if (!$lib) {
+        File.write($dir . "/tests/hello.zsharp", "echo \"hello\";\n");
+        File.write($dir . "/tests/hello.out", "hello\n");
+    }
+    File.write($dir . "/.gitignore", "target/\n*.zbc\n*.ll\n");
+    echo "z#: utworzono projekt `" . $name . "` w " . $dir;
+    return 0;
+}
+
+func cmd_new($args, $ctx): int {
+    $pos = positionals($args, []);
+    if (count($pos) < 1) { eecho("z# new: podaj nazwę projektu"); return 2; }
+    $name = $pos[0];
+    $dir = $name;
+    $base = $name;
+    $slash = -1;
+    for ($i = 0; $i < strlen($name); $i++) { if (substr($name, $i, 1) === "/") { $slash = $i; } }
+    if ($slash >= 0) { $base = substr($name, $slash + 1); }
+    if ($base === "") { eecho("z# new: pusta nazwa"); return 2; }
+    return scaffold($dir, $base, has_flag($args, "--lib"));
+}
+
+func cmd_init($args, $ctx): int {
+    $cwd = System.env("PWD") ?? ".";
+    $base = $cwd;
+    for ($i = 0; $i < strlen($cwd); $i++) { if (substr($cwd, $i, 1) === "/") { $base = substr($cwd, $i + 1); } }
+    if ($base === "") { $base = "app"; }
+    return scaffold(".", $base, has_flag($args, "--lib"));
+}
+
+func need_manifest() {
+    $m = load_manifest(".");
+    if ($m === null) { eecho("z#: brak Z#.toml w bieżącym katalogu (użyj `z# new` / `z# init`)"); }
+    return $m;
+}
+
+func target_path($m, $release, $args): string {
+    $o = flag_value($args, "-o", null);
+    if ($o !== null) { return $o; }
+    return "target/" . ($release ? "release" : "debug") . "/" . $m["name"];
+}
+
+# buduje komendę kompilacji; zwraca [narzędzie, argv]
+func build_plan($m, $args, $out): array {
+    $backend = flag_value($args, "--backend", "c");
+    $release = has_flag($args, "--release");
+    if ($backend === "gcc") {
+        $a = ["build", $m["entry"], "-o", $out];
+        if ($release) { $a[] = "-O3"; }
+        return ["zzc", $a];
+    }
+    $a = ["build", $m["entry"], "-o", $out, $release ? "-O3" : "-O0"];
+    if ($backend === "llvm") { $a[] = "--backend"; $a[] = "llvm"; }
+    return ["zsc", $a];
+}
+
+func cmd_build($args, $ctx): int {
+    $m = need_manifest();
+    if ($m === null) { return 1; }
+    if ($m["kind"] === "lib") { return fail("pakiet `" . $m["name"] . "` jest biblioteką (kind = \"lib\") — nie ma czego budować jako binarki; użyj `z# check`"); }
+    $backend = flag_value($args, "--backend", "c");
+    if (!in_array($backend, ["c", "llvm", "gcc"])) { eecho("z# build: nieznany --backend " . $backend . " (c|llvm|gcc)"); return 2; }
+    $out = target_path($m, has_flag($args, "--release"), $args);
+    Directory.create(System.dirname($out));
+    $plan = build_plan($m, $args, $out);
+    $rc = run_tool($plan[0], $plan[1], $ctx);
+    if ($rc === 0 && !$ctx["dry"] && !$ctx["quiet"]) { echo "z#: gotowe: " . $out; }
+    return $rc;
+}
+
+func cmd_run($args, $ctx): int {
+    $m = need_manifest();
+    if ($m === null) { return 1; }
+    $rest = after_dashdash($args);
+    if (has_flag($args, "--native")) {
+        $out = target_path($m, has_flag($args, "--release"), $args);
+        Directory.create(System.dirname($out));
+        $plan = build_plan($m, $args, $out);
+        $rc = run_tool($plan[0], $plan[1], $ctx);
+        if ($rc !== 0 || $ctx["dry"]) { return $rc; }
+        try { return Process.exec($out, $rest); }
+        catch (Exception $e) { return fail($e->getMessage()); }
+    }
+    $argv = [$m["entry"]];
+    foreach ($rest as $r) { $argv[] = $r; }
+    return run_tool("zsi", $argv, $ctx);
+}
+
+func cmd_check($args, $ctx): int {
+    $m = need_manifest();
+    if ($m === null) { return 1; }
+    $a = ["check"];
+    if (has_flag($args, "--strict")) { $a[] = "--strict"; }
+    $a[] = $m["entry"];
+    return run_tool("zsc", $a, $ctx);
+}
+
+func cmd_test($args, $ctx): int {
+    if (!Directory.exists("tests")) { eecho("z# test: brak katalogu tests/"); return 1; }
+    $pass = 0;
+    $failed = 0;
+    foreach (Directory.list("tests") as $f) {
+        if (!ends_with($f, ".zsharp")) { continue; }
+        $path = "tests/" . $f;
+        $exp = substr($path, 0, strlen($path) - 7) . ".out";
+        $t = resolve_tool("zsi");
+        if ($t === null) { return fail("nie znaleziono `zsi`"); }
+        $full = [];
+        foreach ($t["pre"] as $p) { $full[] = $p; }
+        $full[] = $path;
+        if ($ctx["verbose"]) { eecho("+ " . show_cmd($t["cmd"], $full)); }
+        $r = Process.run($t["cmd"], $full);
+        $ok = $r["status"] === 0;
+        if (File.exists($exp)) { $ok = $r["stdout"] === File.read($exp); }
+        if ($ok) { $pass++; if (!$ctx["quiet"]) { echo "PASS " . $f; } }
+        else { $failed++; echo "FAIL " . $f . " (kod " . $r["status"] . ")"; }
+    }
+    echo "z# test: " . $pass . " ok, " . $failed . " błędów";
+    return $failed === 0 ? 0 : 1;
+}
+
+func cmd_transpile($args, $ctx): int {
+    $to = flag_value($args, "--to", "php");
+    $pos = positionals($args, ["--to", "-o"]);
+    if (count($pos) < 1) { eecho("z# transpile: podaj plik źródłowy"); return 2; }
+    $a = ["--to", $to];
+    $o = flag_value($args, "-o", null);
+    if ($o !== null) { $a[] = "-o"; $a[] = $o; }
+    $a[] = $pos[0];
+    return run_tool("zst", $a, $ctx);
+}
+
+func cmd_clean($args, $ctx): int {
+    if (!Directory.exists("target")) { echo "z#: nic do czyszczenia"; return 0; }
+    if ($ctx["dry"]) { eecho("+ rm -rf target"); return 0; }
+    return Process.exec("rm", ["-rf", "target"]);
+}
+
+func tool_version($cmd, $pre): string {
+    try {
+        $argv = [];
+        foreach ($pre as $p) { $argv[] = $p; }
+        $argv[] = "--version";
+        $r = Process.run($cmd, $argv);
+        $o = trim($r["stdout"]);
+        if ($o === "") { $o = trim($r["stderr"]); }
+        $nl = index_of($o, "\n");
+        return $nl >= 0 ? substr($o, 0, $nl) : $o;
+    } catch (Exception $e) { return "?"; }
+}
+
+func cmd_doctor($args, $ctx): int {
+    echo "z# doctor — " . version() . " (" . System.os() . "/" . System.architecture() . ")";
+    $home = z_home();
+    echo pad_right("Z_HOME/ZS_HOME", 16) . ($home ?? "(nie ustawiono)");
+    $missing = 0;
+    foreach (["zsc", "zsi", "zst", "zzc"] as $t) {
+        $r = resolve_tool($t);
+        if ($r === null) { echo pad_right($t, 16) . "BRAK"; $missing++; }
+        else { echo pad_right($t, 16) . "OK  " . $r["how"]; }
+    }
+    foreach (["cc", "gcc", "clang", "llc", "php", "node"] as $t) {
+        $w = which($t);
+        echo pad_right($t, 16) . ($w === null || $w === "" ? "brak" : "OK  " . $w);
+    }
+    $z0 = System.env("ZSC0") ?? which("zsc0");
+    if (($z0 === null || $z0 === "") && $home !== null && File.exists($home . "/target/release/zsc0")) { $z0 = $home . "/target/release/zsc0"; }
+    echo pad_right("zsc0 (stage0)", 16) . ($z0 === null || $z0 === "" ? "brak" : "OK  " . $z0);
+    return $missing === 0 ? 0 : 1;
+}
+
+func main(): int {
+    $argv = System.args();
+    $rest = array_slice($argv, 1);
+    $ctx = ["verbose" => false, "quiet" => false, "dry" => false];
+    $args = [];
+    $cmd = null;
+    foreach ($rest as $a) {
+        if ($cmd === null) {
+            if ($a === "-v" || $a === "--verbose") { $ctx["verbose"] = true; continue; }
+            if ($a === "-q" || $a === "--quiet") { $ctx["quiet"] = true; continue; }
+            if ($a === "--dry-run") { $ctx["dry"] = true; continue; }
+            if ($a === "--version") { echo version(); return 0; }
+            if ($a === "-h" || $a === "--help") { usage(); return 0; }
+            $cmd = $a;
+        } else { $args[] = $a; }
+    }
+    if ($cmd === null) { usage(); return 2; }
+    if (has_flag($args, "--help") || has_flag($args, "-h")) { return help_for($cmd); }
+    if ($cmd === "version") { echo version(); return 0; }
+    if ($cmd === "help") { if (count($args) > 0) { return help_for($args[0]); } usage(); return 0; }
+    if ($cmd === "new") { return cmd_new($args, $ctx); }
+    if ($cmd === "init") { return cmd_init($args, $ctx); }
+    if ($cmd === "build") { return cmd_build($args, $ctx); }
+    if ($cmd === "run") { return cmd_run($args, $ctx); }
+    if ($cmd === "check") { return cmd_check($args, $ctx); }
+    if ($cmd === "test") { return cmd_test($args, $ctx); }
+    if ($cmd === "transpile") { return cmd_transpile($args, $ctx); }
+    if ($cmd === "clean") { return cmd_clean($args, $ctx); }
+    if ($cmd === "doctor") { return cmd_doctor($args, $ctx); }
+    if ($cmd === "stages") { return run_tool("zsc", ["stages"], $ctx); }
+    eecho("z#: nieznane polecenie `" . $cmd . "` (z# help)");
+    return 2;
+}
+
+exit(main());
