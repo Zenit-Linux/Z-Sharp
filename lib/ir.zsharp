@@ -17,9 +17,21 @@ class IrTables {
         "boolval" => [1, 1], "intval" => [1, 1], "floatval" => [1, 1], "ord" => [1, 1], "chr" => [1, 1],
         "contains" => [2, 2], "starts_with" => [2, 2], "ends_with" => [2, 2], "index_of" => [2, 2], "repeat" => [2, 2],
         "substr" => [2, 3], "trim" => [1, 1], "join" => [2, 2], "in_array" => [2, 2], "range" => [2, 2], "keys" => [1, 1], "values" => [1, 1], "has_key" => [2, 2],
+        "upper" => [1, 1], "lower" => [1, 1], "replace" => [3, 3], "split" => [2, 2], "chars" => [1, 1],
+        "pad_left" => [2, 3], "pad_right" => [2, 3], "to_hex" => [1, 1], "is_digit" => [1, 1], "is_alpha" => [1, 1],
+        "is_alnum" => [1, 1], "is_space" => [1, 1], "is_hex_digit" => [1, 1], "array_slice" => [2, 3], "reverse" => [1, 1],
+        "sort" => [1, 1], "push" => [2, -1], "dump" => [1, -1], "read_line" => [0, 0],
+        "zs_obj_new" => [1, 1], "zs_obj_class" => [1, 1], "zs_obj_get" => [2, 2], "zs_obj_take" => [2, 2], "zs_obj_set" => [3, 3], "zs_obj_put" => [3, 3], "zs_no_method" => [2, 2], "zs_no_class" => [1, 1],
         "necho" => [1, -1], "eecho" => [0, -1], "exit" => [0, 1]
     ];
-    const MATH = ["sqrt" => 1, "floor" => 1, "ceil" => 1, "round" => 1, "abs" => 1, "min" => 2, "max" => 2];
+    const MATH = ["sqrt" => 1, "floor" => 1, "ceil" => 1, "round" => 1, "abs" => 1, "min" => 2, "max" => 2, "pow" => 2];
+    # moduły wbudowane: Moduł => [funkcja => arność]
+    const MODULES = [
+        "System" => ["args" => 0, "env" => 1, "os" => 0, "architecture" => 0, "time" => 0, "cpuCount" => 0, "dirname" => 1, "resolveImport" => 2, "version" => 0, "exit" => -1],
+        "File" => ["read" => 1, "write" => 2, "append" => 2, "exists" => 1, "delete" => 1],
+        "Directory" => ["create" => 1, "exists" => 1, "list" => 1],
+        "Process" => ["run" => -1, "exec" => -1]
+    ];
     const SIMPLE_TYPES = ["int", "float", "string", "bool", "array"];
 }
 
@@ -117,7 +129,7 @@ class Lowerer {
             $x = $s[2];
             if ($x[0] === ":New") { $this->checkNew($x); }
             else if ($x[0] === ":Var") { }
-            else { $this->err($line, "E0107", "throw obsługuje `new Exception(...)`/`new Error(...)` lub zmienną z wyjątkiem"); }
+            else { $this->checkExpr($x); }
         }
         else if ($k === ":FuncStmt") { $this->err($line, "E0101", "funkcje zagnieżdżone nie są obsługiwane (deklaruj funkcje na najwyższym poziomie)"); }
         else { $this->err($line, "E0101", "instrukcja " . substr($k, 1) . " niedostępna w backendzie natywnym 0.0.1"); }
@@ -163,13 +175,11 @@ class Lowerer {
             return;
         }
         if ($k === ":Unary") {
-            if ($e[2] === "BitNot") { $this->err($line, "E0102", "operatory bitowe niedostępne w backendzie natywnym 0.0.1"); }
             $this->checkExpr($e[3]);
             return;
         }
         if ($k === ":Binary") {
             $op = $e[2];
-            if (in_array($op, ["BitAnd", "BitOr", "BitXor", "Shl", "Shr"])) { $this->err($line, "E0102", "operatory bitowe niedostępne w backendzie natywnym 0.0.1"); }
             $this->checkExpr($e[3]);
             $this->checkExpr($e[4]);
             return;
@@ -232,7 +242,11 @@ class Lowerer {
                 if ($n !== IrTables.MATH[$f]) { $this->err($line, "E0104", "Math." . $f . ": zła liczba argumentów"); }
                 return;
             }
-            if ($m === "System" && $f === "exit") { return; }
+            if (has_key(IrTables.MODULES, $m) && has_key(IrTables.MODULES[$m], $f)) {
+                $ar = IrTables.MODULES[$m][$f];
+                if ($ar >= 0 && $n !== $ar) { $this->err($line, "E0104", $m . "." . $f . ": zła liczba argumentów (" . $n . ")"); }
+                return;
+            }
             $this->err($line, "E0103", "funkcja " . $m . "." . $f . " niedostępna w backendzie natywnym 0.0.1");
             return;
         }
@@ -273,10 +287,10 @@ func lower($ast) {
     # 2) walidacja i lokalne
     foreach ($ast as $s) {
         $k = $s[0];
-        if ($k === ":FuncStmt") { continue; }
+        if ($k === ":FuncStmt" || $k === ":Namespace") { continue; }
         if ($k === ":Import") {
             $path = $s[2];
-            if (!in_array($path[0], ["System", "Math"])) {
+            if (!in_array($path[0], ["System", "Math", "File", "Directory", "Process"])) {
                 $lw->errors[] = [$s[1], "E0106", "import " . join($path, ".") . ": moduły Z# nie są jeszcze obsługiwane w backendzie natywnym 0.0.1 (użyj `zsc build --emit zbc`)"];
             }
             continue;
