@@ -1,0 +1,1089 @@
+namespace emit_llvm;
+
+import Workspace.ir;
+
+##
+ * Backend LLVM: Z# IR -> tekstowy LLVM IR (.ll), linkowany z runtime/native/zs_rt.c (clang/llc).
+ * Model wartości: V = { i64 tag, i64 bits }. Argumenty V przekazywane jako dwa i64 (ABI SysV x86-64/AArch64
+ * zgodne z `struct V` z zs_native.h), wynik V jako { i64, i64 }.
+ * Zmienne lokalne to `alloca` (w funkcjach z try — dostęp `volatile`, bo setjmp/longjmp).
+ * Pokrycie = podzbiór backendu C (patrz ir.zsharp); semantyka sprawdzana testami różnicowymi.
+##
+class LlEmitter {
+    public $ir;
+    public $code;       # linie bieżącej funkcji (ciało)
+    public $allocas;    # linie alloca (blok entry)
+    public $globals;    # definicje globalne
+    public $strs;       # literał => indeks
+    public $strList;
+    public $cstrs;      # C-string => indeks
+    public $cstrList;
+    public $floats;
+    public $tmp;
+    public $lbl;
+    public $loops;
+    public $loopId;
+    public $tries;
+    public $hid;
+    public $curFunc;
+    public $term;       # czy bieżący blok jest zakończony
+    public $vol;        # "volatile " w funkcjach z try
+    public $slotN;
+
+    public func __construct($ir) {
+        $this->ir = $ir;
+        $this->code = [];
+        $this->allocas = [];
+        $this->globals = [];
+        $this->strs = [];
+        $this->strList = [];
+        $this->cstrs = [];
+        $this->cstrList = [];
+        $this->floats = [];
+        $this->tmp = 0;
+        $this->lbl = 0;
+        $this->loops = [];
+        $this->loopId = 0;
+        $this->tries = [];
+        $this->hid = 0;
+        $this->curFunc = "";
+        $this->term = false;
+        $this->vol = "";
+        $this->slotN = 0;
+    }
+
+    # ── niskopoziomowe ──
+    func r() { $this->tmp++; return "%t" . $this->tmp; }
+    func newLabel($p) { $this->lbl++; return $p . $this->lbl; }
+
+    func line($s) {
+        if ($this->term) { $this->label($this->newLabel("dead")); }
+        $this->code[] = "  " . $s;
+    }
+
+    func label($l) {
+        if (!$this->term) { $this->code[] = "  br label %" . $l; }
+        $this->code[] = $l . ":";
+        $this->term = false;
+    }
+
+    func terminate($s) {
+        if ($this->term) { $this->label($this->newLabel("dead")); }
+        $this->code[] = "  " . $s;
+        $this->term = true;
+    }
+
+    func esc($s) {
+        $out = "";
+        foreach (chars($s) as $c) {
+            $o = ord($c);
+            if (strlen($c) > 1) { $out .= $c; }
+            else if ($o < 32 || $o >= 127 || $c === "\\" || $c === "\"") { $out .= "\\" . hex2($o); }
+            else { $out .= $c; }
+        }
+        return $out;
+    }
+
+    # globalny C-string (zakończony zerem) -> operand ptr
+    func cstr($s) {
+        if (!has_key($this->cstrs, $s)) {
+            $this->cstrs[$s] = count($this->cstrList);
+            $this->cstrList[] = $s;
+        }
+        return "@.c" . $this->cstrs[$s];
+    }
+
+    # literał napisu Z# -> adres slotu w tablicy @S
+    func strSlot($s) {
+        if (!has_key($this->strs, $s)) {
+            $this->strs[$s] = count($this->strList);
+            $this->strList[] = $s;
+        }
+        return $this->strs[$s];
+    }
+
+    func slot() {
+        $this->slotN++;
+        $n = "%slot" . $this->slotN;
+        $this->allocas[] = "  " . $n . " = alloca { i64, i64 }, align 8";
+        return $n;
+    }
+
+    # ── wywołania runtime ──
+    func ty($t) { return $t === "V" ? "{ i64, i64 }" : $t; }
+
+    # $args: lista [typ, operand]; V -> dwa i64
+    func rt($fn, $ret, $args) {
+        $parts = [];
+        foreach ($args as $a) {
+            if ($a[0] === "V") {
+                $x = $this->r();
+                $y = $this->r();
+                $this->line($x . " = extractvalue { i64, i64 } " . $a[1] . ", 0");
+                $this->line($y . " = extractvalue { i64, i64 } " . $a[1] . ", 1");
+                $parts[] = "i64 " . $x;
+                $parts[] = "i64 " . $y;
+            } else { $parts[] = $a[0] . " " . $a[1]; }
+        }
+        if ($ret === "void") { $this->line("call void @" . $fn . "(" . join($parts, ", ") . ")"); return null; }
+        $res = $this->r();
+        $this->line($res . " = call " . $this->ty($ret) . " @" . $fn . "(" . join($parts, ", ") . ")");
+        return $res;
+    }
+
+    func vcall($fn, $regs) {
+        $args = [];
+        foreach ($regs as $x) { $args[] = ["V", $x]; }
+        return $this->rt($fn, "V", $args);
+    }
+
+    func mkv($tag, $bits) {
+        $a = $this->r();
+        $this->line($a . " = insertvalue { i64, i64 } { i64 " . $tag . ", i64 0 }, i64 " . $bits . ", 1");
+        return $a;
+    }
+
+    func nullv() { return $this->mkv(0, "0"); }
+
+    func truthy($v) {
+        $c = $this->rt("zv_truthy", "i32", [["V", $v]]);
+        $b = $this->r();
+        $this->line($b . " = icmp ne i32 " . $c . ", 0");
+        return $b;
+    }
+
+    func boolOf($i1) {
+        $z = $this->r();
+        $this->line($z . " = zext i1 " . $i1 . " to i64");
+        $a = $this->r();
+        $this->line($a . " = insertvalue { i64, i64 } { i64 1, i64 0 }, i64 " . $z . ", 1");
+        return $a;
+    }
+
+    func ident($n) { return "%\"v_" . $n . "\""; }
+
+    func load($n) {
+        $t = $this->r();
+        $this->line($t . " = load " . $this->vol . "{ i64, i64 }, ptr " . $this->ident($n) . ", align 8");
+        return $t;
+    }
+
+    func store($n, $v) { $this->line("store " . $this->vol . "{ i64, i64 } " . $v . ", ptr " . $this->ident($n) . ", align 8"); }
+
+    func storeTo($ptr, $v) { $this->line("store { i64, i64 } " . $v . ", ptr " . $ptr . ", align 8"); }
+
+    func loadFrom($ptr) {
+        $t = $this->r();
+        $this->line($t . " = load { i64, i64 }, ptr " . $ptr . ", align 8");
+        return $t;
+    }
+
+    # ── wyrażenia ──
+    func isLval($e) { return $e[0] === ":Var" || $e[0] === ":Index"; }
+
+    func val($e) {
+        $x = $this->expr($e);
+        return $this->isLval($e) ? $this->vcall("zv_dup", [$x]) : $x;
+    }
+
+    func binop($op, $a, $b) {
+        $m = ["Add" => "zv_add", "Sub" => "zv_sub", "Mul" => "zv_mul", "Div" => "zv_div", "Mod" => "zv_mod", "Pow" => "zv_pow", "Concat" => "zv_concat", "BitAnd" => "zv_bitand", "BitOr" => "zv_bitor", "BitXor" => "zv_bitxor", "Shl" => "zv_shl", "Shr" => "zv_shr"];
+        if (has_key($m, $op)) { return $this->vcall($m[$op], [$a, $b]); }
+        if ($op === "Eq" || $op === "NotEq" || $op === "Identical" || $op === "NotIdentical") {
+            $fn = ($op === "Eq" || $op === "NotEq") ? "zv_eq" : "zv_ident";
+            $c = $this->rt($fn, "i32", [["V", $a], ["V", $b]]);
+            $p = $this->r();
+            $this->line($p . " = icmp " . (($op === "Eq" || $op === "Identical") ? "ne" : "eq") . " i32 " . $c . ", 0");
+            return $this->boolOf($p);
+        }
+        if ($op === "Lt" || $op === "Gt" || $op === "Le" || $op === "Ge") {
+            $c = $this->rt("zv_cmp", "i32", [["V", $a], ["V", $b]]);
+            $cc = ["Lt" => "slt", "Gt" => "sgt", "Le" => "sle", "Ge" => "sge"][$op];
+            $p = $this->r();
+            $this->line($p . " = icmp " . $cc . " i32 " . $c . ", 0");
+            return $this->boolOf($p);
+        }
+        if ($op === "Xor") {
+            $x = $this->truthy($a);
+            $y = $this->truthy($b);
+            $p = $this->r();
+            $this->line($p . " = xor i1 " . $x . ", " . $y);
+            return $this->boolOf($p);
+        }
+        throw new Exception("emit_llvm: nieobsługiwany operator " . $op);
+    }
+
+    # lewa strona `??`: brak klucza = null
+    func quiet($e) {
+        if ($e[0] === ":Index" && $e[3] !== null) {
+            $b = $this->quiet($e[2]);
+            $k = $this->expr($e[3]);
+            return $this->vcall("zv_index_opt", [$b, $k]);
+        }
+        return $this->expr($e);
+    }
+
+    func keyOf($t, $arr) {
+        if ($t[3] === null) {
+            $n = $this->rt("zs_array_len", "i64", [["V", $arr]]);
+            $a = $this->r();
+            $this->line($a . " = insertvalue { i64, i64 } { i64 2, i64 0 }, i64 " . $n . ", 1");
+            return $a;
+        }
+        return $this->expr($t[3]);
+    }
+
+    # tablica do zapisu dla bazy l-wartości
+    func lv($base) {
+        if ($base[0] === ":Var") {
+            $cur = $this->load($base[2]);
+            $w = $this->vcall("zv_wr", [$cur]);
+            $this->store($base[2], $w);
+            return $w;
+        }
+        $p = $this->lv($base[2]);
+        $k = $this->keyOf($base, $p);
+        $e = $this->vcall("zv_index_opt", [$p, $k]);
+        $isnull = $this->r();
+        $tg = $this->r();
+        $this->line($tg . " = extractvalue { i64, i64 } " . $e . ", 0");
+        $this->line($isnull . " = icmp eq i64 " . $tg . ", 0");
+        $sl = $this->slot();
+        $this->storeTo($sl, $e);
+        $lnew = $this->newLabel("lvnew");
+        $ljoin = $this->newLabel("lvjoin");
+        $this->terminate("br i1 " . $isnull . ", label %" . $lnew . ", label %" . $ljoin);
+        $this->label($lnew);
+        $this->storeTo($sl, $this->newArr());
+        $this->label($ljoin);
+        $cur = $this->loadFrom($sl);
+        $w = $this->vcall("zv_wr", [$cur]);
+        $this->vcallVoid("zv_set", [$p, $k, $w]);
+        return $w;
+    }
+
+    func newArr() { return $this->rt("zv_arr_new", "V", [["i64", "4"]]); }
+
+    func vcallVoid($fn, $regs) {
+        $args = [];
+        foreach ($regs as $x) { $args[] = ["V", $x]; }
+        $this->rt($fn, "void", $args);
+    }
+
+    func incdec($e) {
+        $t = $e[2];
+        $fn = $e[3] ? "zv_add" : "zv_sub";
+        $prefix = $e[4];
+        $one = $this->mkv(2, "1");
+        if ($t[0] === ":Var") {
+            $o = $this->load($t[2]);
+            $n = $this->vcall($fn, [$o, $one]);
+            $this->store($t[2], $n);
+            return $prefix ? $n : $o;
+        }
+        $a = $this->lv($t[2]);
+        $k = $this->keyOf($t, $a);
+        $o = $this->vcall("zv_index", [$a, $k]);
+        $n = $this->vcall($fn, [$o, $one]);
+        $this->vcallVoid("zv_set", [$a, $k, $n]);
+        return $prefix ? $n : $o;
+    }
+
+    # wynik wyrażenia warunkowego przez slot (bez phi)
+    func assignop($e) {
+        $op = $e[2];
+        $t = $e[3];
+        if ($t[0] === ":Var") {
+            $o = $this->load($t[2]);
+            if ($op === "Coalesce") {
+                $r = $this->coalesceWith($o, $e[4]);
+                $this->store($t[2], $r);
+                return $r;
+            }
+            $rhs = $this->expr($e[4]);
+            $n = $this->binop($op, $o, $rhs);
+            $this->store($t[2], $n);
+            return $n;
+        }
+        $a = $this->lv($t[2]);
+        $k = $this->keyOf($t, $a);
+        if ($op === "Coalesce") {
+            $o = $this->vcall("zv_index_opt", [$a, $k]);
+            $n = $this->coalesceWith($o, $e[4]);
+        } else {
+            $o = $this->vcall("zv_index", [$a, $k]);
+            $rhs = $this->expr($e[4]);
+            $n = $this->binop($op, $o, $rhs);
+        }
+        $this->vcallVoid("zv_set", [$a, $k, $n]);
+        return $n;
+    }
+
+    # $x ?? rhs, gdzie $x już policzone
+    func coalesceWith($x, $rhsExpr) {
+        $sl = $this->slot();
+        $this->storeTo($sl, $x);
+        $tg = $this->r();
+        $this->line($tg . " = extractvalue { i64, i64 } " . $x . ", 0");
+        $isn = $this->r();
+        $this->line($isn . " = icmp eq i64 " . $tg . ", 0");
+        $lr = $this->newLabel("coal");
+        $lj = $this->newLabel("coalj");
+        $this->terminate("br i1 " . $isn . ", label %" . $lr . ", label %" . $lj);
+        $this->label($lr);
+        $v = $this->val($rhsExpr);
+        $this->storeTo($sl, $v);
+        $this->label($lj);
+        return $this->loadFrom($sl);
+    }
+
+    func assign($e) {
+        $t = $e[2];
+        if ($t[0] === ":Var") {
+            $v = $this->val($e[3]);
+            $this->store($t[2], $v);
+            return $v;
+        }
+        $a = $this->lv($t[2]);
+        $v = $this->val($e[3]);
+        if ($t[3] === null) { $this->vcallVoid("zv_append", [$a, $v]); }
+        else {
+            $k = $this->expr($t[3]);
+            $this->vcallVoid("zv_set", [$a, $k, $v]);
+        }
+        return $v;
+    }
+
+    func argRegs($list, $dup) {
+        $out = [];
+        foreach ($list as $a) { $out[] = $dup ? $this->val($a[3]) : $this->expr($a[3]); }
+        return $out;
+    }
+
+    func call($e) {
+        $callee = $e[2];
+        $list = $e[3];
+        $n = count($list);
+        if ($callee[0] === ":Prop") { return $this->vcall("b_getmessage", [$this->expr($callee[2])]); }
+        if ($callee[0] === ":Name") {
+            $name = $callee[2];
+            if (has_key($this->ir["funcs"], $name)) {
+                $f = $this->ir["funcs"][$name];
+                $a = $this->argRegs($list, true);
+                for ($i = $n; $i < count($f["params"]); $i++) { $a[] = $this->expr($f["params"][$i][4]); }
+                return $this->vcall("f_" . $name, $a);
+            }
+            return $this->builtin($name, $list);
+        }
+        $m = $callee[2][2];
+        $f = $callee[3];
+        $a = $this->argRegs($list, false);
+        if ($m === "System" && $f === "exit") { return $this->doExit($a); }
+        if ($m === "Process" && count($a) === 1) { $a[] = $this->nullv(); }
+        return $this->vcall("m_" . $m . "_" . $f, $a);
+    }
+
+    func doExit($a) {
+        $c = count($a) > 0 ? $a[0] : $this->mkv(2, "0");
+        $this->vcallVoid("s_exit", [$c]);
+        $this->terminate("unreachable");
+        return $this->nullv();
+    }
+
+    func builtin($name, $list) {
+        $a = $this->argRegs($list, false);
+        if ($name === "eecho") {
+            $first = 1;
+            foreach ($a as $x) { $this->rt("zs_eecho_v", "void", [["V", $x], ["i32", "" . $first]]); $first = 0; }
+            if (count($a) === 0) { $this->rt("zs_shutdown", "void", []); }
+            $this->rt("zs_eecho_end", "void", []);
+            return $this->nullv();
+        }
+        if ($name === "necho") {
+            foreach ($a as $x) { $this->rt("zs_necho_v", "void", [["V", $x]]); }
+            return $this->nullv();
+        }
+        if ($name === "exit") { return $this->doExit($a); }
+        if ($name === "dump") {
+            foreach ($a as $x) { $this->vcall("b_dump", [$x]); }
+            return $this->nullv();
+        }
+        if ($name === "push") {
+            $r = $a[0];
+            for ($i = 1; $i < count($a); $i++) { $r = $this->vcall("b_push", [$r, $a[$i]]); }
+            return $r;
+        }
+        if ($name === "substr") {
+            $has = count($a) === 3 ? "1" : "0";
+            $l = count($a) === 3 ? $a[2] : $this->nullv();
+            return $this->rt("b_substr", "V", [["V", $a[0]], ["V", $a[1]], ["V", $l], ["i32", $has]]);
+        }
+        if (count($a) === 3 && in_array($name, ["pad_left", "pad_right", "array_slice"])) { return $this->vcall("b_" . $name . "3", $a); }
+        return $this->vcall("b_" . $name, $a);
+    }
+
+    func expr($e) {
+        $k = $e[0];
+        if ($k === ":Null") { return $this->nullv(); }
+        if ($k === ":Bool") { return $this->mkv(1, $e[2] ? "1" : "0"); }
+        if ($k === ":Int") { return $this->mkv(2, "" . $e[2]); }
+        if ($k === ":Float") {
+            $s = strval($e[2]);
+            return $this->rt("zl_float_lit", "V", [["ptr", $this->cstr($s)]]);
+        }
+        if ($k === ":Str") {
+            $i = $this->strSlot($e[2]);
+            $p = $this->r();
+            $this->line($p . " = getelementptr inbounds [" . "STRCOUNT" . " x { i64, i64 }], ptr @S, i64 0, i64 " . $i);
+            return $this->loadFrom($p);
+        }
+        if ($k === ":Var") { return $this->load($e[2]); }
+        if ($k === ":Array") {
+            $arr = $this->rt("zv_arr_new", "V", [["i64", "" . count($e[2])]]);
+            foreach ($e[2] as $it) {
+                if ($it[2] === null) { $this->vcallVoid("zv_append", [$arr, $this->val($it[3])]); }
+                else {
+                    $key = $this->expr($it[2]);
+                    $this->vcallVoid("zv_set", [$arr, $key, $this->val($it[3])]);
+                }
+            }
+            return $arr;
+        }
+        if ($k === ":Index") {
+            if ($e[3] === null) { throw new Exception("emit_llvm: odczyt `[]` niedozwolony (linia " . $e[1] . ")"); }
+            $b = $this->expr($e[2]);
+            $i = $this->expr($e[3]);
+            return $this->vcall("zv_index", [$b, $i]);
+        }
+        if ($k === ":Unary") {
+            $x = $this->expr($e[3]);
+            if ($e[2] === "Not") {
+                $t = $this->truthy($x);
+                $n = $this->r();
+                $this->line($n . " = xor i1 " . $t . ", true");
+                return $this->boolOf($n);
+            }
+            if ($e[2] === "Neg") { return $this->vcall("zv_neg", [$x]); }
+            if ($e[2] === "BitNot") { return $this->vcall("zv_bitnot", [$x]); }
+            return $x;
+        }
+        if ($k === ":Binary") {
+            $op = $e[2];
+            if ($op === "And" || $op === "Or") { return $this->shortCircuit($op === "And", $e[3], $e[4]); }
+            if ($op === "Coalesce") { return $this->coalesceWith($this->quiet($e[3]), $e[4]); }
+            $a = $this->expr($e[3]);
+            $b = $this->expr($e[4]);
+            return $this->binop($op, $a, $b);
+        }
+        if ($k === ":Assign") { return $this->assign($e); }
+        if ($k === ":AssignOp") { return $this->assignop($e); }
+        if ($k === ":IncDec") { return $this->incdec($e); }
+        if ($k === ":Ternary") { return $this->ternary($e); }
+        if ($k === ":Call") { return $this->call($e); }
+        throw new Exception("emit_llvm: wyrażenie " . $k . " (linia " . $e[1] . ")");
+    }
+
+    func shortCircuit($isAnd, $l, $r) {
+        $x = $this->expr($l);
+        $t = $this->truthy($x);
+        $sl = $this->slot();
+        $this->storeTo($sl, $this->boolOf($t));
+        $lr = $this->newLabel("sc");
+        $lj = $this->newLabel("scj");
+        if ($isAnd) { $this->terminate("br i1 " . $t . ", label %" . $lr . ", label %" . $lj); }
+        else { $this->terminate("br i1 " . $t . ", label %" . $lj . ", label %" . $lr); }
+        $this->label($lr);
+        $y = $this->expr($r);
+        $ty = $this->truthy($y);
+        $this->storeTo($sl, $this->boolOf($ty));
+        $this->label($lj);
+        return $this->loadFrom($sl);
+    }
+
+    func ternary($e) {
+        $sl = $this->slot();
+        $lt = $this->newLabel("tt");
+        $lf = $this->newLabel("tf");
+        $lj = $this->newLabel("tj");
+        if ($e[3] === null) {
+            $c = $this->expr($e[2]);
+            $this->storeTo($sl, $c);
+            $t = $this->truthy($c);
+            $this->terminate("br i1 " . $t . ", label %" . $lj . ", label %" . $lf);
+        } else {
+            $c = $this->expr($e[2]);
+            $t = $this->truthy($c);
+            $this->terminate("br i1 " . $t . ", label %" . $lt . ", label %" . $lf);
+            $this->label($lt);
+            $a = $this->expr($e[3]);
+            $this->storeTo($sl, $a);
+            $this->terminate("br label %" . $lj);
+        }
+        $this->label($lf);
+        $b = $this->expr($e[4]);
+        $this->storeTo($sl, $b);
+        $this->label($lj);
+        return $this->loadFrom($sl);
+    }
+
+    # ── instrukcje ──
+    func setLine($n) { $this->line("store i64 " . $n . ", ptr @zs_line, align 8"); }
+
+    func block($list) { foreach ($list as $s) { $this->stmt($s); } }
+
+    func pushLoop() { $this->loopId++; $this->loops[] = [$this->loopId, "loop", count($this->tries)]; return $this->loopId; }
+    func popLoop() { $this->loops = array_slice($this->loops, 0, count($this->loops) - 1); }
+
+    func jumpOut($depth) {
+        $saved = $this->tries;
+        for ($i = count($saved) - 1; $i >= $depth; $i--) {
+            $e = $saved[$i];
+            $this->rt("zl_try_leave", "void", [["ptr", $e[1]]]);
+            if ($e[0] === "finally") {
+                $this->tries = array_slice($saved, 0, $i);
+                $this->block($e[2]);
+            }
+        }
+        $this->tries = $saved;
+    }
+
+    func catchCond($types, $x) {
+        # zwraca i1 (OR warunków)
+        $acc = null;
+        foreach ($types as $t) {
+            if ($t === "Throwable" || $t === "Exception") { $c = "true"; }
+            else {
+                $v = $this->rt("zv_exc_is", "i32", [["V", $x], ["i32", "1"]]);
+                $c = $this->r();
+                $this->line($c . " = icmp ne i32 " . $v . ", 0");
+            }
+            if ($acc === null) { $acc = $c; }
+            else {
+                $o = $this->r();
+                $this->line($o . " = or i1 " . $acc . ", " . $c);
+                $acc = $o;
+            }
+        }
+        return $acc;
+    }
+
+    # alokacja uchwytu obsługi (bufor na ZsHandler)
+    func handler() {
+        $this->hid++;
+        $h = "%h" . $this->hid;
+        $this->allocas[] = "  " . $h . " = alloca [512 x i8], align 16";
+        return $h;
+    }
+
+    func jb($h) {
+        $p = $this->r();
+        $this->line($p . " = getelementptr inbounds i8, ptr " . $h . ", i64 8");
+        return $p;
+    }
+
+    func tryCatch($body, $catches) {
+        $h = $this->handler();
+        $this->rt("zl_try_enter", "void", [["ptr", $h]]);
+        $sj = $this->r();
+        $this->line($sj . " = call i32 @_setjmp(ptr " . $this->jb($h) . ") returns_twice");
+        $z = $this->r();
+        $this->line($z . " = icmp eq i32 " . $sj . ", 0");
+        $lb = $this->newLabel("try");
+        $lc = $this->newLabel("catch");
+        $le = $this->newLabel("tryend");
+        $this->terminate("br i1 " . $z . ", label %" . $lb . ", label %" . $lc);
+        $this->label($lb);
+        $this->tries[] = ["catch", $h, null];
+        $this->block($body);
+        $this->tries = array_slice($this->tries, 0, count($this->tries) - 1);
+        $this->rt("zl_try_leave", "void", [["ptr", $h]]);
+        $this->terminate("br label %" . $le);
+        $this->label($lc);
+        $this->rt("zl_try_leave", "void", [["ptr", $h]]);
+        $x = $this->rt("zl_cur_exc", "V", []);
+        $xs = $this->slot();
+        $this->storeTo($xs, $x);
+        foreach ($catches as $c) {
+            $xv = $this->loadFrom($xs);
+            $cond = $this->catchCond($c[2], $xv);
+            $lm = $this->newLabel("cmatch");
+            $ln = $this->newLabel("cnext");
+            $this->terminate("br i1 " . $cond . ", label %" . $lm . ", label %" . $ln);
+            $this->label($lm);
+            if ($c[3] !== null) { $this->store($c[3], $this->loadFrom($xs)); }
+            $this->block($c[4]);
+            $this->terminate("br label %" . $le);
+            $this->label($ln);
+        }
+        $this->rt("zs_reraise", "void", [["V", $this->loadFrom($xs)]]);
+        $this->terminate("unreachable");
+        $this->label($le);
+    }
+
+    func tryStmt($s) {
+        $body = $s[2];
+        $catches = $s[3];
+        $fin = $s[4];
+        if ($fin === null) { $this->tryCatch($body, $catches); return; }
+        $h = $this->handler();
+        $pend = $this->slot();
+        $exc = $this->slot();
+        $this->storeTo($pend, $this->mkv(2, "0"));
+        $this->storeTo($exc, $this->nullv());
+        $this->rt("zl_try_enter", "void", [["ptr", $h]]);
+        $sj = $this->r();
+        $this->line($sj . " = call i32 @_setjmp(ptr " . $this->jb($h) . ") returns_twice");
+        $z = $this->r();
+        $this->line($z . " = icmp eq i32 " . $sj . ", 0");
+        $lb = $this->newLabel("fbody");
+        $lc = $this->newLabel("fexc");
+        $lf = $this->newLabel("ffin");
+        $this->terminate("br i1 " . $z . ", label %" . $lb . ", label %" . $lc);
+        $this->label($lb);
+        $this->tries[] = ["finally", $h, $fin];
+        if (count($catches) > 0) { $this->tryCatch($body, $catches); } else { $this->block($body); }
+        $this->tries = array_slice($this->tries, 0, count($this->tries) - 1);
+        $this->rt("zl_try_leave", "void", [["ptr", $h]]);
+        $this->terminate("br label %" . $lf);
+        $this->label($lc);
+        $this->rt("zl_try_leave", "void", [["ptr", $h]]);
+        $this->storeTo($exc, $this->rt("zl_cur_exc", "V", []));
+        $this->storeTo($pend, $this->mkv(2, "1"));
+        $this->label($lf);
+        $this->block($fin);
+        $p = $this->loadFrom($pend);
+        $pt = $this->r();
+        $this->line($pt . " = extractvalue { i64, i64 } " . $p . ", 1");
+        $pc = $this->r();
+        $this->line($pc . " = icmp ne i64 " . $pt . ", 0");
+        $lr = $this->newLabel("frethrow");
+        $ld = $this->newLabel("fdone");
+        $this->terminate("br i1 " . $pc . ", label %" . $lr . ", label %" . $ld);
+        $this->label($lr);
+        $this->rt("zs_reraise", "void", [["V", $this->loadFrom($exc)]]);
+        $this->terminate("unreachable");
+        $this->label($ld);
+    }
+
+    func chkType($types, $v, $what) {
+        if (count($types) === 1 && in_array($types[0], IrTables.SIMPLE_TYPES)) {
+            return $this->rt("zv_chk", "V", [["V", $v], ["ptr", $this->cstr($types[0])], ["ptr", $this->cstr($what)]]);
+        }
+        return $v;
+    }
+
+    func stmt($s) {
+        $k = $s[0];
+        $line = $s[1];
+        if ($k === ":Expr") { $this->setLine($line); $this->expr($s[2]); return; }
+        if ($k === ":Echo") {
+            $this->setLine($line);
+            $first = 1;
+            foreach ($s[2] as $e) { $x = $this->expr($e); $this->rt("zs_echo_v", "void", [["V", $x], ["i32", "" . $first]]); $first = 0; }
+            $this->rt("zs_echo_end", "void", []);
+            return;
+        }
+        if ($k === ":Block") { $this->block($s[2]); return; }
+        if ($k === ":If") {
+            $this->setLine($line);
+            $c = $this->truthy($this->expr($s[2]));
+            $lt = $this->newLabel("then");
+            $le = $this->newLabel("else");
+            $lj = $this->newLabel("endif");
+            $this->terminate("br i1 " . $c . ", label %" . $lt . ", label %" . ($s[4] !== null ? $le : $lj));
+            $this->label($lt);
+            $this->block($s[3]);
+            $this->terminate("br label %" . $lj);
+            if ($s[4] !== null) {
+                $this->label($le);
+                $this->block($s[4]);
+                $this->terminate("br label %" . $lj);
+            }
+            $this->label($lj);
+            return;
+        }
+        if ($k === ":While") {
+            $id = $this->pushLoop();
+            $lc = "cont_" . $id;
+            $lb = "brk_" . $id;
+            $lbody = $this->newLabel("wbody");
+            $this->terminate("br label %" . $lc);
+            $this->label($lc);
+            $this->setLine($line);
+            $c = $this->truthy($this->expr($s[2]));
+            $this->terminate("br i1 " . $c . ", label %" . $lbody . ", label %" . $lb);
+            $this->label($lbody);
+            $this->block($s[3]);
+            $this->terminate("br label %" . $lc);
+            $this->label($lb);
+            $this->popLoop();
+            return;
+        }
+        if ($k === ":DoWhile") {
+            $id = $this->pushLoop();
+            $lc = "cont_" . $id;
+            $lb = "brk_" . $id;
+            $ltop = $this->newLabel("dtop");
+            $this->terminate("br label %" . $ltop);
+            $this->label($ltop);
+            $this->block($s[2]);
+            $this->terminate("br label %" . $lc);
+            $this->label($lc);
+            $this->setLine($line);
+            $c = $this->truthy($this->expr($s[3]));
+            $this->terminate("br i1 " . $c . ", label %" . $ltop . ", label %" . $lb);
+            $this->label($lb);
+            $this->popLoop();
+            return;
+        }
+        if ($k === ":For") {
+            $id = $this->pushLoop();
+            $lc = "cont_" . $id;
+            $lb = "brk_" . $id;
+            $ltest = $this->newLabel("ftest");
+            $lbody = $this->newLabel("fbody");
+            $lstep = $this->newLabel("fstep");
+            foreach ($s[2] as $e) { $this->setLine($line); $this->expr($e); }
+            $this->terminate("br label %" . $ltest);
+            $this->label($ltest);
+            if ($s[3] !== null) {
+                $this->setLine($line);
+                $c = $this->truthy($this->expr($s[3]));
+                $this->terminate("br i1 " . $c . ", label %" . $lbody . ", label %" . $lb);
+            } else { $this->terminate("br label %" . $lbody); }
+            $this->label($lbody);
+            $this->block($s[5]);
+            $this->terminate("br label %" . $lc);
+            $this->label($lc);
+            foreach ($s[4] as $e) { $this->expr($e); }
+            $this->terminate("br label %" . $ltest);
+            $this->label($lb);
+            $this->popLoop();
+            return;
+        }
+        if ($k === ":Foreach") {
+            $id = $this->pushLoop();
+            $lc = "cont_" . $id;
+            $lb = "brk_" . $id;
+            $this->setLine($line);
+            $it = $this->val($s[2]);
+            $itSlot = $this->slot();
+            $this->storeTo($itSlot, $it);
+            $tg = $this->r();
+            $this->line($tg . " = extractvalue { i64, i64 } " . $it . ", 0");
+            $isArr = $this->r();
+            $this->line($isArr . " = icmp eq i64 " . $tg . ", 5");
+            $lok = $this->newLabel("fe_ok");
+            $lbad = $this->newLabel("fe_bad");
+            $this->terminate("br i1 " . $isArr . ", label %" . $lok . ", label %" . $lbad);
+            $this->label($lbad);
+            $this->rt("zl_foreach_die", "void", [["V", $it]]);
+            $this->terminate("unreachable");
+            $this->label($lok);
+            $n = $this->rt("zs_array_len", "i64", [["V", $it]]);
+            $iSlot = $this->r();
+            $this->allocas[] = "  " . $iSlot . " = alloca i64, align 8";
+            $this->line("store i64 0, ptr " . $iSlot . ", align 8");
+            $lhead = $this->newLabel("fe_head");
+            $lbody = $this->newLabel("fe_body");
+            $this->terminate("br label %" . $lhead);
+            $this->label($lhead);
+            $i = $this->r();
+            $this->line($i . " = load i64, ptr " . $iSlot . ", align 8");
+            $cnd = $this->r();
+            $this->line($cnd . " = icmp slt i64 " . $i . ", " . $n);
+            $this->terminate("br i1 " . $cnd . ", label %" . $lbody . ", label %" . $lb);
+            $this->label($lbody);
+            $cur = $this->loadFrom($itSlot);
+            $v = $this->rt("zv_get_raw", "V", [["V", $cur], ["i64", $i]]);
+            $this->store($s[4], $v);
+            if ($s[3] !== null) {
+                $kv = $this->rt("zv_key_at", "V", [["V", $cur], ["i64", $i]]);
+                $this->store($s[3], $kv);
+            }
+            $this->block($s[5]);
+            $this->terminate("br label %" . $lc);
+            $this->label($lc);
+            $i2 = $this->r();
+            $this->line($i2 . " = load i64, ptr " . $iSlot . ", align 8");
+            $i3 = $this->r();
+            $this->line($i3 . " = add i64 " . $i2 . ", 1");
+            $this->line("store i64 " . $i3 . ", ptr " . $iSlot . ", align 8");
+            $this->terminate("br label %" . $lhead);
+            $this->label($lb);
+            $this->popLoop();
+            return;
+        }
+        if ($k === ":Switch") {
+            $id = $this->pushLoop();
+            $lb = "brk_" . $id;
+            $lc = "cont_" . $id;
+            $this->setLine($line);
+            $sv = $this->expr($s[2]);
+            $svSlot = $this->slot();
+            $this->storeTo($svSlot, $sv);
+            $n = count($s[3]);
+            $labels = [];
+            for ($i = 0; $i < $n; $i++) { $labels[] = $this->newLabel("case"); }
+            $def = -1;
+            for ($i = 0; $i < $n; $i++) {
+                $c = $s[3][$i];
+                if ($c[2] === null) { $def = $i; continue; }
+                $cv = $this->expr($c[2]);
+                $eq = $this->rt("zv_eq", "i32", [["V", $this->loadFrom($svSlot)], ["V", $cv]]);
+                $p = $this->r();
+                $this->line($p . " = icmp ne i32 " . $eq . ", 0");
+                $lnext = $this->newLabel("cmp");
+                $this->terminate("br i1 " . $p . ", label %" . $labels[$i] . ", label %" . $lnext);
+                $this->label($lnext);
+            }
+            $this->terminate("br label %" . ($def >= 0 ? $labels[$def] : $lb));
+            for ($i = 0; $i < $n; $i++) {
+                $this->label($labels[$i]);
+                $this->block($s[3][$i][3]);
+            }
+            $this->terminate("br label %" . $lb);
+            $this->label($lb);
+            $this->label($lc);
+            $this->popLoop();
+            return;
+        }
+        if ($k === ":Return") {
+            $this->setLine($line);
+            $v = $s[2] === null ? $this->nullv() : $this->val($s[2]);
+            $ret = $this->ir["funcs"][$this->curFunc]["ret"] ?? [];
+            $rv = $this->chkType($ret, $v, "wartość zwracana funkcji " . $this->curFunc);
+            if (count($this->tries) > 0) { $this->jumpOut(0); }
+            $this->terminate("ret { i64, i64 } " . $rv);
+            return;
+        }
+        if ($k === ":Break" || $k === ":Continue") {
+            $lv = $s[2];
+            $i = count($this->loops) - $lv;
+            if ($i < 0) { throw new Exception("emit_llvm: break/continue " . $lv . " poza pętlą (linia " . $line . ")"); }
+            $lp = $this->loops[$i];
+            $this->jumpOut($lp[2]);
+            $this->terminate("br label %" . ($k === ":Break" ? "brk_" : "cont_") . $lp[0]);
+            return;
+        }
+        if ($k === ":Try") { $this->tryStmt($s); return; }
+        if ($k === ":Throw") {
+            $x = $s[2];
+            $this->setLine($line);
+            if ($x[0] === ":New") {
+                $msg = count($x[3]) > 0 ? $this->expr($x[3][0][3]) : $this->emptyStr();
+                $ex = $this->rt("zv_exc_new", "V", [["i32", $x[2] === "Error" ? "1" : "0"], ["V", $msg]]);
+                $this->rt("zs_raise", "void", [["V", $ex]]);
+            } else { $tv = $this->expr($x); $this->setLine($line); $this->vcall("b_throw_v", [$tv]); }
+            $this->terminate("unreachable");
+            return;
+        }
+        throw new Exception("emit_llvm: instrukcja " . $k . " (linia " . $line . ")");
+    }
+
+    func emptyStr() {
+        $i = $this->strSlot("");
+        $p = $this->r();
+        $this->line($p . " = getelementptr inbounds [STRCOUNT x { i64, i64 }], ptr @S, i64 0, i64 " . $i);
+        return $this->loadFrom($p);
+    }
+
+    # ── funkcje ──
+    func beginFunc($vol) {
+        $this->code = [];
+        $this->allocas = [];
+        $this->loops = [];
+        $this->tries = [];
+        $this->term = false;
+        $this->vol = $vol ? "volatile " : "";
+    }
+
+    func initLocals($locals, $params) {
+        foreach ($locals as $n) {
+            $this->allocas[] = "  " . $this->ident($n) . " = alloca { i64, i64 }, align 8";
+        }
+        foreach ($locals as $n) {
+            if (!in_array($n, $params)) { $this->store($n, $this->nullv()); }
+        }
+    }
+
+    func finishFunc($header, $kind) {
+        if (!$this->term) {
+            if ($kind === "V") { $this->terminate("ret { i64, i64 } zeroinitializer"); }
+            else { $this->terminate("ret i32 0"); }
+        }
+        $out = [$header . " {", "entry:"];
+        foreach ($this->allocas as $a) { $out[] = $a; }
+        $out[] = "  br label %body";
+        $out[] = "body:";
+        foreach ($this->code as $c) { $out[] = $c; }
+        $out[] = "}";
+        $out[] = "";
+        return $out;
+    }
+
+    func funcDef($name) {
+        $f = $this->ir["funcs"][$name];
+        $this->curFunc = $name;
+        $this->beginFunc($f["has_try"]);
+        $pn = [];
+        $sig = [];
+        foreach ($f["params"] as $p) { $pn[] = $p[2]; }
+        $i = 0;
+        foreach ($f["params"] as $p) { $sig[] = "i64 %a" . $i . "x, i64 %a" . $i . "y"; $i++; }
+        $this->initLocals($f["locals"], $pn);
+        $i = 0;
+        foreach ($f["params"] as $p) {
+            $r0 = $this->r();
+            $r1 = $this->r();
+            $this->line($r0 . " = insertvalue { i64, i64 } undef, i64 %a" . $i . "x, 0");
+            $this->line($r1 . " = insertvalue { i64, i64 } " . $r0 . ", i64 %a" . $i . "y, 1");
+            $v = $r1;
+            if (count($p[3]) === 1 && in_array($p[3][0], IrTables.SIMPLE_TYPES)) {
+                $v = $this->rt("zv_chk", "V", [["V", $r1], ["ptr", $this->cstr($p[3][0])], ["ptr", $this->cstr("argument $" . $p[2] . " funkcji " . $name)]]);
+            }
+            $this->store($p[2], $v);
+            $i++;
+        }
+        $this->block($f["body"]);
+        return $this->finishFunc("define internal { i64, i64 } @\"f_" . $name . "\"(" . join($sig, ", ") . ")", "V");
+    }
+
+    func generate($triple) {
+        $ir = $this->ir;
+        $funcs = [];
+        foreach ($ir["order"] as $name) { foreach ($this->funcDef($name) as $l) { $funcs[] = $l; } }
+        $this->curFunc = "";
+        $this->beginFunc($ir["top_has_try"]);
+        $this->initLocals($ir["toplocals"], []);
+        $this->block($ir["top"]);
+        $topLines = $this->finishFunc("define internal i32 @zs_top()", "i32");
+
+        $o = [];
+        $o[] = "; wygenerowane przez zsc (backend LLVM, Z# 0.0.1) — nie edytuj";
+        $o[] = "target triple = \"" . $triple . "\"";
+        $o[] = "";
+        foreach ($this->decls() as $d) { $o[] = $d; }
+        $o[] = "attributes #0 = { returns_twice }";
+        $o[] = "";
+        $sc = count($this->strList) > 0 ? count($this->strList) : 1;
+        $o[] = "@S = internal global [" . $sc . " x { i64, i64 }] zeroinitializer, align 16";
+        $i = 0;
+        foreach ($this->cstrList as $c) {
+            $o[] = "@.c" . $i . " = private unnamed_addr constant [" . (strlen($c) + 1) . " x i8] c\"" . $this->esc($c) . "\\00\", align 1";
+            $i++;
+        }
+        $i = 0;
+        foreach ($this->strList as $s) {
+            $o[] = "@.s" . $i . " = private unnamed_addr constant [" . (strlen($s) + 1) . " x i8] c\"" . $this->esc($s) . "\\00\", align 1";
+            $i++;
+        }
+        $o[] = "";
+        $o[] = "define internal void @zs_strings_init() {";
+        $o[] = "entry:";
+        $i = 0;
+        foreach ($this->strList as $s) {
+            $o[] = "  %r" . $i . " = call { i64, i64 } @zv_strn(ptr @.s" . $i . ", i64 " . strlen($s) . ")";
+            $o[] = "  %p" . $i . " = getelementptr inbounds [" . $sc . " x { i64, i64 }], ptr @S, i64 0, i64 " . $i;
+            $o[] = "  store { i64, i64 } %r" . $i . ", ptr %p" . $i . ", align 8";
+            $i++;
+        }
+        $o[] = "  ret void";
+        $o[] = "}";
+        $o[] = "";
+        foreach ($funcs as $l) { $o[] = $l; }
+        foreach ($topLines as $l) { $o[] = $l; }
+        $o[] = "define i32 @main(i32 %argc, ptr %argv) {";
+        $o[] = "entry:";
+        $o[] = "  call void @zs_init(i32 %argc, ptr %argv)";
+        $o[] = "  call void @zs_strings_init()";
+        $o[] = "  %rc = call i32 @zs_top()";
+        if (has_key($ir["funcs"], "main") && !$ir["calls_main"]) {
+            $o[] = "  %m = call { i64, i64 } @\"f_main\"()";
+            $o[] = "  %mt = extractvalue { i64, i64 } %m, 0";
+            $o[] = "  %mi = extractvalue { i64, i64 } %m, 1";
+            $o[] = "  %isint = icmp eq i64 %mt, 2";
+            $o[] = "  %mc = trunc i64 %mi to i32";
+            $o[] = "  %rc2 = select i1 %isint, i32 %mc, i32 %rc";
+            $o[] = "  call void @zs_shutdown()";
+            $o[] = "  ret i32 %rc2";
+        } else {
+            $o[] = "  call void @zs_shutdown()";
+            $o[] = "  ret i32 %rc";
+        }
+        $o[] = "}";
+        $text = join($o, "\n") . "\n";
+        return replace($text, "STRCOUNT", "" . $sc);
+    }
+
+    func decls() {
+        $d = [];
+        $v = "i64, i64";
+        $d[] = "declare void @zs_init(i32, ptr)";
+        $d[] = "declare void @zs_shutdown()";
+        $d[] = "declare { i64, i64 } @zv_strn(ptr, i64)";
+        $d[] = "declare { i64, i64 } @zl_float_lit(ptr)";
+        $d[] = "declare void @zl_try_enter(ptr)";
+        $d[] = "declare void @zl_try_leave(ptr)";
+        $d[] = "declare { i64, i64 } @zl_cur_exc()";
+        $d[] = "declare void @zl_foreach_die(" . $v . ")";
+        $d[] = "declare i32 @_setjmp(ptr) #0";
+        $d[] = "@zs_line = external global i64, align 8";
+        $d[] = "declare i32 @zv_truthy(" . $v . ")";
+        $d[] = "declare i32 @zv_eq(" . $v . ", " . $v . ")";
+        $d[] = "declare i32 @zv_ident(" . $v . ", " . $v . ")";
+        $d[] = "declare i32 @zv_cmp(" . $v . ", " . $v . ")";
+        $d[] = "declare i32 @zv_exc_is(" . $v . ", i32)";
+        $d[] = "declare i64 @zs_array_len(" . $v . ")";
+        $d[] = "declare { i64, i64 } @zv_arr_new(i64)";
+        $d[] = "declare void @zv_append(" . $v . ", " . $v . ")";
+        $d[] = "declare void @zv_set(" . $v . ", " . $v . ", " . $v . ")";
+        $d[] = "declare { i64, i64 } @zv_get_raw(" . $v . ", i64)";
+        $d[] = "declare { i64, i64 } @zv_key_at(" . $v . ", i64)";
+        $d[] = "declare { i64, i64 } @zv_exc_new(i32, " . $v . ")";
+        $d[] = "declare void @zs_raise(" . $v . ")";
+        $d[] = "declare void @zs_reraise(" . $v . ")";
+        $d[] = "declare { i64, i64 } @zv_chk(" . $v . ", ptr, ptr)";
+        $d[] = "declare void @zs_echo_v(" . $v . ", i32)";
+        $d[] = "declare void @zs_echo_end()";
+        $d[] = "declare void @zs_necho_v(" . $v . ")";
+        $d[] = "declare void @zs_eecho_v(" . $v . ", i32)";
+        $d[] = "declare void @zs_eecho_end()";
+        $d[] = "declare { i64, i64 } @s_exit(" . $v . ")";
+        $d[] = "declare { i64, i64 } @b_substr(" . $v . ", " . $v . ", " . $v . ", i32)";
+        foreach (["zv_dup", "zv_wr", "zv_neg", "zv_bitnot", "b_getmessage", "b_zs_obj_new", "b_zs_obj_class", "b_zs_no_class", "b_throw_v", "b_dump", "b_count", "b_strlen", "b_typeof", "b_is_int", "b_is_float",
+                  "b_is_string", "b_is_bool", "b_is_array", "b_is_null", "b_strval", "b_boolval", "b_intval", "b_floatval", "b_ord", "b_chr",
+                  "b_trim", "b_keys", "b_values", "b_upper", "b_lower", "b_chars", "b_reverse", "b_sort", "b_to_hex", "b_is_digit",
+                  "b_is_alpha", "b_is_alnum", "b_is_space", "b_is_hex_digit", "m_Math_sqrt", "m_Math_floor", "m_Math_ceil", "m_Math_round",
+                  "m_Math_abs", "m_System_env", "m_System_dirname", "m_File_read", "m_File_exists", "m_File_delete", "m_Directory_create",
+                  "m_Directory_exists", "m_Directory_list"] as $f) {
+            $d[] = "declare { i64, i64 } @" . $f . "(" . $v . ")";
+        }
+        foreach (["zv_add", "zv_sub", "zv_mul", "zv_div", "zv_mod", "zv_pow", "zv_concat", "zv_bitand", "zv_bitor", "zv_bitxor", "zv_shl", "zv_shr", "zv_index", "zv_index_opt", "b_contains", "b_starts_with",
+                  "b_ends_with", "b_index_of", "b_repeat", "b_join", "b_in_array", "b_range", "b_has_key", "b_pad_left", "b_pad_right",
+                  "b_array_slice", "b_push", "m_Math_min", "m_Math_max", "m_Math_pow", "m_File_write", "m_File_append", "m_Process_run",
+                  "m_Process_exec", "b_split", "m_System_resolveImport", "b_zs_obj_get", "b_zs_obj_take", "b_zs_no_method"] as $f) {
+            $d[] = "declare { i64, i64 } @" . $f . "(" . $v . ", " . $v . ")";
+        }
+        foreach (["b_zs_obj_set", "b_zs_obj_put", "b_replace", "b_pad_left3", "b_pad_right3", "b_array_slice3"] as $f) {
+            $d[] = "declare { i64, i64 } @" . $f . "(" . $v . ", " . $v . ", " . $v . ")";
+        }
+        foreach (["m_System_args", "m_System_os", "m_System_architecture", "m_System_time", "m_System_cpuCount", "m_System_version", "b_read_line"] as $f) {
+            $d[] = "declare { i64, i64 } @" . $f . "()";
+        }
+        return $d;
+    }
+}
+
+func hex2($n) {
+    $h = to_hex($n);
+    return strlen($h) < 2 ? "0" . $h : upper($h);
+}
+
+##
+ * IR -> tekst LLVM IR.
+##
+func generate($ir, $triple = "x86_64-pc-linux-gnu") {
+    $em = new LlEmitter($ir);
+    return $em->generate($triple);
+}
