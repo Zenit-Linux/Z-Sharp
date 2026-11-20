@@ -1,0 +1,494 @@
+namespace classes;
+
+import Workspace.parser;
+
+func pseudo_exceptions() {
+    return parser.parse("class Exception { public $message = \"\"; public $line = 0; func __construct($message = \"\") { $this->message = $message; } func getMessage() { return $this->message; } } class Error extends Exception { }");
+}
+
+##
+ * Klasy w backendach natywnych: sprowadzenie do zwykłych funkcji (lowering AST → AST), przed ir.lower.
+ * Obiekt = uchwyt (ZS_OBJ) z tablicą pól w runtime; metody = funkcje `Klasa__metoda($this, ...)`;
+ * `new K(...)` = `K__new(...)`; wywołanie `$o->m(...)` = `zs_invoke($o, "m", [...])` (dyspozytor generowany z tablicy klas);
+ * `parent.m()` i `K.statyczna()` rozwiązywane statycznie; stałe klas wstawiane; `instanceof` = `zs_isa`.
+ * Obsługiwane: pola (z domyślnymi), metody, konstruktor, extends, interfejsy (tylko dla instanceof), metody statyczne, stałe.
+ * Poza zakresem (jawny błąd E0108): statyczne pola, klasy wyjątków dziedziczące po Exception, domknięcia.
+##
+
+class Cls {
+    public $name; public $parent; public $ifaces; public $line;
+    public $props = [];     # [nazwa => domyślne wyrażenie lub null]
+    public $consts = [];    # [nazwa => wyrażenie]
+    public $methods = [];   # [nazwa => ["decl" => Func, "static" => bool, "abstract" => bool]]
+}
+
+class Desugar {
+    public $classes = [];
+    public $errors = [];
+    public $tmp = 0;
+    public $cur = null;       # bieżąca klasa (Cls) przy przepisywaniu metody
+    public $curStatic = false;
+    public $dispatch = [];    # klasa => [metoda => właściciel]
+    public $extra = [];       # wygenerowane FuncStmt
+    public $excMode = false;  # program ma klasy wyjątków: catch -> łańcuch zs_isa
+
+    func err($line, $msg) { $this->errors[] = [$line, "E0108", $msg]; }
+
+    func node($k, $line, $a = null, $b = null, $c = null, $d = null) { return [":" . $k, $line, $a, $b, $c, $d]; }
+    func nm($line, $n) { return [":Name", $line, $n]; }
+    func mkstr($line, $s) { return [":Str", $line, $s]; }
+    func mkvar($line, $n) { return [":Var", $line, $n]; }
+    func call($line, $fn, $args) {
+        $as = [];
+        foreach ($args as $a) { $as[] = [":Arg", 0, null, $a, false]; }
+        return [":Call", $line, $this->nm($line, $fn), $as];
+    }
+    func fresh($p) { $this->tmp++; return "__" . $p . $this->tmp; }
+
+    # ── tabele klas ──
+    func collect($ast) {
+        foreach ($ast as $s) {
+            if ($s[0] !== ":ClassStmt") { continue; }
+            $c = $s[2];
+            $k = new Cls();
+            $k->name = $c[2]; $k->parent = $c[3]; $k->ifaces = $c[4]; $k->line = $s[1];
+            foreach ($c[7] as $p) { $k->props[$p[2]] = ["default" => $p[3], "static" => $p[4]]; }
+            foreach ($c[8] as $cn) { $k->consts[$cn[2]] = $cn[3]; }
+            foreach ($c[9] as $m) { $k->methods[$m[2][2]] = ["decl" => $m[2], "static" => $m[3], "abstract" => $m[4]]; }
+            if (has_key($this->classes, $k->name)) { $this->err($s[1], "klasa " . $k->name . " zdefiniowana wielokrotnie"); }
+            $this->classes[$k->name] = $k;
+        }
+    }
+
+    func chain($name) {
+        $out = [];
+        $n = $name;
+        while ($n !== null && has_key($this->classes, $n) && count($out) < 64) { $out[] = $n; $n = $this->classes[$n]->parent; }
+        return $out;
+    }
+
+    # właściciel metody (pierwsza klasa w łańcuchu, która ją definiuje z ciałem) albo null
+    func owner($cls, $m) {
+        foreach ($this->chain($cls) as $n) {
+            if (has_key($this->classes[$n]->methods, $m) && !$this->classes[$n]->methods[$m]["abstract"]) { return $n; }
+        }
+        return null;
+    }
+
+    func allProps($cls) {
+        $names = array_reverse_names($this->chain($cls));
+        $out = [];
+        foreach ($names as $n) {
+            foreach ($this->classes[$n]->props as $p => $d) {
+                if ($d["static"]) { continue; }
+                if (!has_key($out, $p)) { $out[$p] = ["default" => $d["default"], "cls" => $n]; }
+                else { $out[$p] = ["default" => $d["default"] ?? $out[$p]["default"], "cls" => $n]; }
+            }
+        }
+        return $out;
+    }
+
+    func isaNames($cls) {
+        $out = [];
+        $stack = [$cls];
+        while (count($stack) > 0) {
+            $n = $stack[count($stack) - 1];
+            $stack = array_slice($stack, 0, count($stack) - 1);
+            if (in_array($n, $out)) { continue; }
+            $out[] = $n;
+            if ($n === "Exception") { $out[] = "Throwable"; }
+            if (has_key($this->classes, $n)) {
+                $c = $this->classes[$n];
+                if ($c->parent !== null) { $stack[] = $c->parent; }
+                foreach ($c->ifaces as $i) { $stack[] = $i; }
+            }
+        }
+        return $out;
+    }
+
+    # ── przepisywanie wyrażeń i instrukcji (rekurencyjnie) ──
+    func rwList($xs) {
+        $o = [];
+        foreach ($xs as $x) {
+            if (parser.isNode($x) && $x[0] === ":Expr") {
+                $r = $this->stmtExpr($x);
+                if ($r !== null) { foreach ($r as $y) { $o[] = $y; } continue; }
+            }
+            $o[] = $this->rw($x);
+        }
+        return $o;
+    }
+
+    func rw($x) {
+        if (!is_array($x)) { return $x; }
+        if (!parser.isNode($x)) {
+            $o = [];
+            foreach ($x as $k => $v) {
+                if (is_array($v) && count($v) > 0 && parser.isNode($v[0] ?? null)) { $o[$k] = $this->rwList($v); }
+                else { $o[$k] = $this->rw($v); }
+            }
+            return $o;
+        }
+        $k = $x[0];
+        $line = $x[1];
+        if ($k === ":Expr") {
+            $r = $this->stmtExpr($x);
+            if ($r !== null) { return count($r) === 1 ? $r[0] : [":Block", $line, $r]; }
+        }
+        if ($k === ":Try" && $this->excMode && count($x[3]) > 0) { return $this->rwTry($x); }
+        if ($k === ":Closure") { $this->err($line, "domknięcia niedostępne w backendzie natywnym 0.0.1"); return $x; }
+        if ($k === ":New") { return $this->rwNew($x); }
+        if ($k === ":InstanceOf") { return $this->call($line, "zs_isa", [$this->rw($x[2]), $this->mkstr($line, $x[3])]); }
+        if ($k === ":Prop") { return $this->call($line, "zs_obj_get", [$this->rw($x[2]), $this->mkstr($line, $x[3])]); }
+        if ($k === ":Dot") {
+            if ($x[2][0] === ":Name") {
+                $cn = $this->clsName($x[2][2]);
+                if ($cn !== null) {
+                    $v = $this->constOf($cn, $x[3]);
+                    if ($v !== null) { return $this->rw($v); }
+                    $this->err($line, "stała lub statyczne pole " . $cn . "." . $x[3] . " niedostępne w backendzie natywnym 0.0.1");
+                }
+            }
+            return [":Dot", $line, $this->rw($x[2]), $x[3]];
+        }
+        if ($k === ":Assign" && $x[2][0] === ":Prop") {
+            $t = $x[2];
+            return $this->call($line, "zs_obj_set", [$this->rw($t[2]), $this->mkstr($line, $t[3]), $this->rw($x[3])]);
+        }
+        if ($k === ":AssignOp" && $x[3][0] === ":Prop" && $x[2] !== "Coalesce") {
+            $t = $x[3];
+            return $this->propModify($line, $t, $x[2], $this->rw($x[4]));
+        }
+        if ($k === ":IncDec" && $x[2][0] === ":Prop") {
+            return $this->propModify($line, $x[2], $x[3] ? "Add" : "Sub", [":Int", $line, 1]);
+        }
+        if ($k === ":Call") { return $this->rwCall($x); }
+        $o = [];
+        foreach ($x as $i => $v) {
+            if ($i < 2) { $o[$i] = $v; continue; }
+            if (is_array($v) && count($v) > 0 && parser.isNode($v[0] ?? null)) { $o[$i] = $this->rwList($v); }
+            else { $o[$i] = $this->rw($v); }
+        }
+        return $o;
+    }
+
+    func baseOk($b) { return $b[0] === ":Var"; }
+
+    func propModify($line, $t, $op, $rhs) {
+        $base = $t[2];
+        if (!$this->baseOk($base)) { $this->err($line, "modyfikacja właściwości wymaga zmiennej jako obiektu (np. \$this->x += 1)"); return [":Null", $line]; }
+        $get = $this->call($line, "zs_obj_get", [$base, $this->mkstr($line, $t[3])]);
+        return $this->call($line, "zs_obj_set", [$base, $this->mkstr($line, $t[3]), [":Binary", $line, $op, $get, $rhs]]);
+    }
+
+    func clsName($n) {
+        if ($n === "static" || $n === "self") { return $this->cur !== null ? $this->cur->name : null; }
+        return has_key($this->classes, $n) ? $n : null;
+    }
+
+    func constOf($cn, $k) {
+        foreach ($this->chain($cn) as $n) {
+            if (has_key($this->classes[$n]->consts, $k)) { return $this->classes[$n]->consts[$k]; }
+        }
+        return null;
+    }
+
+    func rwNew($x) {
+        $line = $x[1];
+        $args = [];
+        foreach ($x[3] as $a) { $a[3] = $this->rw($a[3]); $args[] = $a; }
+        if (in_array($x[2], ["Exception", "Error"])) { return [":New", $line, $x[2], $args]; }
+        if (!has_key($this->classes, $x[2])) {
+            return $this->call($line, "zs_no_class", [$this->mkstr($line, $x[2])]);
+        }
+        return [":Call", $line, $this->nm($line, $x[2] . "__new"), $args];
+    }
+
+    func rwCall($x) {
+        $line = $x[1];
+        $callee = $x[2];
+        $args = [];
+        foreach ($x[3] as $a) { $a[3] = $this->rw($a[3]); $args[] = $a; }
+        if ($callee[0] === ":Prop") {
+            $m = $callee[3];
+            if ($m === "getMessage" && count($args) === 0 && !$this->anyMethod("getMessage")) {
+                return [":Call", $line, [":Prop", $callee[1], $this->rw($callee[2]), $m], $args];
+            }
+            $arr = [":Array", $line, []];
+            $items = [];
+            foreach ($args as $a) { $items[] = [":Item", 0, null, $a[3], false]; }
+            $arr[2] = $items;
+            return $this->call($line, "zs_invoke", [$this->rw($callee[2]), $this->mkstr($line, $m), $arr]);
+        }
+        if ($callee[0] === ":Dot" && $callee[2][0] === ":Name") {
+            $n = $callee[2][2];
+            $m = $callee[3];
+            if ($n === "parent") {
+                if ($this->cur === null || $this->cur->parent === null) { $this->err($line, "parent poza klasą z rodzicem"); return $x; }
+                $o = $this->owner($this->cur->parent, $m);
+                if ($o === null) { $this->err($line, "klasa " . $this->cur->parent . " nie ma metody " . $m); return $x; }
+                $as = $args;
+                if (!$this->classes[$o]->methods[$m]["static"]) { $as = prepend([":Arg", 0, null, $this->mkvar($line, "this"), false], $as); }
+                return [":Call", $line, $this->nm($line, $o . "__" . $m), $as];
+            }
+            $cn = $this->clsName($n);
+            if ($cn !== null) {
+                $o = $this->owner($cn, $m);
+                if ($o === null || !$this->classes[$o]->methods[$m]["static"]) { $this->err($line, "brak metody statycznej " . $cn . "." . $m); return $x; }
+                return [":Call", $line, $this->nm($line, $o . "__" . $m), $args];
+            }
+        }
+        return [":Call", $line, $this->rw($callee), $args];
+    }
+
+    func rwTry($x) {
+        $line = $x[1];
+        $ex = $this->fresh("ex");
+        $chain = [[":Throw", $line, $this->mkvar($line, $ex)]];
+        for ($i = count($x[3]) - 1; $i >= 0; $i--) {
+            $c = $x[3][$i];
+            $cond = null;
+            foreach ($c[2] as $t) {
+                $one = $t === "Throwable" ? [":Bool", $line, true] : $this->call($line, "zs_isa", [$this->mkvar($line, $ex), $this->mkstr($line, $t)]);
+                $cond = $cond === null ? $one : [":Binary", $line, "Or", $cond, $one];
+            }
+            $then = [];
+            if ($c[3] !== null) { $then[] = [":Expr", $line, [":Assign", $line, $this->mkvar($line, $c[3]), $this->mkvar($line, $ex)]]; }
+            foreach ($this->rwList($c[4]) as $s) { $then[] = $s; }
+            $chain = [[":If", $line, $cond, $then, $chain]];
+        }
+        $fin = $x[4] === null ? null : $this->rwList($x[4]);
+        return [":Try", $line, $this->rwList($x[2]), [[":Catch", 0, ["Throwable"], $ex, $chain]], $fin];
+    }
+
+    func anyMethod($m) {
+        foreach ($this->classes as $c) { if (has_key($c->methods, $m)) { return true; } }
+        return false;
+    }
+
+    # instrukcja wyrażeniowa z celem `obiekt->pole[...]`: rozwija się do kilku instrukcji (take / zmiana / put)
+    func stmtExpr($s) {
+        $e = $s[2];
+        $line = $s[1];
+        $target = null; $kind = null;
+        if ($e[0] === ":Assign") { $target = $e[2]; $kind = "assign"; }
+        else if ($e[0] === ":AssignOp") { $target = $e[3]; $kind = "op"; }
+        else if ($e[0] === ":IncDec") { $target = $e[2]; $kind = "incdec"; }
+        if ($target === null || $target[0] !== ":Index") { return null; }
+        $keys = [];
+        $t = $target;
+        while ($t[0] === ":Index") { $keys[] = $t[3]; $t = $t[2]; }
+        if ($t[0] !== ":Prop") { return null; }
+        # $t = Prop(base, name); klucze są w kolejności od najgłębszego
+        $keys = array_reverse_names($keys);
+        $out = [];
+        $base = $this->rw($t[2]);
+        if ($base[0] !== ":Var") {
+            $bv = $this->fresh("o");
+            $out[] = [":Expr", $line, [":Assign", $line, $this->mkvar($line, $bv), $base]];
+            $base = $this->mkvar($line, $bv);
+        }
+        $ks = [];
+        foreach ($keys as $key) {
+            if ($key === null) { $ks[] = null; continue; }
+            $kv = $this->fresh("k");
+            $out[] = [":Expr", $line, [":Assign", $line, $this->mkvar($line, $kv), $this->rw($key)]];
+            $ks[] = $this->mkvar($line, $kv);
+        }
+        $rv = null;
+        if ($kind === "assign" || $kind === "op") {
+            $rv = $this->fresh("r");
+            $rhs = $kind === "assign" ? $e[3] : $e[4];
+            $out[] = [":Expr", $line, [":Assign", $line, $this->mkvar($line, $rv), $this->rw($rhs)]];
+        }
+        $w = $this->fresh("w");
+        $out[] = [":Expr", $line, [":Assign", $line, $this->mkvar($line, $w), $this->call($line, "zs_obj_take", [$base, $this->mkstr($line, $t[3])])]];
+        $tgt = $this->mkvar($line, $w);
+        foreach ($ks as $kk) { $tgt = [":Index", $line, $tgt, $kk]; }
+        if ($kind === "assign") { $ne = [":Assign", $line, $tgt, $this->mkvar($line, $rv)]; }
+        else if ($kind === "op") { $ne = [":AssignOp", $line, $e[2], $tgt, $this->mkvar($line, $rv)]; }
+        else { $ne = [":IncDec", $line, $tgt, $e[3], $e[4]]; }
+        $out[] = [":Expr", $line, $ne];
+        $out[] = [":Expr", $line, $this->call($line, "zs_obj_put", [$base, $this->mkstr($line, $t[3]), $this->mkvar($line, $w)])];
+        return $out;
+    }
+
+    # ── generowanie funkcji ──
+    func funcStmt($line, $name, $params, $body) {
+        return [":FuncStmt", $line, [":Func", $line, $name, $params, [], $body, false]];
+    }
+
+    func param($name, $default = null) { return [":Param", 0, $name, [], $default, false]; }
+
+    func genClass($k) {
+        $this->cur = $k;
+        # metody
+        foreach ($k->methods as $m => $d) {
+            if ($d["abstract"]) { continue; }
+            $f = $d["decl"];
+            $params = $f[3];
+            if (!$d["static"]) { $params = prepend($this->param("this"), $params); }
+            $this->curStatic = $d["static"];
+            $body = $this->rwList($f[5]);
+            $this->extra[] = [":FuncStmt", $f[1], [":Func", $f[1], $k->name . "__" . $m, $params, $f[4], $body, false]];
+        }
+        # konstruktor obiektu
+        $line = $k->line;
+        $ctorOwner = $this->owner($k->name, "__construct");
+        $params = [];
+        if ($ctorOwner !== null) { $params = $this->classes[$ctorOwner]->methods["__construct"]["decl"][3]; }
+        $body = [];
+        $body[] = [":Expr", $line, [":Assign", $line, $this->mkvar($line, "__o"), $this->call($line, "zs_obj_new", [$this->mkstr($line, $k->name)])]];
+        foreach ($this->allProps($k->name) as $p => $d) {
+            $this->cur = $this->classes[$d["cls"]];
+            $dv = $d["default"] === null ? [":Null", $line] : $this->rw($d["default"]);
+            $body[] = [":Expr", $line, $this->call($line, "zs_obj_set", [$this->mkvar($line, "__o"), $this->mkstr($line, $p), $dv])];
+        }
+        $this->cur = $k;
+        if ($ctorOwner !== null) {
+            $args = [$this->mkvar($line, "__o")];
+            foreach ($params as $p) { $args[] = $this->mkvar($line, $p[2]); }
+            $body[] = [":Expr", $line, $this->call($line, $ctorOwner . "____construct", $args)];
+        }
+        $body[] = [":Return", $line, $this->mkvar($line, "__o")];
+        $this->extra[] = $this->funcStmt($line, $k->name . "__new", $params, $body);
+    }
+
+    # opakowanie metody: ($this, $args) -> wywołanie z odpowiednią liczbą argumentów (nadmiarowe ignorowane jak w stage0)
+    func wrapper($owner, $m) {
+        $f = $this->classes[$owner]->methods[$m]["decl"];
+        $line = $f[1];
+        $ps = $f[3];
+        $np = count($ps);
+        $min = 0;
+        foreach ($ps as $p) { if ($p[4] === null) { $min++; } }
+        $body = [];
+        $cnt = $this->call($line, "count", [$this->mkvar($line, "args")]);
+        $isVar = $np > 0 && $ps[$np - 1][5];
+        if ($isVar) { $np = $np - 1; }
+        for ($n = 0; $n <= $np; $n++) {
+            $cargs = [$this->mkvar($line, "this")];
+            for ($i = 0; $i < $n; $i++) { $cargs[] = [":Index", $line, $this->mkvar($line, "args"), [":Int", $line, $i]]; }
+            if ($n < $min) {
+                $msg = $m . ": brak argumentu $" . $ps[$n][2];
+                $act = [":Throw", $line, [":New", $line, "Error", [[":Arg", 0, null, $this->mkstr($line, $msg), false]]]];
+            } else {
+                $act = [":Return", $line, $this->call($line, $owner . "__" . $m, $cargs)];
+            }
+            if ($isVar && $n === $np) {
+                $sl = $this->call($line, "array_slice", [$this->mkvar($line, "args"), [":Int", $line, $np]]);
+                $call = $this->call($line, $owner . "__" . $m, $cargs);
+                $call[3][] = [":Arg", 0, null, $sl, true];
+                $act = [":Return", $line, $call];
+            }
+            $cmp = $n === $np ? [":Binary", $line, "Ge", $cnt, [":Int", $line, $n]] : [":Binary", $line, "Identical", $cnt, [":Int", $line, $n]];
+            $body[] = [":If", $line, $cmp, [$act], null];
+        }
+        $body[] = [":Return", $line, [":Null", $line]];
+        return $this->funcStmt($line, $owner . "__" . $m . "__w", [$this->param("this"), $this->param("args")], $body);
+    }
+
+    func genDispatch() {
+        $line = 0;
+        $body = [];
+        $body[] = [":Expr", $line, [":Assign", $line, $this->mkvar($line, "c"), $this->call($line, "zs_obj_class", [$this->mkvar($line, "o")])]];
+        $body[] = [":If", $line, [":Binary", $line, "Identical", $this->mkvar($line, "c"), [":Null", $line]], [
+            [":If", $line, [":Binary", $line, "Identical", $this->mkvar($line, "name"), $this->mkstr($line, "getMessage")],
+                [[":Return", $line, [":Call", $line, [":Prop", $line, $this->mkvar($line, "o"), "getMessage"], []]]], null]], null];
+        $wrapped = [];
+        foreach ($this->classes as $cn => $k) {
+            $stmts = [];
+            $seen = [];
+            foreach ($this->chain($cn) as $n) {
+                foreach ($this->classes[$n]->methods as $m => $d) {
+                    if ($d["abstract"] || $d["static"] || $m === "__construct" || has_key($seen, $m)) { continue; }
+                    $seen[$m] = true;
+                    $wn = $n . "__" . $m . "__w";
+                    if (!has_key($wrapped, $wn)) { $wrapped[$wn] = true; $this->extra[] = $this->wrapper($n, $m); }
+                    $stmts[] = [":If", $line, [":Binary", $line, "Identical", $this->mkvar($line, "name"), $this->mkstr($line, $m)],
+                        [[":Return", $line, $this->call($line, $wn, [$this->mkvar($line, "o"), $this->mkvar($line, "args")])]], null];
+                }
+            }
+            if (count($stmts) > 0) {
+                $body[] = [":If", $line, [":Binary", $line, "Identical", $this->mkvar($line, "c"), $this->mkstr($line, $cn)], $stmts, null];
+            }
+        }
+        $body[] = [":Return", $line, $this->call($line, "zs_no_method", [$this->mkvar($line, "o"), $this->mkvar($line, "name")])];
+        $this->extra[] = $this->funcStmt($line, "zs_invoke", [$this->param("o"), $this->param("name"), $this->param("args")], $body);
+        # instanceof
+        $b = [];
+        $b[] = [":Expr", $line, [":Assign", $line, $this->mkvar($line, "c"), $this->call($line, "zs_obj_class", [$this->mkvar($line, "o")])]];
+        $b[] = [":If", $line, [":Binary", $line, "Identical", $this->mkvar($line, "c"), [":Null", $line]], [
+            [":Expr", $line, [":Assign", $line, $this->mkvar($line, "t"), $this->call($line, "typeof", [$this->mkvar($line, "o")])]],
+            [":Return", $line, [":Binary", $line, "Or", [":Binary", $line, "Identical", $this->mkvar($line, "t"), $this->mkvar($line, "k")],
+                [":Binary", $line, "Or",
+                    [":Binary", $line, "And", [":Binary", $line, "Identical", $this->mkvar($line, "k"), $this->mkstr($line, "Exception")], [":Binary", $line, "Identical", $this->mkvar($line, "t"), $this->mkstr($line, "Error")]],
+                    [":Binary", $line, "And", [":Binary", $line, "Identical", $this->mkvar($line, "k"), $this->mkstr($line, "Throwable")],
+                        [":Binary", $line, "Or", [":Binary", $line, "Identical", $this->mkvar($line, "t"), $this->mkstr($line, "Exception")], [":Binary", $line, "Identical", $this->mkvar($line, "t"), $this->mkstr($line, "Error")]]]]]]], null];
+        foreach ($this->classes as $cn => $k) {
+            $or = null;
+            foreach ($this->isaNames($cn) as $n) {
+                $t = [":Binary", $line, "Identical", $this->mkvar($line, "k"), $this->mkstr($line, $n)];
+                $or = $or === null ? $t : [":Binary", $line, "Or", $or, $t];
+            }
+            $b[] = [":If", $line, [":Binary", $line, "Identical", $this->mkvar($line, "c"), $this->mkstr($line, $cn)], [[":Return", $line, $or]], null];
+        }
+        $b[] = [":Return", $line, [":Bool", $line, false]];
+        $this->extra[] = $this->funcStmt($line, "zs_isa", [$this->param("o"), $this->param("k")], $b);
+    }
+}
+
+func array_reverse_names($xs) {
+    $o = [];
+    for ($i = count($xs) - 1; $i >= 0; $i--) { $o[] = $xs[$i]; }
+    return $o;
+}
+func prepend($v, $xs) {
+    $o = [$v];
+    foreach ($xs as $x) { $o[] = $x; }
+    return $o;
+}
+
+##
+ * Zwraca ["ast" => lista instrukcji bez ClassStmt, "errors" => [[linia, kod, tekst]...]].
+##
+func desugar($ast) {
+    $has = false;
+    foreach ($ast as $s) { if ($s[0] === ":ClassStmt") { $has = true; } }
+    if (!$has) { return ["ast" => $ast, "errors" => []]; }
+    $d = new Desugar();
+    $d->collect($ast);
+    foreach ($d->classes as $k) {
+        $r = $k->name;
+        $guard = 0;
+        $n = $k->parent;
+        while ($n !== null && has_key($d->classes, $n) && $guard < 64) { $n = $d->classes[$n]->parent; $guard++; }
+        if ($n === "Exception" || $n === "Error") { $d->excMode = true; }
+    }
+    if ($d->excMode && !has_key($d->classes, "Exception") && !has_key($d->classes, "Error")) {
+        $pseudo = pseudo_exceptions();
+        $d->collect($pseudo);
+        $ast = $ast;
+        foreach ($pseudo as $s) { $ast[] = $s; }
+    }
+    $rest = [];
+    foreach ($ast as $s) { if ($s[0] !== ":ClassStmt") { $rest[] = $s; } }
+    foreach ($d->classes as $k) { $d->genClass($k); }
+    $d->cur = null;
+    $d->genDispatch();
+    $out = [];
+    foreach ($d->extra as $s) { $out[] = $s; }
+    foreach ($rest as $s) {
+        if ($s[0] === ":FuncStmt") {
+            $f = $s[2];
+            $f[5] = $d->rwList($f[5]);
+            $s[2] = $f;
+            $out[] = $s;
+        } else {
+            $r = $s[0] === ":Expr" ? $d->stmtExpr($s) : null;
+            if ($r !== null) { foreach ($r as $y) { $out[] = $y; } }
+            else { $out[] = $d->rw($s); }
+        }
+    }
+    return ["ast" => $out, "errors" => $d->errors];
+}
