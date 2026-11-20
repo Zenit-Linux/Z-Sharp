@@ -78,6 +78,8 @@ class Emitter {
         if ($op === "Mod") { return $this->bin2("zv_mod", $a, $b); }
         if ($op === "Pow") { return $this->bin2("zv_pow", $a, $b); }
         if ($op === "Concat") { return $this->bin2("zv_concat", $a, $b); }
+        $bits = ["BitAnd" => "zv_bitand", "BitOr" => "zv_bitor", "BitXor" => "zv_bitxor", "Shl" => "zv_shl", "Shr" => "zv_shr"];
+        if (has_key($bits, $op)) { return $this->bin2($bits[$op], $a, $b); }
         $l = $this->t("l");
         $r = $this->t("r");
         $pre = "({ V " . $l . " = " . $a . "; V " . $r . " = " . $b . "; ";
@@ -110,7 +112,7 @@ class Emitter {
         $e = $this->t("e");
         $key = $base[3] === null ? "zv_int(zs_array_len(" . $p . "))" : $this->expr($base[3]);
         return "({ V " . $p . " = " . $this->lv($base[2]) . "; V " . $k . " = " . $key . "; V " . $e . " = zv_index_opt(" . $p . ", " . $k . "); "
-            . "if (" . $e . ".tag == ZS_NULL) { " . $e . " = zv_arr_new(4); zv_set(" . $p . ", " . $k . ", " . $e . "); } zv_wr(" . $e . "); })";
+            . "if (" . $e . ".tag == ZS_NULL) { " . $e . " = zv_arr_new(4); } " . $e . " = zv_wr(" . $e . "); zv_set(" . $p . ", " . $k . ", " . $e . "); " . $e . "; })";
     }
 
     func incdec($e) {
@@ -196,8 +198,9 @@ class Emitter {
         $m = $callee[2][2];
         $f = $callee[3];
         $a = $this->args($list, false);
-        if ($m === "System") { return $this->callWith("s_exit", count($a) > 0 ? $a : ["zv_int(0)"]); }
-        return $this->callWith("m_" . $f, $a);
+        if ($m === "System" && $f === "exit") { return $this->callWith("s_exit", count($a) > 0 ? $a : ["zv_int(0)"]); }
+        if ($m === "Process" && count($a) === 1) { $a[] = "zv_null()"; }
+        return $this->callWith("m_" . $m . "_" . $f, $a);
     }
 
     func builtin($name, $list) {
@@ -214,11 +217,22 @@ class Emitter {
             foreach ($a as $x) { $s .= "zs_necho_v(" . $x . "); "; }
             return $s . "zv_null(); })";
         }
+        if ($name === "push") {
+            $r = $a[0];
+            for ($i = 1; $i < count($a); $i++) { $r = $this->callWith("b_push", [$r, $a[$i]]); }
+            return $r;
+        }
+        if ($name === "dump") {
+            $s = "({ ";
+            foreach ($a as $x) { $s .= "b_dump(" . $x . "); "; }
+            return $s . "zv_null(); })";
+        }
         if ($name === "exit") { return $this->callWith("s_exit", count($a) > 0 ? $a : ["zv_int(0)"]); }
         if ($name === "substr") {
             if (count($a) === 2) { return $this->callWith("b_substr_2", $a); }
             return $this->callWith("b_substr_3", $a);
         }
+        if (count($a) === 3 && in_array($name, ["pad_left", "pad_right", "array_slice"])) { return $this->callWith("b_" . $name . "3", $a); }
         return $this->callWith("b_" . $name, $a);
     }
 
@@ -254,6 +268,7 @@ class Emitter {
             $x = $this->expr($e[3]);
             if ($op === "Not") { return "zv_bool(!zv_truthy(" . $x . "))"; }
             if ($op === "Neg") { return "zv_neg(" . $x . ")"; }
+            if ($op === "BitNot") { return "zv_bitnot(" . $x . ")"; }
             return $x;   # Plus
         }
         if ($k === ":Binary") {
@@ -318,7 +333,7 @@ class Emitter {
         foreach ($types as $t) {
             if ($t === "Throwable") { $c[] = "1"; }
             else if ($t === "Exception") { $c[] = "1"; }   # Error extends Exception
-            else { $c[] = $x . ".tag == 7"; }
+            else { $c[] = "zv_exc_is(" . $x . ", 1)"; }
         }
         return join($c, " || ");
     }
@@ -514,7 +529,7 @@ class Emitter {
             if ($x[0] === ":New") {
                 $msg = count($x[3]) > 0 ? $this->expr($x[3][0][3]) : $this->strRef("");
                 $out[] = $p . "L(" . $line . "); zs_raise(zv_exc_new(" . ($x[2] === "Error" ? 1 : 0) . ", " . $msg . "));";
-            } else { $out[] = $p . "L(" . $line . "); b_throw_v(" . $this->expr($x) . ");"; }
+            } else { $out[] = $p . "{ V thr = " . $this->expr($x) . "; L(" . $line . "); b_throw_v(thr); }"; }
         }
         else { throw new Exception("emit_c: instrukcja " . $k . " (linia " . $line . ")"); }
         return $out;
@@ -583,8 +598,8 @@ class Emitter {
         foreach ($body as $l) { $c[] = $l; }
         foreach ($top as $l) { $c[] = $l; }
         $c[] = "";
-        $c[] = "int main(void) {";
-        $c[] = "    zs_init(); zs_strings_init();";
+        $c[] = "int main(int argc, char **argv) {";
+        $c[] = "    zs_init(argc, argv); zs_strings_init();";
         $c[] = "    int rc = zs_top();";
         if (has_key($ir["funcs"], "main") && !$ir["calls_main"]) {
             $c[] = "    { V r = f_main(); if (r.tag == ZS_INT) rc = (int)zv_i(r); }";
