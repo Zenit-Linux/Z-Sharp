@@ -1,5 +1,27 @@
 # Zmiany (wersja pozostaje 0.0.1)
 
+## Sesja „klasy natywnie i stage3"
+- `lib/classes.zsharp`: lowering klas do funkcji (obiekty jako uchwyty `ZS_OBJ` z tablicą pól; `new` → `Klasa__new`, metody → `Klasa__m($this,…)`, dyspozytor `zs_invoke`, `zs_isa`, stałe wstawiane, `parent.`/`Klasa.statyczna()` statycznie); klasy wyjątków (`extends Exception/Error`, catch → łańcuch `zs_isa`); zapis `$o->pole[...] = v` bez kopiowania tablicy (`zs_obj_take/put`).
+- Wariadyczne `...$x` (pakowanie argumentów), `System.version`, `System.resolveImport` w runtime C.
+- Runtime C: obiekty, rzucanie obiektów-wyjątków, komunikaty zgodne ze stage0; runtime JS w zst: obiekty.
+- `throw` ustawia numer linii po ewaluacji wyrażenia (zgodnie z interpreterem).
+- `scripts/stage3.sh` (w `bootstrap.sh`): natywna samokompilacja zsc, C identyczny dla interpretera/zsc2/zsc3/zsc4.
+- `zsc/src/main.zsharp`: brakujący `import Workspace.emit_c`.
+
+## Sesja „moduły i bity"
+- `lib/link.zsharp`: natywny linker modułów Z# (funkcje + import + namespace; cykle i kod top-level w module → błąd `E0106`); używany przez `zsc` i `zst`.
+- Operatory bitowe (`& | ^ << >> ~`) w runtime C (`zv_bit*`, `zv_shl/shr`, maskowanie przesunięć jak stage0), backendach C/LLVM i w `zst` js.
+- Testy: `imports`, `bitops`, `bitops64` (natywne), `imports`/`bitops`/`mod_*` (zst).
+
+## Sesja „niezależność"
+- **Natywny runtime w C**: `runtime/include/zs_native.h` + `runtime/native/zs_rt.c` (wartości, tablice uporządkowane z haszem i COW, napisy UTF-8, wyjątki setjmp, ~60 wbudowanych, moduły Math/System/File/Directory/Process). Archiwum nie zawierało nagłówka, który emituje `emit_c` — odtworzony od zera; backend nie wymaga już `libzs_runtime.a`.
+- **Backend LLVM**: `lib/emit_llvm.zsharp` (`zsc build --backend llvm`, `--emit ll`, `--target <triple>`); `z#`/`zsc`/`zzc` korzystają z tego samego runtime.
+- `emit_c`: moduły `File/Directory/Process/System.*` (`m_<Moduł>_<fn>`), `catch (Error)` łapie tylko `Error`, poprawny zapis zagnieżdżonych tablic (write-back), `main(argc, argv)`, `push`/`dump` wieloargumentowe, `pad_*`/`array_slice` 2–3 arg., `utf8_lossy` w `substr` (jak stage0).
+- **stage0**: `zsc0 bundle <pakiet.zbc> -o <wyjście>` — binarka standalone (runtime + ładunek). Naprawiony alias `zs-runtime` w `stage0/Cargo.toml` (archiwum się nie budowało).
+- `scripts/{bootstrap,fixpoint,core_status,lib}.sh`, `tests/{run_all,lexer_parity,parser_parity}.sh` — brakowały w archiwum.
+- **wrapper/**: źródło binarki `z#` (new/init/build/run/check/test/transpile/clean/doctor/stages), 34 testy.
+- Testy różnicowe natywne: `zsc/tests/native` (C i LLVM vs interpreter).
+
 - Rdzeń w Z#: **`lib/manifest.zsharp`** (parser `Z#.toml`: wartości, tabele, `[[tablice]]`, inline, klucze kropkowane, walidacja, `find_manifest`, raport) z parytetem względem `zsc0 manifest`; `[memory]` → `zamm.config_from`.
 - Backend natywny: **tablice asocjacyjne** (klucze int/string, kolejność wstawiania, `keys/values/has_key`), **wyjątki** (`try/catch/finally`, `throw new Exception/Error`, `getMessage`, `break/continue/return` przez `finally`). Testy różnicowe: 16 programów.
 
