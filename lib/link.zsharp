@@ -1,0 +1,194 @@
+namespace link;
+
+import Workspace.parser;
+import Workspace.classes;
+
+##
+ * Linker modułów dla backendów natywnych: łączy program wejściowy i zaimportowane moduły Z# (same funkcje)
+ * w jedną listę instrukcji. Funkcje modułu dostają nazwę `<ścieżka_z_podkreśleniami>__<nazwa>`;
+ * wywołania `alias.f(...)` i wywołania wewnątrz modułu są przepisywane. Błędy: [linia, kod, tekst] z nazwą pliku.
+ * Ograniczenia: moduły bez kodu na najwyższym poziomie, bez klas (patrz STATUS.md, M2).
+##
+
+func builtin_modules() { return ["System", "Math", "File", "Directory", "Process"]; }
+
+class Linker {
+    public $errors = [];
+    public $loaded = [];     # plik => ["prefix" => ..., "stmts" => [...], "funcs" => [nazwa => true]]
+    public $active = [];     # plik => true (wykrywanie cykli)
+    public $out = [];        # lista instrukcji FuncStmt wszystkich modułów (kolejność zależności)
+
+    func err($file, $line, $code, $msg) { $this->errors[] = [$line, $code, $msg, $file]; }
+
+    func prefixOf($path) { return join($path, "_"); }
+
+    func dirOf($file) {
+        $d = System.dirname($file);
+        return ($d === null || $d === "") ? "." : $d;
+    }
+
+    # przepisuje wyrażenia/instrukcje: $self = prefiks własnego modułu lub null, $funcs = własne funkcje, $aliases = alias => ["prefix", funcs]
+    func rw($x, $self, $funcs, $aliases) {
+        if (!is_array($x)) { return $x; }
+        if (parser.isNode($x) && $x[0] === ":Call") {
+            $callee = $x[2];
+            if ($callee[0] === ":Name" && $self !== null && has_key($funcs, $callee[2])) {
+                $callee[2] = $self . "__" . $callee[2];
+                $x[2] = $callee;
+            } else if ($callee[0] === ":Dot" && $callee[2][0] === ":Name" && has_key($aliases, $callee[2][2])) {
+                $m = $aliases[$callee[2][2]];
+                $x[2] = [":Name", $callee[1], $m["prefix"] . "__" . $callee[3]];
+            }
+            $args = [];
+            foreach ($x[3] as $a) { $args[] = $this->rw($a, $self, $funcs, $aliases); }
+            $x[3] = $args;
+            if ($x[2][0] !== ":Dot") { $x[2] = $this->rw($x[2], $self, $funcs, $aliases); }
+            return $x;
+        }
+        if (parser.isNode($x) && $x[0] === ":Dot" && $x[2][0] === ":Name" && $x[2][2] === "System" && $x[3] === "version") {
+            return [":Call", $x[1], $x, []];
+        }
+        $o = [];
+        foreach ($x as $k => $v) { $o[$k] = $this->rw($v, $self, $funcs, $aliases); }
+        return $o;
+    }
+
+    # ładuje moduł (raz); zwraca jego opis albo null
+    func loadModule($file, $path, $fromFile, $line) {
+        if (has_key($this->loaded, $file)) { return $this->loaded[$file]; }
+        if (($this->active[$file] ?? false)) { $this->err($fromFile, $line, "E0106", "cykliczny import " . join($path, ".")); return null; }
+        $this->active[$file] = true;
+        try { $ast = parser.parse(File.read($file)); }
+        catch (Exception $e) { $this->err($file, 0, "E0106", "błąd składni modułu: " . $e->getMessage()); $this->active[$file] = false; return null; }
+        $prefix = $this->prefixOf($path);
+        $funcs = [];
+        foreach ($ast as $s) { if ($s[0] === ":FuncStmt") { $funcs[$s[2][2]] = true; } }
+        $aliases = $this->collectImports($ast, $file);
+        $stmts = [];
+        foreach ($ast as $s) {
+            $k = $s[0];
+            if ($k === ":FuncStmt") {
+                $f = $s[2];
+                $f[2] = $prefix . "__" . $f[2];
+                $f[5] = $this->rw($f[5], $prefix, $funcs, $aliases);
+                $s[2] = $f;
+                $stmts[] = $s;
+            } else if ($k === ":ClassStmt") {
+                $stmts[] = $this->rw($s, $prefix, $funcs, $aliases);
+            } else if ($k !== ":Import" && $k !== ":Namespace") {
+                $this->err($file, $s[1], "E0106", "moduł natywny może zawierać tylko funkcje, klasy, import i namespace (instrukcja " . substr($k, 1) . ")");
+            }
+        }
+        $this->active[$file] = false;
+        $m = ["prefix" => $prefix, "funcs" => $funcs];
+        $this->loaded[$file] = $m;
+        foreach ($stmts as $s) { $this->out[] = $s; }
+        return $m;
+    }
+
+    # alias => opis modułu dla importów użytkownika w $ast
+    func collectImports($ast, $file) {
+        $aliases = [];
+        foreach ($ast as $s) {
+            if ($s[0] !== ":Import") { continue; }
+            $path = $s[2];
+            if (in_array($path[0], builtin_modules())) { continue; }
+            $f = System.resolveImport($path, $this->dirOf($file));
+            if ($f === null) { $this->err($file, $s[1], "E0106", "nie znaleziono modułu " . join($path, ".")); continue; }
+            $m = $this->loadModule($f, $path, $file, $s[1]);
+            if ($m !== null) { $aliases[$path[count($path) - 1]] = $m; }
+        }
+        return $aliases;
+    }
+}
+
+##
+ * Zwraca ["ast" => połączona lista instrukcji, "errors" => [[linia, kod, tekst, plik]...]].
+##
+func link($ast, $file) {
+    $lk = new Linker();
+    $aliases = $lk->collectImports($ast, $file);
+    $main = [];
+    foreach ($ast as $s) {
+        if ($s[0] === ":Import" && !in_array($s[2][0], builtin_modules())) { continue; }
+        if ($s[0] === ":FuncStmt") {
+            $f = $s[2];
+            $f[5] = $lk->rw($f[5], null, [], $aliases);
+            $s[2] = $f;
+            $main[] = $s;
+        } else {
+            $main[] = $lk->rw($s, null, [], $aliases);
+        }
+    }
+    $all = [];
+    foreach ($lk->out as $s) { $all[] = $s; }
+    foreach ($main as $s) { $all[] = $s; }
+    $ds = classes.desugar($all);
+    foreach ($ds["errors"] as $e) { $lk->errors[] = [$e[0], $e[1], $e[2], $file]; }
+    $vr = variadic_pass($ds["ast"]);
+    foreach ($vr["errors"] as $e) { $lk->errors[] = [$e[0], $e[1], $e[2], $file]; }
+    return ["ast" => $vr["ast"], "errors" => $lk->errors];
+}
+
+##
+ * Parametry variadyczne (`...$rest`) w funkcjach (także metodach po sprowadzeniu klas): nadmiarowe argumenty wywołań
+ * są pakowane do tablicy; `f(...$tab)` w pozycji wariadycznej przekazuje tablicę wprost.
+##
+class VarPass {
+    public $fixed = [];
+    public $errors = [];
+
+    func rw($x) {
+        if (!is_array($x)) { return $x; }
+        if (parser.isNode($x) && $x[0] === ":Call" && $x[2][0] === ":Name" && has_key($this->fixed, $x[2][2])) {
+            $k = $this->fixed[$x[2][2]];
+            $args = [];
+            foreach ($x[3] as $a) { $a[3] = $this->rw($a[3]); $args[] = $a; }
+            $out = [];
+            for ($i = 0; $i < count($args) && $i < $k; $i++) {
+                if ($args[$i][4]) { $this->errors[] = [$x[1], "E0104", "rozwinięcie ... w pozycji stałego parametru niedostępne w backendzie natywnym 0.0.1"]; }
+                $out[] = $args[$i];
+            }
+            $rest = [];
+            for ($i = $k; $i < count($args); $i++) { $rest[] = $args[$i]; }
+            if (count($rest) === 1 && $rest[0][4]) {
+                $a = $rest[0]; $a[4] = false; $out[] = $a;
+            } else {
+                $items = [];
+                foreach ($rest as $a) {
+                    if ($a[4]) { $this->errors[] = [$x[1], "E0104", "rozwinięcie ... wśród innych argumentów wariadycznych niedostępne w backendzie natywnym 0.0.1"]; }
+                    $items[] = [":Item", 0, null, $a[3], false];
+                }
+                $out[] = [":Arg", 0, null, [":Array", $x[1], $items], false];
+            }
+            $x[3] = $out;
+            return $x;
+        }
+        $o = [];
+        foreach ($x as $k => $v) { $o[$k] = $this->rw($v); }
+        return $o;
+    }
+}
+
+func variadic_pass($ast) {
+    $vp = new VarPass();
+    foreach ($ast as $s) {
+        if ($s[0] !== ":FuncStmt") { continue; }
+        $ps = $s[2][3];
+        $n = count($ps);
+        if ($n > 0 && $ps[$n - 1][5]) { $vp->fixed[$s[2][2]] = $n - 1; }
+    }
+    if (count($vp->fixed) === 0) { return ["ast" => $ast, "errors" => []]; }
+    $out = [];
+    foreach ($ast as $s) {
+        $s = $vp->rw($s);
+        if ($s[0] === ":FuncStmt") {
+            $f = $s[2];
+            $ps = $f[3];
+            $n = count($ps);
+            if ($n > 0 && $ps[$n - 1][5]) { $p = $ps[$n - 1]; $p[5] = false; $ps[$n - 1] = $p; $f[3] = $ps; $s[2] = $f; }
+        }
+        $out[] = $s;
+    }
+    return ["ast" => $out, "errors" => $vp->errors];
+}
