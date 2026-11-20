@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Parytet leksera: pozycje tokenów Rust (--tokens) == leksera w Z# (lib/lexer.zsharp) dla wszystkich programów testowych.
+. "$(dirname "$0")/../scripts/lib.sh"; ensure_stage0; n=0
+for f in "$ROOT"/tests/*.zsharp "$ROOT"/examples/*.zsharp "$ROOT"/lib/*.zsharp; do
+  diff <("$ZSC0" --tokens "$f" 2>&1 | awk '{print $1}') <("$ZSC0" run "$ROOT/tests/lexdump.zsharp" "$f" 2>&1) >/dev/null || { echo "RÓŻNICA leksera: $f"; exit 1; }; n=$((n+1))
+done; echo "lexer parity: $n plików OK"
