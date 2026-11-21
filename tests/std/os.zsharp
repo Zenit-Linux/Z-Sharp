@@ -1,0 +1,15 @@
+import Std.Os;
+$d = Os.mkdtemp("t-");
+Os.mkdir($d . "/a/b");
+Os.writeFile($d . "/a/b/f.txt", "x\r\ny\nz\n");
+echo Os.readLines($d . "/a/b/f.txt"), Os.size($d . "/a/b/f.txt"), Os.isDir($d . "/a"), Os.exists($d . "/nope");
+Os.copy($d . "/a", $d . "/c");
+echo count(Os.walk($d));
+Os.symlink("a", $d . "/lnk");
+echo Os.stat($d . "/lnk")["kind"], Os.readlink($d . "/lnk");
+Os.removeAll($d);
+echo Os.exists($d);
+echo Os.platform(), Os.env("NOPE_X", "dflt"), Os.which("sh") !== null;
+Os.setEnv("ZZ_T", 5); echo Os.env("ZZ_T");
+echo Os.shell("echo hi; exit 3");
+echo count(Os.args());
