@@ -973,7 +973,7 @@ parser = "lib/parser.zs"
 lexer  = "lib/lexer.zs"
 
 [dependencies]
-Z-Sharp = { git = "https://github.com/HackerOS-Linux-System/Z-Sharp", path = "Z-Sharp" }
+Z-Sharp = { git = "https://github.com/Zenit-Linux/Z-Sharp", path = "Z-Sharp" }
 
 [extern.sqlite]            # statyczne linkowanie bibliotek Rust/C/C++ (system `extern`)
 kind = "static"            # static | dylib
