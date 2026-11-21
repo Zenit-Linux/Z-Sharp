@@ -1,6 +1,7 @@
 namespace classes;
 
 import Workspace.parser;
+import Workspace.closures;
 
 func pseudo_exceptions() {
     return parser.parse("class Exception { public $message = \"\"; public $line = 0; func __construct($message = \"\") { $this->message = $message; } func getMessage() { return $this->message; } } class Error extends Exception { }");
@@ -12,7 +13,8 @@ func pseudo_exceptions() {
  * `new K(...)` = `K__new(...)`; wywołanie `$o->m(...)` = `zs_invoke($o, "m", [...])` (dyspozytor generowany z tablicy klas);
  * `parent.m()` i `K.statyczna()` rozwiązywane statycznie; stałe klas wstawiane; `instanceof` = `zs_isa`.
  * Obsługiwane: pola (z domyślnymi), metody, konstruktor, extends, interfejsy (tylko dla instanceof), metody statyczne, stałe.
- * Poza zakresem (jawny błąd E0108): statyczne pola, klasy wyjątków dziedziczące po Exception, domknięcia.
+ * Statyczne pola = globalne sloty `Klasa::pole` (zs_sget/zs_sset), inicjowane na początku programu. Domknięcia: lib/closures.zsharp.
+ * Poza zakresem (jawny błąd E0108): klasy wyjątków dziedziczące po Exception.
 ##
 
 class Cls {
@@ -30,6 +32,7 @@ class Desugar {
     public $curStatic = false;
     public $dispatch = [];    # klasa => [metoda => właściciel]
     public $extra = [];       # wygenerowane FuncStmt
+    public $nuse = [];        # metody wołane z argumentami nazwanymi / rozwinięciem (zs_invoke_n)
     public $excMode = false;  # program ma klasy wyjątków: catch -> łańcuch zs_isa
 
     func err($line, $msg) { $this->errors[] = [$line, "E0108", $msg]; }
@@ -136,7 +139,6 @@ class Desugar {
             if ($r !== null) { return count($r) === 1 ? $r[0] : [":Block", $line, $r]; }
         }
         if ($k === ":Try" && $this->excMode && count($x[3]) > 0) { return $this->rwTry($x); }
-        if ($k === ":Closure") { $this->err($line, "domknięcia niedostępne w backendzie natywnym 0.0.1"); return $x; }
         if ($k === ":New") { return $this->rwNew($x); }
         if ($k === ":InstanceOf") { return $this->call($line, "zs_isa", [$this->rw($x[2]), $this->mkstr($line, $x[3])]); }
         if ($k === ":Prop") { return $this->call($line, "zs_obj_get", [$this->rw($x[2]), $this->mkstr($line, $x[3])]); }
@@ -146,10 +148,23 @@ class Desugar {
                 if ($cn !== null) {
                     $v = $this->constOf($cn, $x[3]);
                     if ($v !== null) { return $this->rw($v); }
-                    $this->err($line, "stała lub statyczne pole " . $cn . "." . $x[3] . " niedostępne w backendzie natywnym 0.0.1");
+                    $sn = $this->staticName($cn, $x[3]);
+                    if ($sn !== null) { return $this->call($line, "zs_sget", [$this->mkstr($line, $sn)]); }
+                    $this->err($line, "brak stałej lub statycznego pola " . $cn . "." . $x[3]);
                 }
             }
             return [":Dot", $line, $this->rw($x[2]), $x[3]];
+        }
+        if ($k === ":Assign" && $this->staticTarget($x[2]) !== null) {
+            return $this->call($line, "zs_sset", [$this->mkstr($line, $this->staticTarget($x[2])), $this->rw($x[3])]);
+        }
+        if ($k === ":AssignOp" && $x[2] !== "Coalesce" && $this->staticTarget($x[3]) !== null) {
+            $sn = $this->mkstr($line, $this->staticTarget($x[3]));
+            return $this->call($line, "zs_sset", [$sn, [":Binary", $line, $x[2], $this->call($line, "zs_sget", [$sn]), $this->rw($x[4])]]);
+        }
+        if ($k === ":IncDec" && $this->staticTarget($x[2]) !== null) {
+            $sn = $this->mkstr($line, $this->staticTarget($x[2]));
+            return $this->call($line, "zs_sset", [$sn, [":Binary", $line, $x[3] ? "Add" : "Sub", $this->call($line, "zs_sget", [$sn]), [":Int", $line, 1]]]);
         }
         if ($k === ":Assign" && $x[2][0] === ":Prop") {
             $t = $x[2];
@@ -179,6 +194,22 @@ class Desugar {
         if (!$this->baseOk($base)) { $this->err($line, "modyfikacja właściwości wymaga zmiennej jako obiektu (np. \$this->x += 1)"); return [":Null", $line]; }
         $get = $this->call($line, "zs_obj_get", [$base, $this->mkstr($line, $t[3])]);
         return $this->call($line, "zs_obj_set", [$base, $this->mkstr($line, $t[3]), [":Binary", $line, $op, $get, $rhs]]);
+    }
+
+    # nazwa globalna statycznego pola ("Klasa::pole", klasa deklarująca) albo null
+    func staticName($cn, $p) {
+        foreach ($this->chain($cn) as $n) {
+            $d = $this->classes[$n]->props;
+            if (has_key($d, $p) && $d[$p]["static"]) { return $n . "::" . $p; }
+        }
+        return null;
+    }
+
+    func staticTarget($t) {
+        if (!is_array($t) || $t[0] !== ":Dot" || $t[2][0] !== ":Name") { return null; }
+        $cn = $this->clsName($t[2][2]);
+        if ($cn === null) { return null; }
+        return $this->staticName($cn, $t[3]);
     }
 
     func clsName($n) {
@@ -213,6 +244,25 @@ class Desugar {
             $m = $callee[3];
             if ($m === "getMessage" && count($args) === 0 && !$this->anyMethod("getMessage")) {
                 return [":Call", $line, [":Prop", $callee[1], $this->rw($callee[2]), $m], $args];
+            }
+            $special = false;
+            foreach ($args as $a) { if ($a[4] || $a[2] !== null) { $special = true; } }
+            if ($special) {
+                $this->nuse[$m] = true;
+                $cur = null;
+                $its = [];
+                foreach ($args as $a) {
+                    if ($a[4]) {
+                        $seg = [":Array", $line, $its];
+                        $cur = $cur === null ? $seg : $this->call($line, "zs_spread", [$cur, $seg]);
+                        $cur = $this->call($line, "zs_spread", [$cur, $a[3]]);
+                        $its = [];
+                    } else if ($a[2] !== null) { $its[] = [":Item", 0, $this->mkstr($line, $a[2]), $a[3]]; }
+                    else { $its[] = [":Item", 0, null, $a[3]]; }
+                }
+                if ($cur === null) { $cur = [":Array", $line, $its]; }
+                else if (count($its) > 0) { $cur = $this->call($line, "zs_spread", [$cur, [":Array", $line, $its]]); }
+                return $this->call($line, "zs_invoke_n", [$this->rw($callee[2]), $this->mkstr($line, $m), $cur]);
             }
             $arr = [":Array", $line, []];
             $items = [];
@@ -278,12 +328,13 @@ class Desugar {
         $keys = [];
         $t = $target;
         while ($t[0] === ":Index") { $keys[] = $t[3]; $t = $t[2]; }
-        if ($t[0] !== ":Prop") { return null; }
+        $sname = $this->staticTarget($t);
+        if ($t[0] !== ":Prop" && $sname === null) { return null; }
         # $t = Prop(base, name); klucze są w kolejności od najgłębszego
         $keys = array_reverse_names($keys);
         $out = [];
-        $base = $this->rw($t[2]);
-        if ($base[0] !== ":Var") {
+        $base = $sname !== null ? [":Null", $line] : $this->rw($t[2]);
+        if ($sname === null && $base[0] !== ":Var") {
             $bv = $this->fresh("o");
             $out[] = [":Expr", $line, [":Assign", $line, $this->mkvar($line, $bv), $base]];
             $base = $this->mkvar($line, $bv);
@@ -302,14 +353,15 @@ class Desugar {
             $out[] = [":Expr", $line, [":Assign", $line, $this->mkvar($line, $rv), $this->rw($rhs)]];
         }
         $w = $this->fresh("w");
-        $out[] = [":Expr", $line, [":Assign", $line, $this->mkvar($line, $w), $this->call($line, "zs_obj_take", [$base, $this->mkstr($line, $t[3])])]];
+        $out[] = [":Expr", $line, [":Assign", $line, $this->mkvar($line, $w), $sname !== null ? $this->call($line, "zs_sget", [$this->mkstr($line, $sname)]) : $this->call($line, "zs_obj_take", [$base, $this->mkstr($line, $t[3])])]];
         $tgt = $this->mkvar($line, $w);
         foreach ($ks as $kk) { $tgt = [":Index", $line, $tgt, $kk]; }
         if ($kind === "assign") { $ne = [":Assign", $line, $tgt, $this->mkvar($line, $rv)]; }
         else if ($kind === "op") { $ne = [":AssignOp", $line, $e[2], $tgt, $this->mkvar($line, $rv)]; }
         else { $ne = [":IncDec", $line, $tgt, $e[3], $e[4]]; }
         $out[] = [":Expr", $line, $ne];
-        $out[] = [":Expr", $line, $this->call($line, "zs_obj_put", [$base, $this->mkstr($line, $t[3]), $this->mkvar($line, $w)])];
+        if ($sname !== null) { $out[] = [":Expr", $line, $this->call($line, "zs_sset", [$this->mkstr($line, $sname), $this->mkvar($line, $w)])]; }
+        else { $out[] = [":Expr", $line, $this->call($line, "zs_obj_put", [$base, $this->mkstr($line, $t[3]), $this->mkvar($line, $w)])]; }
         return $out;
     }
 
@@ -388,7 +440,42 @@ class Desugar {
         return $this->funcStmt($line, $owner . "__" . $m . "__w", [$this->param("this"), $this->param("args")], $body);
     }
 
+    func wrapperN($owner, $m) {
+        $f = $this->classes[$owner]->methods[$m]["decl"];
+        $line = $f[1];
+        $args = prepend([":Arg", 0, null, $this->mkvar($line, "this"), false], closures.bindArgs($line, $f[3], "args", $m));
+        $body = [[":Return", $line, [":Call", $line, $this->nm($line, $owner . "__" . $m), $args]]];
+        return $this->funcStmt($line, $owner . "__" . $m . "__wn", [$this->param("this"), $this->param("args")], $body);
+    }
+
+    func genDispatchN() {
+        $line = 0;
+        $body = [];
+        $body[] = [":Expr", $line, [":Assign", $line, $this->mkvar($line, "c"), $this->call($line, "zs_obj_class", [$this->mkvar($line, "o")])]];
+        $wrapped = [];
+        foreach ($this->classes as $cn => $k) {
+            $stmts = [];
+            $seen = [];
+            foreach ($this->chain($cn) as $n) {
+                foreach ($this->classes[$n]->methods as $m => $d) {
+                    if ($d["abstract"] || $d["static"] || $m === "__construct" || has_key($seen, $m) || !has_key($this->nuse, $m)) { continue; }
+                    $seen[$m] = true;
+                    $wn = $n . "__" . $m . "__wn";
+                    if (!has_key($wrapped, $wn)) { $wrapped[$wn] = true; $this->extra[] = $this->wrapperN($n, $m); }
+                    $stmts[] = [":If", $line, [":Binary", $line, "Identical", $this->mkvar($line, "name"), $this->mkstr($line, $m)],
+                        [[":Return", $line, $this->call($line, $wn, [$this->mkvar($line, "o"), $this->mkvar($line, "args")])]], null];
+                }
+            }
+            if (count($stmts) > 0) {
+                $body[] = [":If", $line, [":Binary", $line, "Identical", $this->mkvar($line, "c"), $this->mkstr($line, $cn)], $stmts, null];
+            }
+        }
+        $body[] = [":Return", $line, $this->call($line, "zs_no_method", [$this->mkvar($line, "o"), $this->mkvar($line, "name")])];
+        $this->extra[] = $this->funcStmt($line, "zs_invoke_n", [$this->param("o"), $this->param("name"), $this->param("args")], $body);
+    }
+
     func genDispatch() {
+        if (count($this->nuse) > 0) { $this->genDispatchN(); }
         $line = 0;
         $body = [];
         $body[] = [":Expr", $line, [":Assign", $line, $this->mkvar($line, "c"), $this->call($line, "zs_obj_class", [$this->mkvar($line, "o")])]];
@@ -475,20 +562,34 @@ func desugar($ast) {
     foreach ($ast as $s) { if ($s[0] !== ":ClassStmt") { $rest[] = $s; } }
     foreach ($d->classes as $k) { $d->genClass($k); }
     $d->cur = null;
-    $d->genDispatch();
-    $out = [];
-    foreach ($d->extra as $s) { $out[] = $s; }
+    $statics = [];
+    foreach ($d->classes as $k) {
+        $d->cur = $k;
+        foreach ($k->props as $pn => $pd) {
+            if (!$pd["static"]) { continue; }
+            $ln = $k->line;
+            $dv = $pd["default"] === null ? [":Null", $ln] : $d->rw($pd["default"]);
+            $statics[] = [":Expr", $ln, $d->call($ln, "zs_sset", [$d->mkstr($ln, $k->name . "::" . $pn), $dv])];
+        }
+    }
+    $d->cur = null;
+    $body = [];
     foreach ($rest as $s) {
         if ($s[0] === ":FuncStmt") {
             $f = $s[2];
             $f[5] = $d->rwList($f[5]);
             $s[2] = $f;
-            $out[] = $s;
+            $body[] = $s;
         } else {
             $r = $s[0] === ":Expr" ? $d->stmtExpr($s) : null;
-            if ($r !== null) { foreach ($r as $y) { $out[] = $y; } }
-            else { $out[] = $d->rw($s); }
+            if ($r !== null) { foreach ($r as $y) { $body[] = $y; } }
+            else { $body[] = $d->rw($s); }
         }
     }
+    $d->genDispatch();   # po przepisaniu całego programu: znane metody wołane z argumentami nazwanymi
+    $out = [];
+    foreach ($d->extra as $s) { $out[] = $s; }
+    foreach ($statics as $s) { $out[] = $s; }
+    foreach ($body as $s) { $out[] = $s; }
     return ["ast" => $out, "errors" => $d->errors];
 }
