@@ -3,10 +3,10 @@
 Rdzeń bootstrapu Z#. Repozytoria `zsc`, `zsi`, `zst`, `zzc` dołączają to repo jako `Z-Sharp/` i importują je przez `import Workspace.<człon>;`.
 
 ```
-scripts/bootstrap.sh          # buduje stage0, testuje wszystko: parytet stage1, sema, punkt stały zsc
-scripts/fixpoint.sh           # zsc kompiluje sam siebie: s1 == s2 == s3
-scripts/core_status.sh        # ile rdzenia jest już w Z#, a co jest ziarnem w Rust
-tests/run_all.sh              # cargo test + golden + ZAMM/runtime w Z# + parytety lexera i parsera
+scripts/bootstrap.zsharp      # buduje stage0, testuje wszystko: parytet stage1, sema, punkt stały zsc
+scripts/fixpoint.zsharp       # zsc kompiluje sam siebie: s1 == s2 == s3
+scripts/core_status.zsharp    # ile rdzenia jest już w Z#, a co jest ziarnem w Rust
+scripts/tests/run_all.zsharp # testy złote (rdzeń, m3, stdlib, sieć) + parytety lexera i parsera (--native: też backend C)
 cargo build --release         # target/release/zsc0 (stage0) + libzs_runtime.a
 ./target/release/zsc0 run examples/hello.zsharp     # źródło
 ./target/release/zsc0 exec plik.zbc                  # pakiet .zbc (bez parsowania źródeł)
@@ -25,8 +25,10 @@ cargo build --release         # target/release/zsc0 (stage0) + libzs_runtime.a
 | `runtime/` | **runtime w Z#** (`main.zsharp`: `ZValue`, napisy, tablice, zasoby, statystyki) + nagłówki C: `include/zs_runtime.h` (ABI `libzs_runtime.a`), `include/zs_native.h` (operacje dla kodu generowanego przez zsc) |
 | `wrapper/` | źródło binarki `z#` (wrapper nad zsc/zsi/zst/zzc) |
 | `runtime/native/`, `runtime/include/` | natywny runtime w C (`zs_rt.c`, `zs_native.h`) dla backendów C i LLVM |
-| `tests/` | `basics`, `nomain`, sema, `zamm_test`, `runtime_test`, parytet leksera/parsera (`*_parity.sh`), `bad/`, `run_all.sh` |
-| `docs/` | `SPEC.md` (0.4), `AST.md`, `BOOTSTRAP.md` |
+| `tests/` | `basics`, `nomain`, sema, `zamm_test`, `runtime_test`, parytet leksera/parsera (`scripts/tests/*_parity.zsharp`), `bad/`, `m3/`, `std/`, `scripts/tests/run_all.zsharp` |
+| `stdlib/` | biblioteka standardowa `Std.*` (json, toml, regex, time, path, os, net) — `docs/STDLIB.md` |
+| `scripts/` | skrypty w Z# (`bootstrap`, `fixpoint`, `stage3`, `core_status`, `lib`, `tests/`) oraz `Linux-Distributions/{install,remove}.sh` |
+| `docs/` | `SPEC.md` (0.4), `AST.md`, `BOOTSTRAP.md`, `STDLIB.md` |
 
 ## Decyzje językowe stage0
 - `.` po **gołej nazwie** (`System.cpuCount()`, `Dog.KIND`) = moduł/klasa; gdzie indziej `.` = konkatenacja. Obiekty: `->`.
@@ -42,4 +44,4 @@ cargo build --release         # target/release/zsc0 (stage0) + libzs_runtime.a
 - Backend natywny `zsc` (C → cc) obsługuje podzbiór: funkcje, tablice (indeksowane i asocjacyjne, wyszukiwanie liniowe), napisy, int/float/bool, pętle, `switch`, `try/catch/finally/throw` (Exception, Error, Throwable), podstawowe funkcje wbudowane. Reszta (klasy, domknięcia, moduły) daje jawny błąd kompilacji z kodem (`E01xx`). Pełny język: `zsc build --emit zbc` + `zsi`.
 - Pamięć w binarkach natywnych: wszystko w czasie życia `Persistent` (bezpieczne, bez zwalniania do końca procesu). Obniżanie do ramek wg analizy ucieczki (`sema`) — do zrobienia.
 - Brak: bytecode VM/JIT, backendu LLVM, SSA, interpolacji stringów, traitów, generyków, prawdziwej asynchroniczności; obiekty/klasy w runtime natywnym.
-- Stan etapów i rozliczenie rdzenia: `docs/BOOTSTRAP.md`, `scripts/core_status.sh`.
+- Stan etapów i rozliczenie rdzenia: `docs/BOOTSTRAP.md`, `scripts/core_status.zsharp`.
