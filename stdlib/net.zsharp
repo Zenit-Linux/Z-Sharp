@@ -1,0 +1,356 @@
+namespace Net;
+
+import Std.Json;
+
+##
+ * Std.Net — sieć: TCP/UDP/DNS, adresy URL, klient i prosty serwer HTTP/1.1 (bez TLS).
+ *
+ *   TCP  : connect($host,$port,$timeoutMs=10000)->uchwyt, listen($host,$port), accept($nasluch)->["handle","host","port"],
+ *          read($h,$max=65536) (tekst; null = timeout, "" = koniec połączenia), readAll($h), write($h,$tekst), close($h),
+ *          setTimeout($h,$ms), localAddr($h), peerAddr($h)->["host","port"]
+ *   UDP  : udpBind($host,$port), sendTo($h,$host,$port,$tekst), recvFrom($h,$max=65536)->["data","host","port"]|null
+ *   DNS  : resolve($host)->lista adresów IP
+ *   URL  : parseUrl, urlEncode, urlDecode, buildQuery, parseQuery
+ *   HTTP : request($metoda,$url,$opcje), get, post, put, delete  -> ["status","reason","headers","body","url"]
+ *          opcje: ["headers"=>[..], "body"=>tekst, "timeout"=>ms (10000), "redirects"=>max (5), "json"=>wartość (ustawia body + Content-Type)]
+ *          serve($host,$port,$handler,$maxZadan=0), readRequest($h), response($status,$headers,$body)
+ * Ograniczenia: brak HTTPS/TLS (https:// => wyjątek); dane to tekst UTF-8 (treści binarne nie są bezpieczne);
+ * klient wysyła `Connection: close`, nagłówki odpowiedzi mają klucze małymi literami.
+##
+
+func fail($msg) { throw new Exception("Net: " . $msg); }
+
+# ── TCP / UDP / DNS ──
+func connect($host, $port, $timeoutMs = 10000) { return Socket.tcpConnect($host, $port, $timeoutMs); }
+func listen($host, $port) { return Socket.tcpListen($host, $port); }
+func accept($listener) { return Socket.accept($listener); }
+func read($h, $max = 65536) { return Socket.read($h, $max); }
+func write($h, $data) { return Socket.write($h, $data); }
+func close($h) { Socket.close($h); return null; }
+func setTimeout($h, $ms) { Socket.setTimeout($h, $ms); return null; }
+func localAddr($h) { return Socket.localAddr($h); }
+func peerAddr($h) { return Socket.peerAddr($h); }
+func udpBind($host, $port) { return Socket.udpBind($host, $port); }
+func sendTo($h, $host, $port, $data) { return Socket.sendTo($h, $host, $port, $data); }
+func recvFrom($h, $max = 65536) { return Socket.recvFrom($h, $max); }
+func resolve($host) { return Socket.resolve($host); }
+
+func readAll($h) {
+    $parts = [];
+    while (true) {
+        $c = Socket.read($h, 65536);
+        if ($c === null) { fail("przekroczono czas oczekiwania na dane"); }
+        if ($c === "") { break; }
+        $parts[] = $c;
+    }
+    return join($parts, "");
+}
+
+# ── URL ──
+func urlEncode($s) {
+    $out = [];
+    foreach (chars($s) as $ch) {
+        if (strlen($ch) === 1 && (is_alpha($ch) || is_digit($ch) || $ch === "-" || $ch === "_" || $ch === "." || $ch === "~")) { $out[] = $ch; }
+        else {
+            foreach (System.bytes($ch) as $b) { $out[] = "%" . pad_left(upper(to_hex($b)), 2, "0"); }
+        }
+    }
+    return join($out, "");
+}
+
+func urlDecode($s, $plusIsSpace = false) {
+    $n = strlen($s);
+    if (index_of($s, "%") < 0 && !($plusIsSpace && index_of($s, "+") >= 0)) { return $s; }
+    $bytes = [];
+    $i = 0;
+    while ($i < $n) {
+        $c = substr($s, $i, 1);
+        if ($c === "%" && $i + 2 < $n + 0 + 1 && $i + 2 <= $n - 1 + 0) {
+            $h1 = index_of("0123456789abcdef", lower(substr($s, $i + 1, 1)));
+            $h2 = index_of("0123456789abcdef", lower(substr($s, $i + 2, 1)));
+            if ($h1 >= 0 && $h2 >= 0) { $bytes[] = $h1 * 16 + $h2; $i += 3; continue; }
+        }
+        if ($c === "+" && $plusIsSpace) { $bytes[] = 32; $i++; continue; }
+        # znak (ASCII albo bajty wielobajtowego znaku) — kopiujemy bajty
+        $j = $i + 1;
+        while ($j < $n && ord(substr($s, $j, 1)) >= 128 && ord(substr($s, $j, 1)) < 192) { $j++; }
+        foreach (System.bytes(substr($s, $i, $j - $i)) as $b) { $bytes[] = $b; }
+        $i = $j;
+    }
+    return System.fromBytes($bytes);
+}
+
+func buildQuery($params) {
+    $parts = [];
+    foreach ($params as $k => $v) { $parts[] = urlEncode(strval($k)) . "=" . urlEncode(strval($v)); }
+    return join($parts, "&");
+}
+
+func parseQuery($q) {
+    $out = [];
+    if (strlen($q) > 0 && substr($q, 0, 1) === "?") { $q = substr($q, 1, strlen($q) - 1); }
+    if ($q === "") { return $out; }
+    foreach (split($q, "&") as $pair) {
+        if ($pair === "") { continue; }
+        $e = index_of($pair, "=");
+        if ($e < 0) { $out[urlDecode($pair, true)] = ""; }
+        else { $out[urlDecode(substr($pair, 0, $e), true)] = urlDecode(substr($pair, $e + 1, strlen($pair) - $e - 1), true); }
+    }
+    return $out;
+}
+
+##
+ * scheme://[user[:pass]@]host[:port][/path][?query][#fragment]  ->  ["scheme","user","host","port","path","query","fragment"]
+ * port = podany albo domyślny dla http (80) / https (443); path zawsze zaczyna się od "/".
+##
+func parseUrl($url) {
+    $p = index_of($url, "://");
+    if ($p <= 0) { fail("niepoprawny URL (brak schematu): " . $url); }
+    $scheme = lower(substr($url, 0, $p));
+    $rest = substr($url, $p + 3, strlen($url) - $p - 3);
+    $frag = "";
+    $h = index_of($rest, "#");
+    if ($h >= 0) { $frag = substr($rest, $h + 1, strlen($rest) - $h - 1); $rest = substr($rest, 0, $h); }
+    $query = "";
+    $q = index_of($rest, "?");
+    if ($q >= 0) { $query = substr($rest, $q + 1, strlen($rest) - $q - 1); $rest = substr($rest, 0, $q); }
+    $path = "/";
+    $s = index_of($rest, "/");
+    if ($s >= 0) { $path = substr($rest, $s, strlen($rest) - $s); $rest = substr($rest, 0, $s); }
+    $user = "";
+    $at = -1;
+    for ($i = strlen($rest) - 1; $i >= 0; $i--) { if (substr($rest, $i, 1) === "@") { $at = $i; break; } }
+    if ($at >= 0) { $user = substr($rest, 0, $at); $rest = substr($rest, $at + 1, strlen($rest) - $at - 1); }
+    $host = $rest;
+    $port = $scheme === "https" ? 443 : ($scheme === "http" ? 80 : 0);
+    if (strlen($rest) > 0 && substr($rest, 0, 1) === "[") {
+        $e = index_of($rest, "]");
+        if ($e < 0) { fail("niepoprawny adres IPv6 w URL: " . $url); }
+        $host = substr($rest, 1, $e - 1);
+        if ($e + 1 < strlen($rest) && substr($rest, $e + 1, 1) === ":") { $port = intval(substr($rest, $e + 2, strlen($rest) - $e - 2)); }
+    } else {
+        $c = index_of($rest, ":");
+        if ($c >= 0) { $host = substr($rest, 0, $c); $port = intval(substr($rest, $c + 1, strlen($rest) - $c - 1)); }
+    }
+    if ($host === "") { fail("URL bez nazwy hosta: " . $url); }
+    return ["scheme" => $scheme, "user" => $user, "host" => $host, "port" => $port, "path" => $path, "query" => $query, "fragment" => $frag];
+}
+
+# ── HTTP: wspólne ──
+func reasonText($code) {
+    $r = [200 => "OK", 201 => "Created", 202 => "Accepted", 204 => "No Content", 301 => "Moved Permanently", 302 => "Found", 303 => "See Other",
+          304 => "Not Modified", 307 => "Temporary Redirect", 308 => "Permanent Redirect", 400 => "Bad Request", 401 => "Unauthorized",
+          403 => "Forbidden", 404 => "Not Found", 405 => "Method Not Allowed", 408 => "Request Timeout", 409 => "Conflict", 410 => "Gone",
+          413 => "Payload Too Large", 415 => "Unsupported Media Type", 422 => "Unprocessable Entity", 429 => "Too Many Requests",
+          500 => "Internal Server Error", 501 => "Not Implemented", 502 => "Bad Gateway", 503 => "Service Unavailable", 504 => "Gateway Timeout"];
+    return has_key($r, $code) ? $r[$code] : "Status";
+}
+
+# nagłówki "Nazwa: wartość" (linie po pierwszej) -> tablica z kluczami małymi literami
+func parseHeaders($lines) {
+    $h = [];
+    for ($i = 1; $i < count($lines); $i++) {
+        $ln = $lines[$i];
+        $c = index_of($ln, ":");
+        if ($c <= 0) { continue; }
+        $k = lower(trim(substr($ln, 0, $c)));
+        $v = trim(substr($ln, $c + 1, strlen($ln) - $c - 1));
+        $h[$k] = has_key($h, $k) ? $h[$k] . ", " . $v : $v;
+    }
+    return $h;
+}
+
+func headerBlock($headers) {
+    $out = "";
+    foreach ($headers as $k => $v) { $out .= strval($k) . ": " . strval($v) . "\r\n"; }
+    return $out;
+}
+
+func hasHeader($headers, $name) {
+    foreach ($headers as $k => $v) { if (lower(strval($k)) === $name) { return true; } }
+    return false;
+}
+
+func decodeChunked($body) {
+    $out = [];
+    $i = 0;
+    $n = strlen($body);
+    while ($i < $n) {
+        $e = index_of(substr($body, $i, $n - $i), "\r\n");
+        if ($e < 0) { break; }
+        $line = substr($body, $i, $e);
+        $sc = index_of($line, ";");
+        if ($sc >= 0) { $line = substr($line, 0, $sc); }
+        $size = 0;
+        foreach (chars(lower(trim($line))) as $ch) {
+            $d = index_of("0123456789abcdef", $ch);
+            if ($d < 0) { fail("niepoprawny rozmiar chunka: " . $line); }
+            $size = $size * 16 + $d;
+        }
+        $i += $e + 2;
+        if ($size === 0) { break; }
+        $out[] = substr($body, $i, $size);
+        $i += $size + 2;
+    }
+    return join($out, "");
+}
+
+# ── klient HTTP ──
+##
+ * Wykonuje żądanie HTTP (bez TLS). Zwraca ["status","reason","headers","body","url"]; podąża za przekierowaniami (opcje.redirects).
+##
+func request($method, $url, $opts = []) {
+    $redirects = has_key($opts, "redirects") ? $opts["redirects"] : 5;
+    $timeout = has_key($opts, "timeout") ? $opts["timeout"] : 10000;
+    $headers = has_key($opts, "headers") ? $opts["headers"] : [];
+    $body = has_key($opts, "body") ? $opts["body"] : "";
+    if (has_key($opts, "json")) {
+        $body = Json.encode($opts["json"]);
+        if (!hasHeader($headers, "content-type")) { $headers["Content-Type"] = "application/json"; }
+    }
+    $method = upper($method);
+    for ($hop = 0; $hop <= $redirects; $hop++) {
+        $u = parseUrl($url);
+        if ($u["scheme"] === "https") { fail("HTTPS nie jest wspierany (brak TLS): " . $url); }
+        if ($u["scheme"] !== "http") { fail("nieobsługiwany schemat: " . $u["scheme"]); }
+        $target = $u["path"] . ($u["query"] !== "" ? "?" . $u["query"] : "");
+        $hostHdr = (index_of($u["host"], ":") >= 0 ? "[" . $u["host"] . "]" : $u["host"]) . ($u["port"] !== 80 ? ":" . $u["port"] : "");
+        $req = $method . " " . $target . " HTTP/1.1\r\nHost: " . $hostHdr . "\r\n";
+        if (!hasHeader($headers, "user-agent")) { $req .= "User-Agent: Z-Sharp-Std.Net/1.0\r\n"; }
+        if (!hasHeader($headers, "accept")) { $req .= "Accept: */*\r\n"; }
+        $req .= "Connection: close\r\n" . headerBlock($headers);
+        if ($body !== "" || $method === "POST" || $method === "PUT" || $method === "PATCH") { $req .= "Content-Length: " . strlen($body) . "\r\n"; }
+        $req .= "\r\n" . $body;
+        $h = Socket.tcpConnect($u["host"], $u["port"], $timeout);
+        Socket.setTimeout($h, $timeout);
+        $raw = "";
+        try {
+            Socket.write($h, $req);
+            $raw = readAll($h);
+        } catch (Exception $e) {
+            Socket.close($h);
+            throw $e;
+        }
+        Socket.close($h);
+        $sep = index_of($raw, "\r\n\r\n");
+        if ($sep < 0) { fail("niepełna odpowiedź HTTP od " . $url); }
+        $lines = split(substr($raw, 0, $sep), "\r\n");
+        $status = split($lines[0], " ");
+        if (count($status) < 2 || substr($status[0], 0, 5) !== "HTTP/") { fail("niepoprawna linia statusu: " . $lines[0]); }
+        $code = intval($status[1]);
+        $reason = count($status) > 2 ? join(array_slice($status, 2, count($status) - 2), " ") : "";
+        $rh = parseHeaders($lines);
+        $rest = substr($raw, $sep + 4, strlen($raw) - $sep - 4);
+        if (has_key($rh, "transfer-encoding") && contains(lower($rh["transfer-encoding"]), "chunked")) { $rest = decodeChunked($rest); }
+        else if (has_key($rh, "content-length")) {
+            $len = intval($rh["content-length"]);
+            if (strlen($rest) > $len) { $rest = substr($rest, 0, $len); }
+        }
+        if (($code === 301 || $code === 302 || $code === 303 || $code === 307 || $code === 308) && has_key($rh, "location") && $hop < $redirects) {
+            $loc = $rh["location"];
+            if (index_of($loc, "://") > 0) { $url = $loc; }
+            else if (substr($loc, 0, 1) === "/") { $url = $u["scheme"] . "://" . $hostHdr . $loc; }
+            else {
+                $dir = $u["path"];
+                $k = strlen($dir) - 1;
+                while ($k > 0 && substr($dir, $k, 1) !== "/") { $k--; }
+                $url = $u["scheme"] . "://" . $hostHdr . substr($dir, 0, $k + 1) . $loc;
+            }
+            if ($code === 303 || (($code === 301 || $code === 302) && $method === "POST")) { $method = "GET"; $body = ""; }
+            continue;
+        }
+        return ["status" => $code, "reason" => $reason, "headers" => $rh, "body" => $rest, "url" => $url];
+    }
+    fail("zbyt wiele przekierowań");
+}
+
+func get($url, $opts = []) { return request("GET", $url, $opts); }
+func post($url, $body, $opts = []) { $opts["body"] = $body; return request("POST", $url, $opts); }
+func put($url, $body, $opts = []) { $opts["body"] = $body; return request("PUT", $url, $opts); }
+func delete($url, $opts = []) { return request("DELETE", $url, $opts); }
+
+# ── serwer HTTP ──
+##
+ * Buduje odpowiedź ["status","headers","body"] (Content-Length i Content-Type uzupełnia serve()).
+##
+func response($status, $headers = [], $body = "") { return ["status" => $status, "headers" => $headers, "body" => $body]; }
+
+##
+ * Czyta jedno żądanie z połączonego gniazda: ["method","target","path","query","params","headers","body"] albo null (połączenie puste).
+##
+func readRequest($h) {
+    $buf = "";
+    $sep = -1;
+    while ($sep < 0) {
+        $c = Socket.read($h, 65536);
+        if ($c === null) { fail("przekroczono czas oczekiwania na żądanie"); }
+        if ($c === "") { if ($buf === "") { return null; } fail("połączenie zamknięte w trakcie nagłówków"); }
+        $buf .= $c;
+        $sep = index_of($buf, "\r\n\r\n");
+        if ($sep < 0 && strlen($buf) > 1048576) { fail("nagłówki żądania zbyt duże"); }
+    }
+    $lines = split(substr($buf, 0, $sep), "\r\n");
+    $first = split($lines[0], " ");
+    if (count($first) < 2) { fail("niepoprawna linia żądania: " . $lines[0]); }
+    $hdr = parseHeaders($lines);
+    $body = substr($buf, $sep + 4, strlen($buf) - $sep - 4);
+    $want = has_key($hdr, "content-length") ? intval($hdr["content-length"]) : 0;
+    if ($want > 33554432) { fail("treść żądania zbyt duża"); }
+    $parts = [$body];
+    $have = strlen($body);
+    while ($have < $want) {
+        $c = Socket.read($h, 65536);
+        if ($c === null || $c === "") { fail("połączenie zamknięte w trakcie treści żądania"); }
+        $parts[] = $c;
+        $have += strlen($c);
+    }
+    $body = join($parts, "");
+    if (strlen($body) > $want) { $body = substr($body, 0, $want); }
+    $target = $first[1];
+    $q = index_of($target, "?");
+    $path = $q >= 0 ? substr($target, 0, $q) : $target;
+    $query = $q >= 0 ? substr($target, $q + 1, strlen($target) - $q - 1) : "";
+    return ["method" => upper($first[0]), "target" => $target, "path" => urlDecode($path), "query" => $query, "params" => parseQuery($query), "headers" => $hdr, "body" => $body];
+}
+
+func writeResponse($h, $res) {
+    if (is_string($res)) { $res = response(200, ["Content-Type" => "text/plain; charset=utf-8"], $res); }
+    $status = has_key($res, "status") ? $res["status"] : 200;
+    $headers = has_key($res, "headers") ? $res["headers"] : [];
+    $body = has_key($res, "body") ? strval($res["body"]) : "";
+    $out = "HTTP/1.1 " . $status . " " . reasonText($status) . "\r\n";
+    if (!hasHeader($headers, "content-type")) { $out .= "Content-Type: text/plain; charset=utf-8\r\n"; }
+    $out .= headerBlock($headers) . "Content-Length: " . strlen($body) . "\r\nConnection: close\r\n\r\n" . $body;
+    Socket.write($h, $out);
+    return null;
+}
+
+##
+ * Prosty, jednowątkowy serwer HTTP: dla każdego żądania woła $handler($req) i odsyła zwróconą odpowiedź
+ * (tekst => 200 text/plain albo tablica z response()). $maxZadan = 0 => działa bez końca. Zwraca liczbę obsłużonych żądań.
+##
+func serve($host, $port, $handler, $maxRequests = 0) {
+    $l = Socket.tcpListen($host, $port);
+    $served = 0;
+    while ($maxRequests === 0 || $served < $maxRequests) {
+        $conn = Socket.accept($l);
+        $h = $conn["handle"];
+        Socket.setTimeout($h, 10000);
+        try {
+            $req = readRequest($h);
+            if ($req !== null) {
+                $req["peer"] = $conn["host"] . ":" . $conn["port"];
+                $res = null;
+                try { $res = $handler($req); }
+                catch (Exception $e) { $res = response(500, [], "Internal Server Error: " . $e->getMessage()); }
+                writeResponse($h, $res);
+            }
+        } catch (Exception $e) {
+            try { writeResponse($h, response(400, [], "Bad Request")); } catch (Exception $e2) { }
+        }
+        Socket.close($h);
+        $served++;
+    }
+    Socket.close($l);
+    return $served;
+}
