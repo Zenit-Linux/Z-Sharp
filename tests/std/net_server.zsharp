@@ -1,0 +1,9 @@
+import Std.Net;
+func h($r) {
+  if ($r["path"] === "/boom") { throw new Exception("x"); }
+  if ($r["path"] === "/redir") { return Net.response(302, ["Location" => "/hello?name=Zażółć"]); }
+  $nm = has_key($r["params"], "name") ? $r["params"]["name"] : "-";
+  return Net.response(200, ["X-Test" => "1"], $r["method"] . " " . $r["path"] . " " . $nm . " [" . $r["body"] . "]");
+}
+$n = Net.serve("127.0.0.1", 18099, fn($r) => h($r), 6);
+echo "served", $n;
