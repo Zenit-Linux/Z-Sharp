@@ -1,0 +1,34 @@
+import Std.Regex;
+func show($m) { if ($m === null) { echo "null"; return null; } echo $m["text"], $m["start"], $m["end"], join($m["groups"], "|"); return null; }
+show(Regex.find("a(b+)c", "xxabbbc"));
+show(Regex.find("(\\d+)-(\\d+)", "tel 555-1234 ok"));
+show(Regex.find("^\\w+@\\w+\\.com$", "bob@ex.com"));
+show(Regex.find("(?<y>\\d{4})-(?<m>\\d\\d)", "on 2026-11-21"));
+echo Regex.find("(?<y>\\d{4})-(?<m>\\d\\d)", "on 2026-11-21")["named"]["m"];
+show(Regex.find("a.*?c", "abcabc"));
+show(Regex.find("a.*c", "abcabc"));
+show(Regex.find("(a|ab)(c|bcd)(d*)", "abcd"));
+show(Regex.find("(a*)*b", "aaab"));
+show(Regex.find("(a*)+$", "aaa"));
+show(Regex.find("foo(?=bar)", "foobaz foobar"));
+show(Regex.find("foo(?!bar)", "foobar foobaz"));
+show(Regex.find("(\\w)\\1", "hello"));
+show(Regex.find("[^a-c]+", "abcxyzabc"));
+show(Regex.find("[\\d.]+", "v 3.14!"));
+show(Regex.find("\\bcat\\b", "concat cat"));
+show(Regex.find(Regex.compile("HeLLo", "i"), "say hello"));
+show(Regex.find("x{2,3}", "xxxxx"));
+show(Regex.find("x{2,3}?", "xxxxx"));
+show(Regex.find("żółw", "to jest żółw ok"));
+show(Regex.find("[ą-ż]+", "abc żółć"));
+show(Regex.find(Regex.compile("a.c", "s"), "a\nc"));
+show(Regex.find("^b", "a\nb"));
+echo Regex.test("^b", "a\nb"), Regex.test(Regex.compile("^b", "m"), "a\nb"), Regex.fullMatch("a+", "aaa"), Regex.fullMatch("a|ab", "ab"), Regex.fullMatch("a+", "aab");
+echo Regex.replace("(\\w+)@(\\w+)", "a@b, c@d", "$2 at $1");
+echo Regex.replace("\\s+", "a   b \t c", " ");
+echo Regex.replace("(?<n>\\d+)", "x1y22", "<${n}>", true), Regex.replace("\\d", "1 2 3", "#", false), Regex.replace("x*", "abc", "-");
+echo join(Regex.split(",\\s*", "a, b,c,   d"), "|"), join(Regex.split("", "abc"), "|"), join(Regex.split("\\d", "a1b2c3", 2), "|"), count(Regex.split("x", ""));
+echo count(Regex.findAll("\\d+", "1 22 333")), Regex.findAll("\\d+", "1 22 333")[2]["text"], count(Regex.findAll("a*", "baab"));
+echo Regex.escape("a.b*c(d)"), Regex.test(Regex.escape("1+1=2?"), "is 1+1=2? yes");
+foreach (["(", "a)", "[a", "*a", "a{2,1}", "\\", "(?<=a)b"] as $bad) { try { Regex.compile($bad); echo "no error"; } catch (Exception $e) { echo $e->getMessage(); } }
+try { Regex.find("(a*)*$x", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!"); echo "done"; } catch (Exception $e) { echo "bt"; }
