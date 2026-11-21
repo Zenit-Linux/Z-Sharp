@@ -1,13 +1,43 @@
-#!/usr/bin/env bash
+#!/usr/bin/env zsi
 # Rozliczenie rdzenia: ile kodu jest w Z#, a ile w ziarnie (Rust stage0) i w runtime C.
-. "$(dirname "$0")/lib.sh"
-loc() { cat "$@" 2>/dev/null | grep -cv '^\s*$'; }
-printf "%-34s %8s\n" "człon" "linii"
-for f in lexer parser sema ir emit_c emit_llvm zbc manifest cli; do printf "%-34s %8s\n" "lib/$f.zsharp (Z#)" "$(loc "$ROOT/lib/$f.zsharp")"; done
-for f in "$ROOT"/lib/bytecode.zsharp "$ROOT"/lib/vm.zsharp; do [ -f "$f" ] && printf "%-34s %8s\n" "lib/$(basename "$f") (Z#)" "$(loc "$f")"; done
-printf "%-34s %8s\n" "wrapper/main.zsharp (Z#)" "$(loc "$ROOT/wrapper/main.zsharp")"
-printf "%-34s %8s\n" "zamm + runtime w Z#" "$(loc "$ROOT"/zamm/*.zsharp "$ROOT"/runtime/*.zsharp)"
-printf "%-34s %8s\n" "runtime/native (C)" "$(loc "$ROOT"/runtime/native/*.c "$ROOT"/runtime/include/*.h)"
-printf "%-34s %8s\n" "stage0 (Rust, ziarno)" "$(find "$ROOT/stage0" -name '*.rs' -not -path '*/target/*' | xargs cat | grep -cv '^\s*$')"
-Z=$(cat "$ROOT"/lib/*.zsharp | grep -cv '^\s*$'); R=$(find "$ROOT/stage0" -name '*.rs' -not -path '*/target/*' | xargs cat | grep -cv '^\s*$')
-echo "frontend+backendy w Z#: $Z linii; ziarno Rust: $R linii"
+import Std.Os;
+import Std.Path;
+import Workspace.Scripts;
+
+func row($name, $n) { echo pad_right($name, 34) . pad_left(strval($n), 8); return null; }
+
+# wszystkie pliki z rozszerzeniem pod katalogiem (bez target/)
+func tree($dir, $ext) {
+    $out = [];
+    foreach (Os.walk($dir) as $p) {
+        if (contains($p, "/target/")) { continue; }
+        if (ends_with($p, $ext) && Os.isFile($p)) { $out[] = $p; }
+    }
+    return $out;
+}
+
+func main() {
+    $r = Scripts.root();
+    row("człon", "linii");
+    foreach (["lexer", "parser", "sema", "ir", "emit_c", "emit_llvm", "zbc", "manifest", "cli", "link", "classes", "closures", "prelude"] as $f) {
+        row("lib/" . $f . ".zsharp (Z#)", Scripts.loc([$r . "/lib/" . $f . ".zsharp"]));
+    }
+    foreach (["bytecode", "vm"] as $f) {
+        if (Os.isFile($r . "/lib/" . $f . ".zsharp")) { row("lib/" . $f . ".zsharp (Z#)", Scripts.loc([$r . "/lib/" . $f . ".zsharp"])); }
+    }
+    row("wrapper/main.zsharp (Z#)", Scripts.loc([$r . "/wrapper/main.zsharp"]));
+    row("zamm + runtime w Z#", Scripts.loc(array_merge_lists(Scripts.filesIn($r . "/zamm", ".zsharp"), Scripts.filesIn($r . "/runtime", ".zsharp"))));
+    row("stdlib (Z#)", Scripts.loc(Scripts.filesIn($r . "/stdlib", ".zsharp")));
+    row("runtime/native (C)", Scripts.loc(array_merge_lists(Scripts.filesIn($r . "/runtime/native", ".c"), Scripts.filesIn($r . "/runtime/include", ".h"))));
+    $rust = Scripts.loc(tree($r . "/stage0", ".rs"));
+    row("stage0 (Rust, ziarno)", $rust);
+    $z = Scripts.loc(Scripts.filesIn($r . "/lib", ".zsharp"));
+    echo "frontend+backendy w Z#: " . $z . " linii; ziarno Rust: " . $rust . " linii";
+}
+
+func array_merge_lists($a, $b) {
+    foreach ($b as $x) { $a[] = $x; }
+    return $a;
+}
+
+main();
