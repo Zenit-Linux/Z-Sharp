@@ -3,16 +3,16 @@
 | Etap | Co | Stan |
 |---|---|---|
 | **stage0** | interpreter AST w Rust (`zsc0`): `run` (źródła) i `exec` (pakiet `.zbc`) | działa |
-| **stage1-front** | lekser + parser w Z# (`lib/lexer.zsharp`, `lib/parser.zsharp`) | działa; parytet z Rust (`tests/*_parity.sh`), w tym samoparsowanie |
+| **stage1-front** | lekser + parser w Z# (`lib/lexer.zsharp`, `lib/parser.zsharp`) | działa; parytet z Rust (`scripts/tests/*_parity.zsharp`), w tym samoparsowanie |
 | **stage1-sem** | analiza semantyczna + analiza ucieczki (`lib/sema.zsharp`) → klasy ZAMM | działa; 0 ostrzeżeń na własnych źródłach |
 | **stage1-pack** | `.zbc` (`lib/zbc.zsharp`): program bez źródeł, deterministyczny | działa |
-| **punkt stały** | `zsc` (z `.zbc`) kompiluje samego siebie: s1 == s2 == s3 | **działa** (`scripts/fixpoint.sh`) |
+| **punkt stały** | `zsc` (z `.zbc`) kompiluje samego siebie: s1 == s2 == s3 | **działa** (`scripts/fixpoint.zsharp`) |
 | **stage1-core** | ZAMM (`zamm/*.zsharp`) i runtime (`runtime/main.zsharp`) napisane w Z#, 1:1 z referencją w Rust | działa; `tests/zamm_test.zsharp` (39 asercji), `tests/runtime_test.zsharp` (16) |
 | **stage1-ir** | Z# IR strukturalne (`lib/ir.zsharp`): lowering, walidacja, lokalne, `--emit ir` | działa (SSA i bytecode VM: do zrobienia) |
 | **stage2** | backend C (`lib/emit_c.zsharp`) → `cc` + własny runtime w C (`runtime/native/zs_rt.c`, bez Rusta): `zsc build` daje binarkę natywną | działa dla podzbioru; testy różnicowe interpreter↔natywny (`zsc/tests/native/run_diff.sh`) |
 | **stage2-llvm** | backend LLVM (`lib/emit_llvm.zsharp`): tekstowy `.ll` → `clang`, ten sam runtime, `--target <triple>` | działa dla podzbioru; te same testy różnicowe (C i LLVM: 12/12) |
-| **stage3-bundle** | `zsc0 bundle`: binarka = runtime + wbudowany pakiet `.zbc`; `zsc`, `zsi`, `zst`, `zzc`, `z#` jako pojedyncze pliki wykonywalne bez źródeł | działa (`scripts/fixpoint.sh` kończy się budową standalone `zsc`) |
-| **stage3-native** | `zsc` skompilowany **natywnie** (C/LLVM) kompiluje `zsc` | **działa**: `scripts/stage3.sh` (zsc2→zsc3→zsc4, C identyczny z interpreterem) |
+| **stage3-bundle** | `zsc0 bundle`: binarka = runtime + wbudowany pakiet `.zbc`; `zsc`, `zsi`, `zst`, `zzc`, `z#` jako pojedyncze pliki wykonywalne bez źródeł | działa (`scripts/fixpoint.zsharp` kończy się budową standalone `zsc`) |
+| **stage3-native** | `zsc` skompilowany **natywnie** (C/LLVM) kompiluje `zsc` | **działa**: `scripts/stage3.zsharp` (zsc2→zsc3→zsc4, C identyczny z interpreterem) |
 
 ## Co dokładnie dowodzi punkt stały
 * s1: `zsc` uruchomiony **ze źródeł** (parsowanych przez Rust) pakuje własne źródła.
@@ -31,14 +31,14 @@ Program może składać się z samego kodu najwyższego poziomu. Jeśli zdefinio
 runtime wywołuje je po kodzie najwyższego poziomu; zwrócona liczba całkowita to kod wyjścia procesu.
 
 ## Weryfikacja
-`scripts/bootstrap.sh`: build, testy Rust (manifest, ZAMM, runtime, czytnik AST), test złoty, `nomain`, parytet leksera/parsera,
+`scripts/bootstrap.zsharp`: build, testy Rust (manifest, ZAMM, runtime, czytnik AST), test złoty, `nomain`, parytet leksera/parsera,
 sema (złoty + 0 ostrzeżeń), manifesty, narzędzia, punkt stały, `zsi` na `.zbc`, ABI C.
 
 ## Bootstrap rdzenia (lib + zamm + runtime)
 | człon | w Z# | ziarno w Rust | weryfikacja |
 |---|---|---|---|
-| lexer, parser | `lib/lexer.zsharp`, `lib/parser.zsharp` | `stage0/zs-lexer`, `zs-parser` | parytet pozycji tokenów i AST (`tests/*_parity.sh`) |
-| manifest (`Z#.toml`) | `lib/manifest.zsharp` | `stage0/zs-manifest` | `tests/manifest_test.zsharp` + parytet wyjścia `zsc0 manifest` (`tests/manifest_parity.sh`) |
+| lexer, parser | `lib/lexer.zsharp`, `lib/parser.zsharp` | `stage0/zs-lexer`, `zs-parser` | parytet pozycji tokenów i AST (`scripts/tests/*_parity.zsharp`) |
+| manifest (`Z#.toml`) | `lib/manifest.zsharp` | `stage0/zs-manifest` | `tests/manifest_test.zsharp` + parytet wyjścia `zsc0 manifest` (`scripts/tests/manifest_parity (zsc0 manifest)`) |
 | sema, zbc, ir, emit_c | `lib/*.zsharp` | — (tylko Z#) | golden sema, punkt stały, testy różnicowe |
 | ZAMM | `zamm/*.zsharp` | `stage0/zamm` | `tests/zamm_test.zsharp` odpowiada `zamm/tests/zamm.rs` |
 | runtime | `runtime/main.zsharp` | `stage0/runtime` | `tests/runtime_test.zsharp` odpowiada `runtime/tests/abi.rs` |
@@ -46,7 +46,7 @@ sema (złoty + 0 ostrzeżeń), manifesty, narzędzia, punkt stały, `zsi` na `.z
 Model pamięci w Z#: stage0 nie ma surowej pamięci, więc ZAMM w Z# działa na **symulowanej przestrzeni adresowej** (`zamm/chunk.zsharp`:
 adresy chunków, rzadka mapa komórek, poison `0xDD`). Cała logika (przesuwanie wskaźnika, wyrównanie, rewind, pula, LOS, generacje uchwytów,
 `pop_frame_returning`) jest prawdziwym kodem Z#; różnica względem Rusta to brak bajtów (komórka = wartość; napisy w komórkach to znaki, rozmiar w bajtach UTF-8).
-`scripts/core_status.sh` pokazuje, ile każdego członu jest w Z#, a ile w ziarnie.
+`scripts/core_status.zsharp` pokazuje, ile każdego członu jest w Z#, a ile w ziarnie.
 
 ## Backend natywny (zsc)
 `zsc build x.zs` → AST → sema → IR → C (`emit_c`) → `cc` + `libzs_runtime.a`. Kolejność ewaluacji lewa→prawa, tablice mają semantykę wartości,
