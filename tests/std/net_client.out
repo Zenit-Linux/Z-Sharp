@@ -1,0 +1,9 @@
+200 OK 1 GET /hello Zażółć gęślą []
+200 POST /p - [dane ąę]
+200 GET /hello Zażółć [] http://127.0.0.1:18099/hello?name=Zażółć
+500 Internal Server Error: x
+PUT /j - [{"a":1}]
+Net: HTTPS nie jest wspierany (brak TLS): https://x.example/
+a b cż a%20b%2F%C5%BC q=x%20y&n=1 ż z
+example.com 8080 /a/b x=1 f user ::1
+true
