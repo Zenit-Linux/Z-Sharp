@@ -1,0 +1,8 @@
+["x", "y", "z"] 7 true false
+6
+link a
+false
+linux dflt true
+5
+["status" => 3, "stdout" => "hi\n", "stderr" => ""]
+0
