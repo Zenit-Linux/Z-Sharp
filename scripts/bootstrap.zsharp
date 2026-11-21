@@ -1,17 +1,55 @@
-#!/usr/bin/env bash
+#!/usr/bin/env zsi
 # Pełna weryfikacja łańcucha bootstrapu: stage0 -> testy rdzenia -> punkt stały zsc -> testy natywne (C i LLVM) -> wrapper.
-set -euo pipefail
-. "$(dirname "$0")/lib.sh"
-echo "== stage0 (ziarno Rust)"; (cd "$ROOT" && cargo build --release --quiet) && echo "   $ZSC0"
-echo "== testy rdzenia"; "$ROOT/tests/run_all.sh"
-if [ -n "$ZSC_DIR" ]; then
-  echo "== punkt stały zsc"; "$ROOT/scripts/fixpoint.sh"
-  link_workspace; trap unlink_workspace EXIT
-  echo "== backend natywny (C + LLVM) vs interpreter"
-  [ -x "$ZSC_DIR/tests/native/run_diff.sh" ] && ZS_HOME="$ROOT" "$ZSC_DIR/tests/native/run_diff.sh"
-  echo "== stage3 (natywna samokompilacja zsc)"; "$ROOT/scripts/stage3.sh"
-  echo "== wrapper z#"
-  T="$(mktemp -d)"; "$ZSC0" run "$ZSC_DIR/src/main.zsharp" build "$ROOT/wrapper/main.zsharp" -o "$T/z#" >/dev/null && "$T/z#" version
-  rm -rf "$T"
-fi
-"$ROOT/scripts/core_status.sh"
+import Std.Os;
+import Workspace.Scripts;
+
+# uruchamia skrypt Z# przez stage0; przerywa przy błędzie
+func runScript($name, $args = []) {
+    $z = Scripts.zsc0();
+    $a = ["run", Scripts.root() . "/scripts/" . $name];
+    foreach ($args as $x) { $a[] = $x; }
+    $code = Scripts.inherit($z, $a);
+    if ($code !== 0) { Scripts.die($name . " zakończył się kodem " . $code); }
+    return null;
+}
+
+func main() {
+    $r = Scripts.root();
+    Scripts.step("stage0 (ziarno Rust)");
+    $old = Os.cwd();
+    Os.chdir($r);
+    $code = Os.exec("cargo", ["build", "--release", "--quiet"]);
+    Os.chdir($old);
+    if ($code !== 0) { Scripts.die("cargo build nie powiódł się"); }
+    echo "   " . Scripts.zsc0();
+
+    Scripts.step("testy rdzenia");
+    runScript("tests/run_all.zsharp");
+
+    $zscDir = Scripts.zscDir();
+    if ($zscDir !== null) {
+        Scripts.step("punkt stały zsc");
+        runScript("fixpoint.zsharp");
+        $created = Scripts.linkWorkspace($zscDir);
+        Scripts.step("backend natywny (C + LLVM) vs interpreter");
+        $diff = $zscDir . "/tests/native/run_diff.sh";
+        if (Os.isFile($diff)) {
+            if (Scripts.inherit("sh", [$diff]) !== 0) { Scripts.unlinkWorkspace($zscDir, $created); Scripts.die("run_diff.sh nie przeszedł"); }
+        } else {
+            echo "   (brak zsc/tests/native/run_diff.sh — porównuję testy m3 i std z backendem C)";
+            runScript("tests/run_all.zsharp", ["--native", "--filter=tests/m3/"]);
+            runScript("tests/run_all.zsharp", ["--native", "--filter=tests/std/"]);
+        }
+        Scripts.step("stage3 (natywna samokompilacja zsc)");
+        runScript("stage3.zsharp");
+        Scripts.step("wrapper z#");
+        $t = Scripts.tmp();
+        Scripts.must("wrapper", Scripts.zsc0(), ["run", $zscDir . "/src/main.zsharp", "build", $r . "/wrapper/main.zsharp", "-o", $t . "/z#"]);
+        echo trim(Scripts.must("z# version", $t . "/z#", ["version"]));
+        Os.removeAll($t);
+        Scripts.unlinkWorkspace($zscDir, $created);
+    }
+    runScript("core_status.zsharp");
+}
+
+main();
