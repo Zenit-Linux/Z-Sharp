@@ -1,0 +1,167 @@
+namespace Path;
+
+##
+ * Std.Path — operacje na ścieżkach POSIX (czyste operacje na tekście; nic nie dotyka dysku poza absolute/expandHome).
+ *   isAbs, parts, normalize, join, dirname, basename, ext, stem, withExt, split, relative, absolute, isSubpath, expandHome
+ * Uwaga implementacyjna: wewnątrz tego modułu nie używamy wbudowanych `join`/`split` (nazwy modułowe je przesłaniają).
+##
+
+func lastSlash($p) {
+    $i = strlen($p) - 1;
+    while ($i >= 0 && substr($p, $i, 1) !== "/") { $i--; }
+    return $i;
+}
+
+func isAbs($p) { return strlen($p) > 0 && substr($p, 0, 1) === "/"; }
+
+##
+ * Niepuste segmenty ścieżki (bez rozwiązywania "." i "..").
+##
+func parts($p) {
+    $out = [];
+    $n = strlen($p);
+    $start = 0;
+    for ($i = 0; $i <= $n; $i++) {
+        if ($i === $n || substr($p, $i, 1) === "/") {
+            if ($i > $start) { $out[] = substr($p, $start, $i - $start); }
+            $start = $i + 1;
+        }
+    }
+    return $out;
+}
+
+func glue($segs) {
+    $r = "";
+    $first = true;
+    foreach ($segs as $s) {
+        if (!$first) { $r .= "/"; }
+        $r .= $s;
+        $first = false;
+    }
+    return $r;
+}
+
+##
+ * Czyści ścieżkę: usuwa ".", puste segmenty i rozwiązuje ".." leksykalnie.
+##
+func normalize($p) {
+    $abs = isAbs($p);
+    $out = [];
+    foreach (parts($p) as $s) {
+        if ($s === ".") { continue; }
+        if ($s === "..") {
+            $n = count($out);
+            if ($n > 0 && $out[$n - 1] !== "..") { $out = array_slice($out, 0, $n - 1); }
+            else if (!$abs) { $out[] = ".."; }
+            continue;
+        }
+        $out[] = $s;
+    }
+    $r = glue($out);
+    if ($abs) { return "/" . $r; }
+    return $r === "" ? "." : $r;
+}
+
+##
+ * Łączy elementy (pomija puste; element bezwzględny zaczyna ścieżkę od nowa) i czyści wynik.
+##
+func join(...$items) {
+    $r = "";
+    foreach ($items as $p) {
+        if ($p === "") { continue; }
+        if (isAbs($p) || $r === "") { $r = $p; }
+        else { $r = $r . "/" . $p; }
+    }
+    if ($r === "") { return ""; }
+    return normalize($r);
+}
+
+func trimSlashes($p) {
+    $n = strlen($p);
+    while ($n > 1 && substr($p, $n - 1, 1) === "/") { $n--; }
+    return substr($p, 0, $n);
+}
+
+func dirname($p) {
+    if ($p === "") { return "."; }
+    $q = trimSlashes($p);
+    $i = lastSlash($q);
+    if ($i < 0) { return "."; }
+    $d = trimSlashes(substr($q, 0, $i));
+    return $d === "" ? "/" : $d;
+}
+
+func basename($p, $suffix = "") {
+    if ($p === "") { return "."; }
+    $q = trimSlashes($p);
+    if ($q === "/") { return "/"; }
+    $b = substr($q, lastSlash($q) + 1);
+    if ($suffix !== "" && $b !== $suffix && ends_with($b, $suffix)) { $b = substr($b, 0, strlen($b) - strlen($suffix)); }
+    return $b;
+}
+
+##
+ * Rozszerzenie ostatniego segmentu razem z kropką (".tar.gz" -> ".gz"); "" gdy brak. Ukryte pliki (".bashrc") nie mają rozszerzenia.
+##
+func ext($p) {
+    $b = basename($p);
+    $i = strlen($b) - 1;
+    while ($i > 0 && substr($b, $i, 1) !== ".") { $i--; }
+    if ($i <= 0) { return ""; }
+    return substr($b, $i);
+}
+
+func stem($p) {
+    $b = basename($p);
+    $e = ext($b);
+    return substr($b, 0, strlen($b) - strlen($e));
+}
+
+func withExt($p, $e) {
+    $old = ext($p);
+    $base = substr($p, 0, strlen($p) - strlen($old));
+    if ($e !== "" && substr($e, 0, 1) !== ".") { $e = "." . $e; }
+    return $base . $e;
+}
+
+func split($p) { return [dirname($p), basename($p)]; }
+
+##
+ * Ścieżka względna z $base do $target (obie bezwzględne albo obie względne).
+##
+func relative($base, $target) {
+    if (isAbs($base) !== isAbs($target)) { throw new Exception("Path.relative: obie ścieżki muszą być bezwzględne albo względne"); }
+    $b = parts(normalize($base));
+    $t = parts(normalize($target));
+    if (count($b) === 1 && $b[0] === ".") { $b = []; }
+    if (count($t) === 1 && $t[0] === ".") { $t = []; }
+    $i = 0;
+    while ($i < count($b) && $i < count($t) && $b[$i] === $t[$i]) { $i++; }
+    $out = [];
+    for ($j = $i; $j < count($b); $j++) { $out[] = ".."; }
+    for ($j = $i; $j < count($t); $j++) { $out[] = $t[$j]; }
+    $r = glue($out);
+    return $r === "" ? "." : $r;
+}
+
+func absolute($p, $cwd = null) {
+    if (isAbs($p)) { return normalize($p); }
+    if ($cwd === null) { $cwd = System.cwd(); }
+    return normalize($cwd . "/" . $p);
+}
+
+func isSubpath($parent, $child) {
+    $a = parts(normalize($parent));
+    $b = parts(normalize($child));
+    if (count($a) > count($b)) { return false; }
+    for ($i = 0; $i < count($a); $i++) { if ($a[$i] !== $b[$i]) { return false; } }
+    return true;
+}
+
+func expandHome($p) {
+    $h = System.env("HOME");
+    if ($h === null || $h === "") { return $p; }
+    if ($p === "~") { return $h; }
+    if (starts_with($p, "~/")) { return $h . substr($p, 1); }
+    return $p;
+}
