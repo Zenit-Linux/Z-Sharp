@@ -1,0 +1,17 @@
+import Std.Net;
+$r = Net.get("http://127.0.0.1:18099/hello?name=" . Net.urlEncode("Zażółć gęślą"));
+echo $r["status"], $r["reason"], $r["headers"]["x-test"], $r["body"];
+$r = Net.post("http://127.0.0.1:18099/p", "dane ąę", ["headers" => ["X-A" => "b"]]);
+echo $r["status"], $r["body"];
+$r = Net.get("http://127.0.0.1:18099/redir");
+echo $r["status"], $r["body"], $r["url"];
+$r = Net.get("http://127.0.0.1:18099/boom");
+echo $r["status"], $r["body"];
+$r = Net.request("PUT", "http://127.0.0.1:18099/j", ["json" => ["a" => 1]]);
+echo $r["body"];
+try { Net.get("https://x.example/"); } catch (Exception $e) { echo $e->getMessage(); }
+echo Net.urlDecode("a%20b+c%C5%BC", true), Net.urlEncode("a b/ż"), Net.buildQuery(["q" => "x y", "n" => 1]), Net.parseQuery("?a=1&b=%C5%BC+z")["b"];
+$u = Net.parseUrl("http://user@example.com:8080/a/b?x=1#f");
+echo $u["host"], $u["port"], $u["path"], $u["query"], $u["fragment"], $u["user"], Net.parseUrl("http://[::1]:81/")["host"];
+echo count(Net.resolve("localhost")) > 0;
+$l = Net.udpBind("127.0.0.1", 0); $p = Net.localAddr($l);
