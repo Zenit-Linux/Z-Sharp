@@ -1,0 +1,197 @@
+namespace Os;
+
+##
+ * Std.Os — system operacyjny: środowisko, katalog roboczy, pliki i katalogi, procesy.
+ *   Środowisko : platform, arch, cpus, hostname, pid, args, env, setEnv, unsetEnv, environ, cwd, chdir, home, tempDir, exit
+ *   System plików: exists, isFile, isDir, stat, size, readFile, readLines, writeFile, appendFile, mkdir, remove, removeAll,
+ *                  rename, copy, list, walk, realpath, chmod, symlink, readlink, mkdtemp
+ *   Procesy    : run, exec, shell, which
+ * Tekst jest UTF-8 (pliki binarne: bajty niepoprawne w UTF-8 są zamieniane w stage0 — patrz docs/STDLIB.md).
+##
+
+func platform() { return System.os(); }
+func arch() { return System.architecture(); }
+func cpus() { return System.cpuCount(); }
+func hostname() { return System.hostname(); }
+func pid() { return System.pid(); }
+
+##
+ * Argumenty programu (bez nazwy programu / skryptu).
+##
+func args() { return array_slice(System.args(), 1); }
+
+func env($name, $default = null) {
+    $v = System.env($name);
+    return $v === null ? $default : $v;
+}
+func setEnv($name, $value) { System.setEnv($name, strval($value)); return null; }
+func unsetEnv($name) { System.unsetEnv($name); return null; }
+func environ() { return System.environ(); }
+func cwd() { return System.cwd(); }
+func chdir($p) { System.chdir($p); return null; }
+
+func home() {
+    $h = System.env("HOME");
+    return ($h === null || $h === "") ? null : $h;
+}
+
+func tempDir() {
+    $t = System.env("TMPDIR");
+    return ($t === null || $t === "") ? "/tmp" : $t;
+}
+
+func exit($code = 0) { System.exit($code); }
+
+# ── system plików ──
+func stat($p) { return File.stat($p); }
+func isFile($p) { return File.exists($p); }
+func isDir($p) { return Directory.exists($p); }
+func exists($p) { return File.exists($p) || Directory.exists($p) || File.stat($p) !== null; }
+
+func size($p) {
+    $s = File.stat($p);
+    if ($s === null) { throw new Exception($p . ": nie istnieje"); }
+    return $s["size"];
+}
+
+func readFile($p) { return File.read($p); }
+func writeFile($p, $data) { File.write($p, $data); return null; }
+func appendFile($p, $data) { File.append($p, $data); return null; }
+
+##
+ * Linie pliku bez końcowych znaków nowej linii (obsługa \n i \r\n); ostatnia pusta linia (po końcowym \n) jest pomijana.
+##
+func readLines($p) {
+    $text = File.read($p);
+    $out = [];
+    $n = strlen($text);
+    $start = 0;
+    for ($i = 0; $i < $n; $i++) {
+        if (substr($text, $i, 1) === "\n") {
+            $e = $i;
+            if ($e > $start && substr($text, $e - 1, 1) === "\r") { $e--; }
+            $out[] = substr($text, $start, $e - $start);
+            $start = $i + 1;
+        }
+    }
+    if ($start < $n) { $out[] = substr($text, $start); }
+    return $out;
+}
+
+##
+ * Tworzy katalog razem z brakującymi rodzicami (jak mkdir -p).
+##
+func mkdir($p) { Directory.create($p); return null; }
+
+##
+ * Usuwa plik, dowiązanie albo pusty katalog.
+##
+func remove($p) {
+    $s = File.stat($p);
+    if ($s === null) { throw new Exception($p . ": nie istnieje"); }
+    if ($s["kind"] === "dir") { Directory.remove($p); } else { File.delete($p); }
+    return null;
+}
+
+##
+ * Usuwa rekurencyjnie (dowiązania symboliczne są usuwane, nie śledzone). Brak ścieżki nie jest błędem.
+##
+func removeAll($p) {
+    $s = File.stat($p);
+    if ($s === null) { return null; }
+    if ($s["kind"] === "dir") {
+        foreach (Directory.list($p) as $name) { removeAll($p . "/" . $name); }
+        Directory.remove($p);
+    } else {
+        File.delete($p);
+    }
+    return null;
+}
+
+func rename($from, $to) { File.rename($from, $to); return null; }
+
+func copy($from, $to) {
+    $s = File.stat($from);
+    if ($s === null) { throw new Exception($from . ": nie istnieje"); }
+    if ($s["kind"] === "dir") {
+        Directory.create($to);
+        foreach (Directory.list($from) as $name) { copy($from . "/" . $name, $to . "/" . $name); }
+    } else {
+        File.write($to, File.read($from));
+        File.chmod($to, $s["mode"]);
+    }
+    return null;
+}
+
+##
+ * Nazwy wpisów katalogu (posortowane).
+##
+func list($p) { return Directory.list($p); }
+
+##
+ * Wszystkie ścieżki pod katalogiem (rekurencyjnie, katalog przed zawartością); ścieżki zaczynają się od $p.
+##
+func walk($p) {
+    $out = [];
+    foreach (Directory.list($p) as $name) {
+        $full = $p . "/" . $name;
+        $out[] = $full;
+        $s = File.stat($full);
+        if ($s !== null && $s["kind"] === "dir") { foreach (walk($full) as $q) { $out[] = $q; } }
+    }
+    return $out;
+}
+
+func realpath($p) { return File.realpath($p); }
+func chmod($p, $mode) { File.chmod($p, $mode); return null; }
+func symlink($target, $link) { File.symlink($target, $link); return null; }
+func readlink($p) { return File.readlink($p); }
+
+##
+ * Tworzy unikalny katalog tymczasowy i zwraca jego ścieżkę.
+##
+func mkdtemp($prefix = "zs-") {
+    $p = tempDir() . "/" . $prefix . System.pid() . "-" . System.nowNanos();
+    Directory.create($p);
+    return $p;
+}
+
+# ── procesy ──
+
+##
+ * Uruchamia program (bez powłoki) i zbiera wyjście: ["status" => int, "stdout" => tekst, "stderr" => tekst].
+##
+func run($cmd, $args = []) { return Process.run($cmd, $args); }
+
+##
+ * Uruchamia program z odziedziczonymi stdin/stdout/stderr; zwraca kod wyjścia.
+##
+func exec($cmd, $args = []) { return Process.exec($cmd, $args); }
+
+##
+ * Uruchamia wiersz poleceń przez `/bin/sh -c` i zbiera wyjście (jak run).
+##
+func shell($line) { return Process.run("/bin/sh", ["-c", $line]); }
+
+##
+ * Szuka programu w $PATH; zwraca pełną ścieżkę albo null.
+##
+func which($cmd) {
+    if (contains($cmd, "/")) { return File.exists($cmd) ? $cmd : null; }
+    $path = System.env("PATH");
+    if ($path === null) { return null; }
+    $n = strlen($path);
+    $start = 0;
+    for ($i = 0; $i <= $n; $i++) {
+        if ($i === $n || substr($path, $i, 1) === ":") {
+            $dir = $i > $start ? substr($path, $start, $i - $start) : ".";
+            $start = $i + 1;
+            $cand = $dir . "/" . $cmd;
+            if (File.exists($cand)) {
+                $s = File.stat($cand);
+                if ($s !== null && ($s["mode"] & 73) !== 0) { return $cand; }
+            }
+        }
+    }
+    return null;
+}
