@@ -1,16 +1,36 @@
-#!/usr/bin/env bash
+#!/usr/bin/env zsi
 # Punkt stały: zsc (jako .zbc) kompiluje sam siebie. s1 == s2 == s3 (bajt w bajt), potem pakiet standalone.
-set -euo pipefail
-. "$(dirname "$0")/lib.sh"; ensure_stage0
-[ -n "$ZSC_DIR" ] || { echo "fixpoint: nie znaleziono repo zsc (ustaw ZSC_DIR)"; exit 1; }
-link_workspace; trap unlink_workspace EXIT
-T="$(mktemp -d)"; trap 'unlink_workspace; rm -rf "$T"' EXIT
-SRC="$ZSC_DIR/src/main.zsharp"
-"$ZSC0" run "$SRC" build "$SRC" --emit zbc -o "$T/s1.zbc" >/dev/null     # stage0 (Rust) -> s1
-"$ZSC0" exec "$T/s1.zbc" build "$SRC" --emit zbc -o "$T/s2.zbc" >/dev/null # s1 -> s2
-"$ZSC0" exec "$T/s2.zbc" build "$SRC" --emit zbc -o "$T/s3.zbc" >/dev/null # s2 -> s3
-cmp "$T/s1.zbc" "$T/s2.zbc" && cmp "$T/s2.zbc" "$T/s3.zbc" && echo "fixpoint: s1 == s2 == s3 ($(wc -c <"$T/s3.zbc") B)"
-# samodzielna binarka zsc (runtime + zbc), bez Rusta w ścieżce użytkownika
-"$ZSC0" bundle "$T/s3.zbc" -o "$T/zsc" >/dev/null
-echo 'echo "fixpoint-ok", 40 + 2;' > "$T/p.zs"
-"$T/zsc" build "$T/p.zs" -o "$T/p" >/dev/null && [ "$("$T/p")" = "fixpoint-ok 42" ] && echo "standalone zsc: buduje i uruchamia program natywny"
+import Std.Os;
+import Workspace.Scripts;
+
+func main() {
+    Scripts.ensureStage0();
+    $z = Scripts.zsc0();
+    $zscDir = Scripts.requireZscDir("fixpoint");
+    $created = Scripts.linkWorkspace($zscDir);
+    $t = Scripts.tmp();
+    $src = $zscDir . "/src/main.zsharp";
+    try {
+        Scripts.must("stage0 -> s1", $z, ["run", $src, "build", $src, "--emit", "zbc", "-o", $t . "/s1.zbc"]);
+        Scripts.must("s1 -> s2", $z, ["exec", $t . "/s1.zbc", "build", $src, "--emit", "zbc", "-o", $t . "/s2.zbc"]);
+        Scripts.must("s2 -> s3", $z, ["exec", $t . "/s2.zbc", "build", $src, "--emit", "zbc", "-o", $t . "/s3.zbc"]);
+        if (!Scripts.sameFile($t . "/s1.zbc", $t . "/s2.zbc") || !Scripts.sameFile($t . "/s2.zbc", $t . "/s3.zbc")) {
+            Scripts.die("fixpoint: s1, s2, s3 różnią się");
+        }
+        echo "fixpoint: s1 == s2 == s3 (" . Scripts.fileSize($t . "/s3.zbc") . " B)";
+        # samodzielna binarka zsc (runtime + zbc), bez Rusta w ścieżce użytkownika
+        Scripts.must("bundle", $z, ["bundle", $t . "/s3.zbc", "-o", $t . "/zsc"]);
+        Os.writeFile($t . "/p.zs", "echo \"fixpoint-ok\", 40 + 2;\n");
+        Scripts.must("standalone zsc build", $t . "/zsc", ["build", $t . "/p.zs", "-o", $t . "/p"]);
+        if (trim(Scripts.must("uruchomienie programu", $t . "/p")) !== "fixpoint-ok 42") { Scripts.die("standalone zsc: zły wynik programu"); }
+        echo "standalone zsc: buduje i uruchamia program natywny";
+    } catch (Exception $e) {
+        Scripts.unlinkWorkspace($zscDir, $created);
+        Os.removeAll($t);
+        throw $e;
+    }
+    Scripts.unlinkWorkspace($zscDir, $created);
+    Os.removeAll($t);
+}
+
+main();
