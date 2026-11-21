@@ -1,0 +1,14 @@
+# M3: statyczne pola klas
+class Counter {
+    public static $n = 0;
+    public static $log = [];
+    const STEP = 2;
+    static func bump() { self.n += Counter.STEP; self.log[] = self.n; return self.n; }
+}
+class Sub extends Counter { }
+echo Counter.bump(), Counter.bump();
+Counter.n = 10;
+echo Counter.bump(), Counter.n;
+echo count(Counter.log), Counter.log[2];
+Sub.bump();
+echo Counter.n;
