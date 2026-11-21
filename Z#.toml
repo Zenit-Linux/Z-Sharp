@@ -23,16 +23,19 @@ runtime     = "runtime/main.zsharp"
 ir          = "lib/ir.zsharp"
 link        = "lib/link.zsharp"
 classes     = "lib/classes.zsharp"
+closures    = "lib/closures.zsharp"
+prelude     = "lib/prelude.zsharp"
 emit_c      = "lib/emit_c.zsharp"
 emit_llvm   = "lib/emit_llvm.zsharp"
 manifest    = "lib/manifest.zsharp"
+Scripts     = "scripts/lib.zsharp"
 
 [bootstrap]
 stage0 = "stage0"             # interpreter AST w Rust (zsc0)
 stage1 = "lib/parser.zsharp"  # frontend napisany w Z#, uruchamiany przez stage0
 zbc    = "lib/zbc.zsharp"     # kontener .zbc: program bez źródeł, wykonywany przez `zsc0 exec`
-parity = ["tests/lexer_parity.sh", "tests/parser_parity.sh"]
-fixpoint = "scripts/fixpoint.sh"   # zsc kompiluje sam siebie; stage1 == stage2 == stage3
+parity = ["scripts/tests/lexer_parity.zsharp", "scripts/tests/parser_parity.zsharp"]
+fixpoint = "scripts/fixpoint.zsharp"   # zsc kompiluje sam siebie; stage1 == stage2 == stage3
 
 [memory]                      # domyślna konfiguracja ZAMM (zob. zamm/README.md)
 chunk-kib       = 64
