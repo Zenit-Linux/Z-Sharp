@@ -1,5 +1,21 @@
 # Zmiany (wersja pozostaje 0.0.1)
 
+## Sesja „M3 domknięty, M5 stdlib, skrypty w Z#"
+- **M3 (domknięcia i nie tylko) w backendach natywnych**: `lib/closures.zsharp` (lifting domknięć z przechwyceniem przez wartość, funkcje strzałkowe,
+  wywołania wartości `$f(...)`, `zs_call`/`zs_spread`), argumenty nazwane i spread także dla metod (`zs_invoke_n`), pola statyczne (`zs_sget/zs_sset`),
+  funkcje wyższego rzędu `map/filter/reduce/each/find/any/all/sum/usort` (`lib/prelude.zsharp` w Z# dla C/LLVM; wbudowane w stage0). Testy: `tests/m3/`.
+- **M5 — biblioteka standardowa** (`stdlib/`, `docs/STDLIB.md`): `Std.Json`, `Std.Toml`, `Std.Regex`, `Std.Time`, `Std.Path`, `Std.Os`, `Std.Net`
+  (TCP/UDP/DNS, URL, klient i serwer HTTP/1.1; bez TLS). Działają identycznie w interpreterze, C i LLVM. Testy: `tests/std/`.
+- Nowe prymitywy w stage0 i runtime C: `System.{setEnv,unsetEnv,environ,cwd,chdir,pid,hostname,nowNanos,monotonic,sleep,localOffset,bytes,fromBytes}`,
+  `File.{stat,rename,realpath,chmod,symlink,readlink}`, `Directory.remove`, moduł `Socket`. Deklaracje LLVM generowane z `IrTables.MODULES`.
+- stage0: `zsc0 bundle`, import `Std.X` (stdlib wkompilowana + cache), poprawiony alias runtime w `stage0/Cargo.toml`.
+- **Skrypty w Z# (shebang `#!/usr/bin/env zsi`)**: `scripts/{bootstrap,core_status,fixpoint,stage3,lib}.zsharp` zastępują `.sh`;
+  `scripts/tests/{lexer_parity,parser_parity,run_all}.zsharp` — prawdziwy Z# (poprzednio bash/pusty plik). Wspólna biblioteka: `import Workspace.Scripts;`.
+- `scripts/Linux-Distributions/{install,remove}.sh`: instalacja/usuwanie `zsi zzc zsc zst` na dowolnej dystrybucji; wersja z `Z#.toml` narzędzia,
+  binarka z `releases/download/<wersja>/<narzędzie>`; `--immutable` (także `--immuntable`) → `$HOME/.local/bin`.
+- Workflowy `build.yml` w zsc/zsi/zst/zzc: instalator Z# + budowa ze źródeł + test dymny + artefakt/asset wydania. `zzc/Z#.toml` uzupełniony;
+  zależności narzędzi wskazują `Zenit-Linux/Z-Sharp`.
+
 ## Sesja „klasy natywnie i stage3"
 - `lib/classes.zsharp`: lowering klas do funkcji (obiekty jako uchwyty `ZS_OBJ` z tablicą pól; `new` → `Klasa__new`, metody → `Klasa__m($this,…)`, dyspozytor `zs_invoke`, `zs_isa`, stałe wstawiane, `parent.`/`Klasa.statyczna()` statycznie); klasy wyjątków (`extends Exception/Error`, catch → łańcuch `zs_isa`); zapis `$o->pole[...] = v` bez kopiowania tablicy (`zs_obj_take/put`).
 - Wariadyczne `...$x` (pakowanie argumentów), `System.version`, `System.resolveImport` w runtime C.
