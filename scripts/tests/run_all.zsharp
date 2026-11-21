@@ -1,1 +1,116 @@
+#!/usr/bin/env zsi
+# Uruchamia wszystkie testy rdzenia:
+#   1. testy złote (tests/, tests/m3/, tests/std/): `zsc0 run X.zsharp` == X.out (stdout + stderr)
+#   2. test sieciowy Std.Net (serwer w tle + klient)
+#   3. parytet leksera i parsera (scripts/tests/lexer_parity.zsharp, parser_parity.zsharp)
+# Opcje: --native  dodatkowo porównuje wynik programu zbudowanego backendem C (wymaga repo zsc)
+#        --filter=tekst  tylko testy, których ścieżka zawiera tekst
+import Std.Os;
+import Workspace.Scripts;
 
+func goldenTests($r) {
+    $out = [];
+    foreach (["tests", "tests/m3", "tests/std"] as $d) {
+        foreach (Scripts.filesIn($r . "/" . $d, ".zsharp") as $f) {
+            $stem = substr($f, 0, strlen($f) - 7);
+            if (Os.isFile($stem . ".out") && !contains($f, "net_client")) { $out[] = $f; }
+        }
+    }
+    return $out;
+}
+
+# `X_sample.zsharp` to wejście dla `X_cli.zsharp` (np. sema_sample dla sema_cli); pozostałe testy uruchamiają się same
+func runArgs($f) {
+    if (ends_with($f, "_sample.zsharp")) {
+        return ["run", substr($f, 0, strlen($f) - 14) . "_cli.zsharp", $f];
+    }
+    return ["run", $f];
+}
+
+func expected($f) { return Os.readFile(substr($f, 0, strlen($f) - 7) . ".out"); }
+
+func report($name, $ok, $detail = "") {
+    echo ($ok ? "  ok    " : "  BŁĄD  ") . $name;
+    if (!$ok && $detail !== "") { echo $detail; }
+    return $ok;
+}
+
+func firstDiff($want, $got) {
+    $a = split($want, "\n");
+    $b = split($got, "\n");
+    $n = Math.max(count($a), count($b));
+    for ($i = 0; $i < $n; $i++) {
+        $x = $i < count($a) ? $a[$i] : "<brak>";
+        $y = $i < count($b) ? $b[$i] : "<brak>";
+        if ($x !== $y) { return "    linia " . ($i + 1) . ":\n      oczekiwano: " . $x . "\n      otrzymano:  " . $y; }
+    }
+    return "";
+}
+
+func nativeOutput($zscDir, $z, $f, $tmp) {
+    $r = Scripts.sh($z, ["run", $zscDir . "/src/main.zsharp", "build", $f, "-o", $tmp . "/prog", "--backend", "c"]);
+    if ($r["status"] !== 0) { return "BUDOWANIE NIE POWIODŁO SIĘ:\n" . Scripts.combined($r); }
+    return Scripts.combined(Scripts.sh($tmp . "/prog"));
+}
+
+# Std.Net: serwer (tests/std/net_server.zsharp, 6 żądań) w tle + klient; porównanie z net_client.out
+func netTest($r, $z) {
+    $dir = $r . "/tests/std";
+    Os.shell("'" . $z . "' run '" . $dir . "/net_server.zsharp' >/dev/null 2>&1 &");
+    Os.run("sleep", ["1"]);
+    $got = Scripts.combined(Scripts.sh($z, ["run", $dir . "/net_client.zsharp"]));
+    $want = Os.readFile($dir . "/net_client.out");
+    return report("tests/std/net_client (serwer + klient)", $got === $want, firstDiff($want, $got));
+}
+
+func main() {
+    Scripts.ensureStage0();
+    $z = Scripts.zsc0();
+    $r = Scripts.root();
+    $native = false;
+    $filter = "";
+    foreach (Os.args() as $a) {
+        if ($a === "--native") { $native = true; }
+        else if (starts_with($a, "--filter=")) { $filter = substr($a, 9, strlen($a) - 9); }
+        else { Scripts.die("nieznana opcja: " . $a); }
+    }
+    $zscDir = $native ? Scripts.requireZscDir("run_all --native") : null;
+    $created = $native ? Scripts.linkWorkspace($zscDir) : false;
+    $tmp = Scripts.tmp();
+    $fail = 0;
+    $total = 0;
+    Scripts.step("testy złote");
+    foreach (goldenTests($r) as $f) {
+        $name = substr($f, strlen($r) + 1, strlen($f) - strlen($r) - 1);
+        if ($filter !== "" && !contains($name, $filter)) { continue; }
+        $total++;
+        $got = Scripts.combined(Scripts.sh($z, runArgs($f)));
+        $want = expected($f);
+        $ok = report($name, $got === $want, firstDiff($want, $got));
+        if ($ok && $native && !ends_with($f, "_sample.zsharp")) {
+            $ng = nativeOutput($zscDir, $z, $f, $tmp);
+            $ok = report($name . " [natywny C]", $ng === $want, firstDiff($want, $ng));
+        }
+        if (!$ok) { $fail++; }
+    }
+    if ($filter === "" || contains("net", $filter)) {
+        Scripts.step("test sieciowy");
+        $total++;
+        if (!netTest($r, $z)) { $fail++; }
+    }
+    if ($native) { Scripts.unlinkWorkspace($zscDir, $created); }
+    Os.removeAll($tmp);
+    if ($filter === "") {
+        Scripts.step("parytet leksera i parsera");
+        foreach (["lexer_parity", "parser_parity"] as $p) {
+            $total++;
+            $code = Scripts.inherit($z, ["run", $r . "/scripts/tests/" . $p . ".zsharp"]);
+            if ($code !== 0) { $fail++; }
+        }
+    }
+    echo "";
+    if ($fail > 0) { echo "run_all: " . $fail . " z " . $total . " grup testów NIE przeszło"; Os.exit(1); }
+    echo "run_all: " . $total . " grup testów OK";
+}
+
+main();
