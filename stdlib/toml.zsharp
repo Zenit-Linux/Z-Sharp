@@ -1,0 +1,521 @@
+namespace Toml;
+
+##
+ * Std.Toml — TOML 1.0 (parser i serializator).
+ *   decode($tekst)  -> tablica asocjacyjna; tablice TOML => tablice asocjacyjne, tablice-listy => listy
+ *   encode($tablica) -> tekst TOML
+ * Mapowanie typów: string => string, integer => int (dec/hex/oct/bin, `_`), float => float (inf/nan też), boolean => bool,
+ *   data/czas (offset/local date-time, local date, local time) => string w oryginalnym zapisie (bez interpretacji; Std.Time.parseIso je zrozumie).
+ * Ograniczenia: pusta tablica i pusta tabela są nierozróżnialne (`[]`); klucz będący zapisem liczby całkowitej ("7") staje się kluczem int
+ * (zasada tablic Z#); encode zapisuje daty jako zwykłe teksty. Błędy: Exception `Toml.decode: ... (linia L, kolumna K)`.
+##
+
+func lineCol($s, $pos) {
+    $line = 1;
+    $col = 1;
+    for ($i = 0; $i < $pos && $i < strlen($s); $i++) {
+        if (substr($s, $i, 1) === "\n") { $line++; $col = 1; } else { $col++; }
+    }
+    return [$line, $col];
+}
+
+func fail($s, $pos, $msg) {
+    $lc = lineCol($s, $pos);
+    throw new Exception("Toml.decode: " . $msg . " (linia " . $lc[0] . ", kolumna " . $lc[1] . ")");
+}
+
+func isDigit($c) { return $c !== "" && index_of("0123456789", $c) >= 0; }
+func isBare($c) { return $c !== "" && strlen($c) === 1 && (is_alpha($c) || is_digit($c) || $c === "_" || $c === "-"); }
+
+# spacje/tabulatory w linii
+func skipWs($s, $i, $n) {
+    while ($i < $n) {
+        $c = substr($s, $i, 1);
+        if ($c === " " || $c === "\t") { $i++; } else { break; }
+    }
+    return $i;
+}
+
+# spacje, nowe linie i komentarze (wewnątrz tablic) albo tylko spacje i komentarz do końca linii
+func skipAll($s, $i, $n) {
+    while ($i < $n) {
+        $c = substr($s, $i, 1);
+        if ($c === " " || $c === "\t" || $c === "\n" || $c === "\r") { $i++; }
+        else if ($c === "#") { while ($i < $n && substr($s, $i, 1) !== "\n") { $i++; } }
+        else { break; }
+    }
+    return $i;
+}
+
+func hexN($s, $i, $w, $n) {
+    if ($i + $w > $n) { fail($s, $i, "za krótka sekwencja \\u"); }
+    $v = 0;
+    for ($k = 0; $k < $w; $k++) {
+        $h = index_of("0123456789abcdef", lower(substr($s, $i + $k, 1)));
+        if ($h < 0) { fail($s, $i + $k, "niepoprawna cyfra szesnastkowa"); }
+        $v = $v * 16 + $h;
+    }
+    return $v;
+}
+
+# tekst podstawowy; $multi => """..."""; $i wskazuje na pierwszy znak PO otwarciu
+func basicString($s, $i, $n, $multi) {
+    $parts = [];
+    $start = $i;
+    if ($multi) {
+        if (substr($s, $i, 2) === "\r\n") { $i += 2; $start = $i; }
+        else if (substr($s, $i, 1) === "\n") { $i++; $start = $i; }
+    }
+    while (true) {
+        if ($i >= $n) { fail($s, $i, "nieterminowany tekst"); }
+        $c = substr($s, $i, 1);
+        if ($multi) {
+            if ($c === "\"" && substr($s, $i, 3) === "\"\"\"") {
+                $j = $i + 3;
+                while ($j < $n && substr($s, $j, 1) === "\"" && $j - $i < 5) { $j++; }
+                $extra = $j - $i - 3;
+                $parts[] = substr($s, $start, $i - $start + $extra);
+                return [join($parts, ""), $j];
+            }
+        } else {
+            if ($c === "\"") { $parts[] = substr($s, $start, $i - $start); return [join($parts, ""), $i + 1]; }
+            if ($c === "\n") { fail($s, $i, "nowa linia w tekście jednoliniowym"); }
+        }
+        if ($c === "\\") {
+            $parts[] = substr($s, $start, $i - $start);
+            if ($i + 1 >= $n) { fail($s, $i, "nieterminowany tekst"); }
+            $e = substr($s, $i + 1, 1);
+            $i += 2;
+            if ($e === "n") { $parts[] = "\n"; }
+            else if ($e === "t") { $parts[] = "\t"; }
+            else if ($e === "r") { $parts[] = "\r"; }
+            else if ($e === "b") { $parts[] = chr(8); }
+            else if ($e === "f") { $parts[] = chr(12); }
+            else if ($e === "e") { $parts[] = chr(27); }
+            else if ($e === "\\") { $parts[] = "\\"; }
+            else if ($e === "\"") { $parts[] = "\""; }
+            else if ($e === "u") { $parts[] = chr(hexN($s, $i, 4, $n)); $i += 4; }
+            else if ($e === "U") { $parts[] = chr(hexN($s, $i, 8, $n)); $i += 8; }
+            else if ($multi && ($e === "\n" || $e === " " || $e === "\t" || $e === "\r")) {
+                # "line ending backslash": usuwa białe znaki do następnego widocznego znaku
+                $j = $i - 1;
+                while ($j < $n && (substr($s, $j, 1) === " " || substr($s, $j, 1) === "\t")) { $j++; }
+                if ($j < $n && substr($s, $j, 1) === "\r") { $j++; }
+                if ($j >= $n || substr($s, $j, 1) !== "\n") { fail($s, $i - 1, "niepoprawna sekwencja ucieczki"); }
+                while ($j < $n && index_of(" \t\r\n", substr($s, $j, 1)) >= 0) { $j++; }
+                $i = $j;
+            } else { fail($s, $i - 1, "niepoprawna sekwencja ucieczki \\" . $e); }
+            $start = $i;
+            continue;
+        }
+        if (ord($c) < 32 && $c !== "\t" && !($multi && ($c === "\n" || $c === "\r"))) { fail($s, $i, "znak sterujący w tekście"); }
+        $i++;
+    }
+    return [null, $i];
+}
+
+func literalString($s, $i, $n, $multi) {
+    if ($multi) {
+        if (substr($s, $i, 2) === "\r\n") { $i += 2; }
+        else if (substr($s, $i, 1) === "\n") { $i++; }
+        $start = $i;
+        while ($i < $n) {
+            if (substr($s, $i, 1) === "'" && substr($s, $i, 3) === "'''") {
+                $j = $i + 3;
+                while ($j < $n && substr($s, $j, 1) === "'" && $j - $i < 5) { $j++; }
+                return [substr($s, $start, $j - 3 - $start), $j];
+            }
+            $i++;
+        }
+        fail($s, $i, "nieterminowany tekst");
+    }
+    $start = $i;
+    while ($i < $n) {
+        $c = substr($s, $i, 1);
+        if ($c === "'") { return [substr($s, $start, $i - $start), $i + 1]; }
+        if ($c === "\n") { break; }
+        $i++;
+    }
+    fail($s, $i, "nieterminowany tekst");
+}
+
+func parseStr($s, $i, $n) {
+    $c = substr($s, $i, 1);
+    if ($c === "\"") {
+        if (substr($s, $i, 3) === "\"\"\"") { return basicString($s, $i + 3, $n, true); }
+        return basicString($s, $i + 1, $n, false);
+    }
+    if (substr($s, $i, 3) === "'''") { return literalString($s, $i + 3, $n, true); }
+    return literalString($s, $i + 1, $n, false);
+}
+
+# klucz (być może kropkowany) -> [lista kluczy, nowa pozycja]
+func parseKey($s, $i, $n) {
+    $keys = [];
+    while (true) {
+        $i = skipWs($s, $i, $n);
+        $c = substr($s, $i, 1);
+        if ($c === "\"" || $c === "'") {
+            $r = parseStr($s, $i, $n);
+            $keys[] = $r[0];
+            $i = $r[1];
+        } else {
+            $j = $i;
+            while ($j < $n && isBare(substr($s, $j, 1))) { $j++; }
+            if ($j === $i) { fail($s, $i, "oczekiwano klucza"); }
+            $keys[] = substr($s, $i, $j - $i);
+            $i = $j;
+        }
+        $i = skipWs($s, $i, $n);
+        if ($i < $n && substr($s, $i, 1) === ".") { $i++; continue; }
+        break;
+    }
+    return [$keys, $i];
+}
+
+func looksDate($tok) {
+    $n = strlen($tok);
+    if ($n >= 8 && substr($tok, 2, 1) === ":" && isDigit(substr($tok, 0, 1))) { return true; }
+    return $n >= 10 && substr($tok, 4, 1) === "-" && substr($tok, 7, 1) === "-" && isDigit(substr($tok, 0, 1));
+}
+
+func parseNumber($s, $i, $n, $tok, $at) {
+    $t = $tok;
+    $neg = false;
+    $sign = false;
+    $c0 = substr($t, 0, 1);
+    if ($c0 === "+" || $c0 === "-") { $neg = $c0 === "-"; $t = substr($t, 1, strlen($t) - 1); $sign = true; }
+    if ($t === "inf") { $v = 1.0e308 * 10.0; return $neg ? -$v : $v; }
+    if ($t === "nan") { return Math.sqrt(-1.0); }
+    if ($t === "") { fail($s, $at, "niepoprawna liczba"); }
+    $pre = substr($t, 0, 2);
+    if (!$sign && ($pre === "0x" || $pre === "0o" || $pre === "0b")) {
+        $base = $pre === "0x" ? 16 : ($pre === "0o" ? 8 : 2);
+        $digs = "0123456789abcdef";
+        $v = 0;
+        $prevUs = true;
+        for ($k = 2; $k < strlen($t); $k++) {
+            $ch = lower(substr($t, $k, 1));
+            if ($ch === "_") { if ($prevUs) { fail($s, $at, "niepoprawne `_` w liczbie"); } $prevUs = true; continue; }
+            $d = index_of($digs, $ch);
+            if ($d < 0 || $d >= $base) { fail($s, $at, "niepoprawna liczba " . $tok); }
+            $v = $v * $base + $d;
+            $prevUs = false;
+        }
+        if (strlen($t) === 2 || $prevUs) { fail($s, $at, "niepoprawna liczba " . $tok); }
+        return $v;
+    }
+    $isFloat = false;
+    $clean = [];
+    $prev = "_";
+    $len = strlen($t);
+    for ($k = 0; $k < $len; $k++) {
+        $ch = substr($t, $k, 1);
+        if ($ch === "_") {
+            if (!isDigit($prev) || $k + 1 >= $len || !isDigit(substr($t, $k + 1, 1))) { fail($s, $at, "niepoprawne `_` w liczbie"); }
+            $prev = $ch;
+            continue;
+        }
+        if ($ch === "." || $ch === "e" || $ch === "E") { $isFloat = true; }
+        else if (!isDigit($ch) && !(($ch === "+" || $ch === "-") && ($prev === "e" || $prev === "E"))) { fail($s, $at, "niepoprawna liczba " . $tok); }
+        $clean[] = $ch;
+        $prev = $ch;
+    }
+    $txt = join($clean, "");
+    if (!$isFloat) {
+        if (strlen($txt) > 1 && substr($txt, 0, 1) === "0") { fail($s, $at, "zera wiodące w liczbie " . $tok); }
+        $v = intval($txt);
+        return $neg ? -$v : $v;
+    }
+    if (substr($txt, 0, 1) === "." || substr($txt, strlen($txt) - 1, 1) === "." || contains($txt, ".e") || contains($txt, ".E") || contains($txt, "..")) { fail($s, $at, "niepoprawna liczba " . $tok); }
+    if (strlen($txt) > 1 && substr($txt, 0, 1) === "0" && isDigit(substr($txt, 1, 1))) { fail($s, $at, "zera wiodące w liczbie " . $tok); }
+    $v = floatval($txt);
+    return $neg ? -$v : $v;
+}
+
+func parseValue($s, $i, $n, $depth) {
+    if ($depth > 256) { fail($s, $i, "zbyt głębokie zagnieżdżenie"); }
+    if ($i >= $n) { fail($s, $i, "oczekiwano wartości"); }
+    $c = substr($s, $i, 1);
+    if ($c === "\"" || $c === "'") { return parseStr($s, $i, $n); }
+    if ($c === "[") {
+        $arr = [];
+        $i++;
+        while (true) {
+            $i = skipAll($s, $i, $n);
+            if ($i >= $n) { fail($s, $i, "niedomknięta tablica"); }
+            if (substr($s, $i, 1) === "]") { return [$arr, $i + 1]; }
+            $r = parseValue($s, $i, $n, $depth + 1);
+            $arr[] = $r[0];
+            $i = skipAll($s, $r[1], $n);
+            $d = substr($s, $i, 1);
+            if ($d === ",") { $i++; continue; }
+            if ($d === "]") { return [$arr, $i + 1]; }
+            fail($s, $i, "oczekiwano `,` lub `]`");
+        }
+    }
+    if ($c === "{") {
+        $tbl = [];
+        $i = skipWs($s, $i + 1, $n);
+        if (substr($s, $i, 1) === "}") { return [$tbl, $i + 1]; }
+        while (true) {
+            $i = skipWs($s, $i, $n);
+            $kr = parseKey($s, $i, $n);
+            $i = skipWs($s, $kr[1], $n);
+            if (substr($s, $i, 1) !== "=") { fail($s, $i, "oczekiwano `=`"); }
+            $vr = parseValue($s, skipWs($s, $i + 1, $n), $n, $depth + 1);
+            $tbl = setIn($s, $i, $tbl, $kr[0], 0, $vr[0]);
+            $i = skipWs($s, $vr[1], $n);
+            $d = substr($s, $i, 1);
+            if ($d === ",") { $i++; continue; }
+            if ($d === "}") { return [$tbl, $i + 1]; }
+            fail($s, $i, "oczekiwano `,` lub `}`");
+        }
+    }
+    $j = $i;
+    while ($j < $n) {
+        $ch = substr($s, $j, 1);
+        if ($ch === "," || $ch === "]" || $ch === "}" || $ch === "#" || $ch === "\n" || $ch === "\r") { break; }
+        if (($ch === " " || $ch === "\t")) {
+            # data i czas mogą być rozdzielone spacją: "1979-05-27 07:32:00"
+            if ($j - $i === 10 && looksDate(substr($s, $i, 10)) && isDigit(substr($s, $j + 1, 1))) { $j++; continue; }
+            break;
+        }
+        $j++;
+    }
+    $tok = substr($s, $i, $j - $i);
+    if ($tok === "") { fail($s, $i, "oczekiwano wartości"); }
+    if ($tok === "true") { return [true, $j]; }
+    if ($tok === "false") { return [false, $j]; }
+    if (looksDate($tok)) { return [$tok, $j]; }
+    return [parseNumber($s, $i, $n, $tok, $i), $j];
+}
+
+# ── model dokumentu ──
+##
+ * Ustawia $v pod ścieżką $path[$k..] w $node (zwraca nowy węzeł). Elementy-listy (tablice tabel) wybiera ostatni element.
+##
+func setIn($s, $pos, $node, $path, $k, $v) {
+    $key = $path[$k];
+    $last = $k === count($path) - 1;
+    if ($last) {
+        if (has_key($node, $key)) { fail($s, $pos, "klucz `" . strval($key) . "` jest już zdefiniowany"); }
+        $node[$key] = $v;
+        return $node;
+    }
+    $child = has_key($node, $key) ? $node[$key] : [];
+    if (!is_array($child)) { fail($s, $pos, "`" . strval($key) . "` nie jest tabelą"); }
+    $node[$key] = setIn($s, $pos, $child, $path, $k + 1, $v);
+    return $node;
+}
+
+# zwraca tabelę pod ścieżką (wiele indeksów int = elementy tablic tabel)
+func getIn($node, $path, $k) {
+    if ($k >= count($path)) { return $node; }
+    return getIn($node[$path[$k]], $path, $k + 1);
+}
+
+func putIn($node, $path, $k, $v) {
+    if ($k >= count($path)) { return $v; }
+    $key = $path[$k];
+    $node[$key] = putIn($node[$key], $path, $k + 1, $v);
+    return $node;
+}
+
+func isTableList($v) {
+    if (!is_array($v) || count($v) === 0) { return false; }
+    $i = 0;
+    foreach ($v as $k => $x) {
+        if ($k !== $i || !is_array($x)) { return false; }
+        $i++;
+    }
+    return true;
+}
+
+##
+ * Rozwiązuje nagłówek [a.b.c]: przechodzi po kluczach, wchodząc w ostatni element tablic tabel; tworzy brakujące tabele.
+ * Zwraca [root, konkretna ścieżka z indeksami].
+##
+func resolve($s, $pos, $root, $keys, $arrayHeader) {
+    $path = [];
+    $cur = $root;
+    $cnt = count($keys);
+    for ($i = 0; $i < $cnt; $i++) {
+        $key = $keys[$i];
+        $isLast = $i === $cnt - 1;
+        if (!has_key($cur, $key)) {
+            if ($isLast && $arrayHeader) {
+                $cur[$key] = [[]];
+                $root = putIn($root, $path, 0, $cur);
+                $path[] = $key;
+                $path[] = 0;
+                return [$root, $path];
+            }
+            $cur[$key] = [];
+            $root = putIn($root, $path, 0, $cur);
+        }
+        $nxt = $cur[$key];
+        if (!is_array($nxt)) { fail($s, $pos, "`" . strval($key) . "` nie jest tabelą"); }
+        if ($isLast && $arrayHeader) {
+            if (!isTableList($nxt)) { fail($s, $pos, "`" . strval($key) . "` nie jest tablicą tabel"); }
+            $nxt[] = [];
+            $cur[$key] = $nxt;
+            $root = putIn($root, $path, 0, $cur);
+            $path[] = $key;
+            $path[] = count($nxt) - 1;
+            return [$root, $path];
+        }
+        $path[] = $key;
+        if (isTableList($nxt)) {
+            $idx = count($nxt) - 1;
+            $path[] = $idx;
+            $cur = $nxt[$idx];
+        } else { $cur = $nxt; }
+    }
+    return [$root, $path];
+}
+
+func decode($s) {
+    $n = strlen($s);
+    $root = [];
+    $ctx = [];
+    $declared = [];
+    $i = 0;
+    while (true) {
+        $i = skipAll($s, $i, $n);
+        if ($i >= $n) { break; }
+        $c = substr($s, $i, 1);
+        if ($c === "[") {
+            $isArr = substr($s, $i + 1, 1) === "[";
+            $kr = parseKey($s, $i + ($isArr ? 2 : 1), $n);
+            $j = skipWs($s, $kr[1], $n);
+            $close = $isArr ? "]]" : "]";
+            if (substr($s, $j, strlen($close)) !== $close) { fail($s, $j, "oczekiwano `" . $close . "`"); }
+            $i = $j + strlen($close);
+            $sig = join($kr[0], chr(0));
+            if (!$isArr) {
+                if (has_key($declared, $sig)) { fail($s, $j, "tabela [" . join($kr[0], ".") . "] zdefiniowana ponownie"); }
+                $declared[$sig] = true;
+            }
+            $r = resolve($s, $j, $root, $kr[0], $isArr);
+            $root = $r[0];
+            $ctx = $r[1];
+        } else {
+            $kr = parseKey($s, $i, $n);
+            $j = skipWs($s, $kr[1], $n);
+            if (substr($s, $j, 1) !== "=") { fail($s, $j, "oczekiwano `=`"); }
+            $vr = parseValue($s, skipWs($s, $j + 1, $n), $n, 0);
+            $tbl = getIn($root, $ctx, 0);
+            $tbl = setIn($s, $j, $tbl, $kr[0], 0, $vr[0]);
+            $root = putIn($root, $ctx, 0, $tbl);
+            $i = skipWs($s, $vr[1], $n);
+        }
+        if ($i < $n) {
+            $d = substr($s, $i, 1);
+            if ($d === "#") { while ($i < $n && substr($s, $i, 1) !== "\n") { $i++; } }
+            else if ($d !== "\n" && $d !== "\r") { fail($s, $i, "oczekiwano końca linii"); }
+        }
+    }
+    return $root;
+}
+
+# ── serializator ──
+func quote($v) {
+    $out = [];
+    $start = 0;
+    $n = strlen($v);
+    for ($i = 0; $i < $n; $i++) {
+        $c = substr($v, $i, 1);
+        $o = ord($c);
+        $esc = null;
+        if ($c === "\"") { $esc = "\\\""; }
+        else if ($c === "\\") { $esc = "\\\\"; }
+        else if ($c === "\n") { $esc = "\\n"; }
+        else if ($c === "\t") { $esc = "\\t"; }
+        else if ($c === "\r") { $esc = "\\r"; }
+        else if ($o < 32 || $o === 127) { $esc = "\\u" . pad_left(to_hex($o), 4, "0"); }
+        if ($esc !== null) {
+            if ($i > $start) { $out[] = substr($v, $start, $i - $start); }
+            $out[] = $esc;
+            $start = $i + 1;
+        }
+    }
+    if ($n > $start) { $out[] = substr($v, $start, $n - $start); }
+    return "\"" . join($out, "") . "\"";
+}
+
+func keyText($k) {
+    $s = strval($k);
+    $ok = strlen($s) > 0;
+    for ($i = 0; $i < strlen($s); $i++) { if (!isBare(substr($s, $i, 1))) { $ok = false; break; } }
+    return $ok ? $s : quote($s);
+}
+
+func isList($a) {
+    $i = 0;
+    foreach ($a as $k => $v) {
+        if ($k !== $i) { return false; }
+        $i++;
+    }
+    return true;
+}
+
+func scalarText($v) {
+    if ($v === true) { return "true"; }
+    if ($v === false) { return "false"; }
+    if (is_int($v)) { return strval($v); }
+    if (is_float($v)) {
+        if ($v !== $v) { return "nan"; }
+        if ($v - $v !== 0.0) { return $v > 0.0 ? "inf" : "-inf"; }
+        $t = strval($v);
+        if (!contains($t, ".") && !contains($t, "e") && !contains($t, "E")) { $t .= ".0"; }
+        return $t;
+    }
+    if (is_string($v)) { return quote($v); }
+    throw new Exception("Toml.encode: nieobsługiwany typ " . typeof($v));
+}
+
+func inline($v, $depth) {
+    if ($depth > 256) { throw new Exception("Toml.encode: zbyt głębokie zagnieżdżenie"); }
+    if (!is_array($v)) { return scalarText($v); }
+    $parts = [];
+    if (isList($v)) {
+        foreach ($v as $x) { $parts[] = inline($x, $depth + 1); }
+        return "[" . join($parts, ", ") . "]";
+    }
+    foreach ($v as $k => $x) { $parts[] = keyText($k) . " = " . inline($x, $depth + 1); }
+    return "{ " . join($parts, ", ") . " }";
+}
+
+func emitTable($tbl, $path, $out, $depth) {
+    if ($depth > 256) { throw new Exception("Toml.encode: zbyt głębokie zagnieżdżenie"); }
+    foreach ($tbl as $k => $v) {
+        if ($v === null) { throw new Exception("Toml.encode: TOML nie ma wartości null (klucz " . strval($k) . ")"); }
+        if (is_array($v) && count($v) > 0 && !isList($v)) { continue; }
+        if (isTableList($v)) { continue; }
+        $out[] = keyText($k) . " = " . inline($v, 0);
+    }
+    foreach ($tbl as $k => $v) {
+        if (!is_array($v)) { continue; }
+        $sub = $path;
+        $sub[] = keyText($k);
+        if (count($v) > 0 && !isList($v)) {
+            if (count($out) > 0) { $out[] = ""; }
+            $out[] = "[" . join($sub, ".") . "]";
+            $out = emitTable($v, $sub, $out, $depth + 1);
+        } else if (isTableList($v)) {
+            foreach ($v as $el) {
+                if (count($out) > 0) { $out[] = ""; }
+                $out[] = "[[" . join($sub, ".") . "]]";
+                $out = emitTable($el, $sub, $out, $depth + 1);
+            }
+        }
+    }
+    return $out;
+}
+
+func encode($tbl) {
+    if (!is_array($tbl)) { throw new Exception("Toml.encode: wymagana tablica asocjacyjna"); }
+    $out = emitTable($tbl, [], [], 0);
+    return count($out) === 0 ? "" : join($out, "\n") . "\n";
+}
