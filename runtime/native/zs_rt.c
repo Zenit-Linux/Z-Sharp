@@ -12,6 +12,13 @@
 #include <time.h>
 #include <ctype.h>
 #include <sys/select.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <poll.h>
+#include <fcntl.h>
 
 ZsHandler *zs_h = NULL;
 V zs_cur_exc;
@@ -33,7 +40,9 @@ V zv_str(const char *p) { return zv_strn(p, (int64_t)strlen(p)); }
 int64_t zv_i(V v) { return v.u.i; }
 
 typedef struct ZObj { ZStr *cls; ZArr *f; } ZObj;
+typedef struct ZFn { V id; V cap; } ZFn;
 const char *zv_tn(V v) {
+    if (v.tag == ZS_FN) return "function";
     if (v.tag == ZS_OBJ) return ((ZObj *)v.u.p)->cls->d;
     switch (v.tag) {
         case ZS_NULL: return "null"; case ZS_BOOL: return "bool"; case ZS_INT: return "int"; case ZS_FLOAT: return "float";
@@ -112,6 +121,7 @@ static void text_into(Buf *b, V v, int dumpmode) {
             bputs(b, "]"); break;
         }
         case ZS_OBJ: bputs(b, "<object "); bputs(b, ((ZObj *)v.u.p)->cls->d); bputs(b, ">"); break;
+        case ZS_FN: bputs(b, "<function>"); break;
         default: bputs(b, v.tag == ZS_EXC ? (v.u.x->kind ? "<object Error>" : "<object Exception>") : "<object>"); break;
     }
 }
@@ -410,6 +420,13 @@ V b_zs_no_method(V o, V name) {
     if (o.tag == ZS_OBJ) zs_die("klasa %s nie ma metody %s", zv_tn(o), name.u.s->d);
     zs_die("wywołanie metody `%s` na wartości typu %s", name.u.s->d, zv_tn(o));
 }
+V b_zs_mkfn(V id, V cap) { ZFn *f = xmalloc(sizeof *f); f->id = id; f->cap = cap; V v; v.tag = ZS_FN; v.u.p = f; return v; }
+V b_zs_fn_id(V f) { if (f.tag == ZS_FN) return ((ZFn *)f.u.p)->id; if (f.tag == ZS_STR) return f; return zv_null(); }
+V b_zs_fn_cap(V f) { return f.tag == ZS_FN ? ((ZFn *)f.u.p)->cap : zv_null(); }
+V b_is_callable(V f) { return zv_bool(f.tag == ZS_FN); }
+static V g_statics;
+V b_zs_sget(V name) { if (g_statics.tag != ZS_ARRAY) return zv_null(); int64_t i = arr_find(g_statics.u.a, name); return i < 0 ? zv_null() : zv_dup(g_statics.u.a->vals[i]); }
+V b_zs_sset(V name, V v) { if (g_statics.tag != ZS_ARRAY) g_statics = zv_arr_new(8); arr_put(g_statics.u.a, name, zv_dup(v)); return v; }
 V b_zs_no_class(V name) { zs_die("nieznana klasa %s", name.u.s->d); }
 
 /* ───────── wyjście ───────── */
@@ -646,6 +663,14 @@ V m_System_resolveImport(V segs, V dir) {
         }
         return zv_null();
     }
+    if (strcmp(names[0], "Std") == 0 && n == 2) {     /* biblioteka standardowa: $ZS_STD, $ZS_HOME/stdlib */
+        char lo[256]; size_t l = strlen(names[1]); if (l >= sizeof lo) return zv_null();
+        for (size_t i = 0; i <= l; i++) lo[i] = (char)tolower((unsigned char)names[1][i]);
+        const char *e1 = getenv("ZS_STD"), *e2 = getenv("ZS_HOME");
+        if (e1) { snprintf(base, sizeof base, "%s/%s.zsharp", e1, lo); if (is_file_(base)) return zv_str(base); }
+        if (e2) { snprintf(base, sizeof base, "%s/stdlib/%s.zsharp", e2, lo); if (is_file_(base)) return zv_str(base); }
+        return zv_null();
+    }
     const char *dirs[40]; char cwd[4096], zp[4096]; int nd = 0; dirs[nd++] = here->d;
     if (getcwd(cwd, sizeof cwd)) dirs[nd++] = cwd;
     const char *e = getenv("ZS_PATH");
@@ -714,3 +739,207 @@ void zl_try_enter(ZsHandler *h) { h->prev = zs_h; zs_h = h; }
 void zl_try_leave(ZsHandler *h) { zs_h = h->prev; }
 V zl_cur_exc(void) { return zs_cur_exc; }
 void zl_foreach_die(V it) { zs_die("foreach wymaga tablicy, jest %s", zv_tn(it)); }
+
+
+/* ───────── rozszerzenia systemowe (Std.Os / Std.Time / Std.Net) ───────── */
+extern char **environ;
+static V assoc_new(void) { return zv_arr_new(4); }
+static void assoc_set(V a, const char *k, V v) { arr_put(a.u.a, zv_str(k), v); }
+static V read_trim_file(const char *p) {
+    FILE *f = fopen(p, "rb"); if (!f) return zv_null(); char b[512]; size_t n = fread(b, 1, sizeof b - 1, f); fclose(f);
+    while (n > 0 && (b[n - 1] == '\n' || b[n - 1] == '\r' || b[n - 1] == ' ' || b[n - 1] == '\t')) n--;
+    size_t s0 = 0; while (s0 < n && (b[s0] == ' ' || b[s0] == '\t' || b[s0] == '\n')) s0++;
+    return zv_strn(b + s0, (int64_t)(n - s0));
+}
+V m_System_setEnv(V k, V v) { ZStr *a = need_s(k, "System.setEnv", 1), *b = need_s(v, "System.setEnv", 2); setenv(a->d, b->d, 1); return zv_null(); }
+V m_System_unsetEnv(V k) { unsetenv(need_s(k, "System.unsetEnv", 1)->d); return zv_null(); }
+static int cmp_kv(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
+V m_System_environ(void) {
+    int n = 0; while (environ && environ[n]) n++;
+    char **tmp = xmalloc(sizeof(char *) * (size_t)(n + 1));
+    for (int i = 0; i < n; i++) { tmp[i] = strdup(environ[i]); char *e = strchr(tmp[i], '='); if (e) *e = '\x01'; }   /* sortowanie po (klucz, wartość) */
+    qsort(tmp, (size_t)n, sizeof(char *), cmp_kv);
+    V r = assoc_new();
+    for (int i = 0; i < n; i++) { char *e = strchr(tmp[i], '\x01'); if (e) { *e = 0; arr_put(r.u.a, zv_str(tmp[i]), zv_str(e + 1)); } free(tmp[i]); }
+    free(tmp); return r;
+}
+V m_System_cwd(void) { char b[4096]; if (!getcwd(b, sizeof b)) io_die("System.cwd", errno); return zv_str(b); }
+V m_System_chdir(V p) { ZStr *s = need_s(p, "System.chdir", 1); if (chdir(s->d)) io_die(s->d, errno); return zv_null(); }
+V m_System_pid(void) { return zv_int((int64_t)getpid()); }
+V m_System_hostname(void) {
+    V v = read_trim_file("/proc/sys/kernel/hostname"); if (v.tag == ZS_STR) return v;
+    v = read_trim_file("/etc/hostname"); if (v.tag == ZS_STR) return v;
+    return zv_str("");
+}
+V m_System_nowNanos(void) { struct timespec t; clock_gettime(CLOCK_REALTIME, &t); return zv_int((int64_t)t.tv_sec * 1000000000LL + t.tv_nsec); }
+V m_System_monotonic(void) {
+    static int64_t t0 = -1; struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    int64_t now = (int64_t)t.tv_sec * 1000000000LL + t.tv_nsec; if (t0 < 0) t0 = now;
+    return zv_int(now - t0 + 1000000000LL);
+}
+V m_System_sleep(V ms) {
+    int64_t m = need_i(ms, "System.sleep", 1); fflush(stdout);
+    if (m > 0) { struct timespec t = { (time_t)(m / 1000), (long)(m % 1000) * 1000000L }; while (nanosleep(&t, &t) && errno == EINTR) {} }
+    return zv_null();
+}
+V m_System_localOffset(V t) { time_t x = (time_t)need_i(t, "System.localOffset", 1); struct tm tm; memset(&tm, 0, sizeof tm); localtime_r(&x, &tm); return zv_int((int64_t)tm.tm_gmtoff); }
+V m_File_stat(V p) {
+    ZStr *s = need_s(p, "File.stat", 1); struct stat st; if (lstat(s->d, &st)) return zv_null();
+    const char *kind = S_ISLNK(st.st_mode) ? "link" : S_ISDIR(st.st_mode) ? "dir" : S_ISREG(st.st_mode) ? "file" : "other";
+    V r = assoc_new(); assoc_set(r, "kind", zv_str(kind)); assoc_set(r, "size", zv_int((int64_t)st.st_size));
+    assoc_set(r, "mtime", zv_int((int64_t)st.st_mtime)); assoc_set(r, "mode", zv_int((int64_t)(st.st_mode & 07777))); return r;
+}
+V m_File_rename(V a, V b) { ZStr *x = need_s(a, "File.rename", 1), *y = need_s(b, "File.rename", 2); if (rename(x->d, y->d)) io_die(x->d, errno); return zv_null(); }
+V m_File_realpath(V p) { ZStr *s = need_s(p, "File.realpath", 1); char b[4096]; if (!realpath(s->d, b)) io_die(s->d, errno); return zv_str(b); }
+V m_File_chmod(V p, V m) { ZStr *s = need_s(p, "File.chmod", 1); if (chmod(s->d, (mode_t)need_i(m, "File.chmod", 2))) io_die(s->d, errno); return zv_null(); }
+V m_File_symlink(V t, V l) { ZStr *a = need_s(t, "File.symlink", 1), *b = need_s(l, "File.symlink", 2); if (symlink(a->d, b->d)) io_die(b->d, errno); return zv_null(); }
+V m_File_readlink(V p) { ZStr *s = need_s(p, "File.readlink", 1); char b[4096]; ssize_t n = readlink(s->d, b, sizeof b - 1); if (n < 0) io_die(s->d, errno); return zv_strn(b, n); }
+V m_Directory_remove(V p) { ZStr *s = need_s(p, "Directory.remove", 1); if (rmdir(s->d)) io_die(s->d, errno); return zv_null(); }
+
+/* ── sieć: uchwyty = kolejne liczby całkowite → deskryptory ── */
+typedef struct { int fd; int kind; /* 1 tcp, 2 listener, 3 udp */ } NetH;
+static NetH *g_nh; static int64_t g_nn, g_ncap;
+static int64_t net_add(int fd, int kind) {
+    if (g_nn == g_ncap) { g_ncap = g_ncap ? g_ncap * 2 : 16; g_nh = xrealloc(g_nh, sizeof(NetH) * (size_t)g_ncap); }
+    g_nh[g_nn].fd = fd; g_nh[g_nn].kind = kind; g_nn++; return g_nn;   /* uchwyt = indeks + 1 */
+}
+static NetH *net_get(V h, const char *f) {
+    int64_t i = need_i(h, f, 1);
+    if (i < 1 || i > g_nn || g_nh[i - 1].fd < 0) zs_die("%s: niepoprawny uchwyt sieciowy %lld", f, (long long)i);
+    return &g_nh[i - 1];
+}
+static int net_addr(const char *host, int64_t port, int socktype, struct sockaddr_storage *out, socklen_t *len) {
+    struct addrinfo hints, *res; memset(&hints, 0, sizeof hints); hints.ai_socktype = socktype; hints.ai_family = AF_UNSPEC;
+    char ps[16]; snprintf(ps, sizeof ps, "%lld", (long long)port);
+    int rc = getaddrinfo(host, ps, &hints, &res);
+    if (rc) zs_die("%s:%lld: %s", host, (long long)port, gai_strerror(rc));
+    memcpy(out, res->ai_addr, res->ai_addrlen); *len = res->ai_addrlen; freeaddrinfo(res); return 0;
+}
+static V sa_host(struct sockaddr_storage *sa, socklen_t len, int64_t *port) {
+    char h[128] = ""; char sv[16] = ""; getnameinfo((struct sockaddr *)sa, len, h, sizeof h, sv, sizeof sv, NI_NUMERICHOST | NI_NUMERICSERV);
+    *port = atoi(sv); return zv_str(h);
+}
+static void set_tmo(int fd, int64_t ms) {
+    struct timeval tv; tv.tv_sec = (time_t)(ms > 0 ? ms / 1000 : 0); tv.tv_usec = (suseconds_t)(ms > 0 ? (ms % 1000) * 1000 : 0);
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv); setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+}
+V m_Socket_tcpConnect(V h, V p, V ms) {
+    ZStr *host = need_s(h, "Socket.tcpConnect", 1); int64_t port = need_i(p, "Socket.tcpConnect", 2), tmo = need_i(ms, "Socket.tcpConnect", 3);
+    struct sockaddr_storage sa; socklen_t sl; net_addr(host->d, port, SOCK_STREAM, &sa, &sl);
+    int fd = socket(sa.ss_family, SOCK_STREAM, 0); if (fd < 0) zs_die("%s:%lld: %s", host->d, (long long)port, strerror(errno));
+    int rc;
+    if (tmo > 0) {
+        int fl = fcntl(fd, F_GETFL, 0); fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+        rc = connect(fd, (struct sockaddr *)&sa, sl);
+        if (rc && errno == EINPROGRESS) {
+            struct pollfd pf = { fd, POLLOUT, 0 }; int pr = poll(&pf, 1, (int)tmo);
+            if (pr <= 0) { close(fd); zs_die("%s:%lld: %s", host->d, (long long)port, pr == 0 ? "connection timed out" : strerror(errno)); }
+            int err = 0; socklen_t el = sizeof err; getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el); rc = err ? -1 : 0; errno = err;
+        }
+        fcntl(fd, F_SETFL, fl);
+    } else rc = connect(fd, (struct sockaddr *)&sa, sl);
+    if (rc) { int e = errno; close(fd); zs_die("%s:%lld: %s", host->d, (long long)port, strerror(e)); }
+    int one = 1; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    return zv_int(net_add(fd, 1));
+}
+V m_Socket_tcpListen(V h, V p) {
+    ZStr *host = need_s(h, "Socket.tcpListen", 1); int64_t port = need_i(p, "Socket.tcpListen", 2);
+    struct sockaddr_storage sa; socklen_t sl; net_addr(host->d, port, SOCK_STREAM, &sa, &sl);
+    int fd = socket(sa.ss_family, SOCK_STREAM, 0); if (fd < 0) zs_die("%s:%lld: %s", host->d, (long long)port, strerror(errno));
+    int one = 1; setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    if (bind(fd, (struct sockaddr *)&sa, sl) || listen(fd, 128)) { int e = errno; close(fd); zs_die("%s:%lld: %s", host->d, (long long)port, strerror(e)); }
+    return zv_int(net_add(fd, 2));
+}
+V m_Socket_accept(V h) {
+    NetH *l = net_get(h, "Socket.accept"); if (l->kind != 2) zs_die("Socket.accept: to nie jest gniazdo nasłuchujące");
+    struct sockaddr_storage sa; socklen_t sl = sizeof sa; int fd;
+    do { fd = accept(l->fd, (struct sockaddr *)&sa, &sl); } while (fd < 0 && errno == EINTR);
+    if (fd < 0) zs_die("Socket.accept: %s", strerror(errno));
+    int one = 1; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    int64_t port; V host = sa_host(&sa, sl, &port);
+    V r = assoc_new(); assoc_set(r, "handle", zv_int(net_add(fd, 1))); assoc_set(r, "host", host); assoc_set(r, "port", zv_int(port)); return r;
+}
+V m_Socket_read(V h, V m) {
+    NetH *x = net_get(h, "Socket.read"); int64_t max = need_i(m, "Socket.read", 2); if (max < 1) max = 1; if (max > (1 << 24)) max = 1 << 24;
+    if (x->kind != 1) zs_die("Socket.read: to nie jest połączenie TCP");
+    char *buf = xmalloc((size_t)max + 4); ssize_t n;
+    do { n = recv(x->fd, buf, (size_t)max, 0); } while (n < 0 && errno == EINTR);
+    if (n < 0) { int e = errno; free(buf); if (e == EAGAIN || e == EWOULDBLOCK) return zv_null(); zs_die("Socket.read: %s", strerror(e)); }
+    /* niepełna sekwencja UTF-8 na końcu porcji: dobierz brakujące bajty, żeby znak nie został uszkodzony */
+    for (int back = 1; back <= 3 && back <= n; back++) {
+        unsigned char c = (unsigned char)buf[n - back];
+        if ((c & 0xC0) == 0x80) continue;
+        int need = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+        if (need > back) { ssize_t got = recv(x->fd, buf + n, (size_t)(need - back), MSG_WAITALL); if (got > 0) n += got; }
+        break;
+    }
+    V r = utf8_lossy(buf, n); free(buf); return r;
+}
+V m_Socket_write(V h, V d) {
+    NetH *x = net_get(h, "Socket.write"); V t = to_text(d); if (x->kind != 1) zs_die("Socket.write: to nie jest połączenie TCP");
+    int64_t off = 0; while (off < t.u.s->len) {
+        ssize_t n = send(x->fd, t.u.s->d + off, (size_t)(t.u.s->len - off), MSG_NOSIGNAL);
+        if (n < 0) { if (errno == EINTR) continue; zs_die("Socket.write: %s", strerror(errno)); }
+        off += n;
+    }
+    return zv_int(t.u.s->len);
+}
+V m_Socket_close(V h) {
+    int64_t i = need_i(h, "Socket.close", 1); if (i < 1 || i > g_nn || g_nh[i - 1].fd < 0) return zv_null();
+    if (g_nh[i - 1].kind == 1) shutdown(g_nh[i - 1].fd, SHUT_RDWR);
+    close(g_nh[i - 1].fd); g_nh[i - 1].fd = -1; return zv_null();
+}
+V m_Socket_setTimeout(V h, V ms) { NetH *x = net_get(h, "Socket.setTimeout"); if (x->kind != 2) set_tmo(x->fd, need_i(ms, "Socket.setTimeout", 2)); return zv_null(); }
+V m_Socket_udpBind(V h, V p) {
+    ZStr *host = need_s(h, "Socket.udpBind", 1); int64_t port = need_i(p, "Socket.udpBind", 2);
+    struct sockaddr_storage sa; socklen_t sl; net_addr(host->d, port, SOCK_DGRAM, &sa, &sl);
+    int fd = socket(sa.ss_family, SOCK_DGRAM, 0); if (fd < 0) zs_die("%s:%lld: %s", host->d, (long long)port, strerror(errno));
+    if (bind(fd, (struct sockaddr *)&sa, sl)) { int e = errno; close(fd); zs_die("%s:%lld: %s", host->d, (long long)port, strerror(e)); }
+    return zv_int(net_add(fd, 3));
+}
+V m_Socket_sendTo(V h, V host, V p, V d) {
+    NetH *x = net_get(h, "Socket.sendTo"); ZStr *hs = need_s(host, "Socket.sendTo", 2); int64_t port = need_i(p, "Socket.sendTo", 3); V t = to_text(d);
+    if (x->kind != 3) zs_die("Socket.sendTo: to nie jest gniazdo UDP");
+    struct sockaddr_storage sa; socklen_t sl; net_addr(hs->d, port, SOCK_DGRAM, &sa, &sl);
+    ssize_t n = sendto(x->fd, t.u.s->d, (size_t)t.u.s->len, 0, (struct sockaddr *)&sa, sl);
+    if (n < 0) zs_die("Socket.sendTo: %s", strerror(errno));
+    return zv_int(n);
+}
+V m_Socket_recvFrom(V h, V m) {
+    NetH *x = net_get(h, "Socket.recvFrom"); int64_t max = need_i(m, "Socket.recvFrom", 2); if (max < 1) max = 1; if (max > (1 << 20)) max = 1 << 20;
+    if (x->kind != 3) zs_die("Socket.recvFrom: to nie jest gniazdo UDP");
+    char *buf = xmalloc((size_t)max); struct sockaddr_storage sa; socklen_t sl = sizeof sa; ssize_t n;
+    do { n = recvfrom(x->fd, buf, (size_t)max, 0, (struct sockaddr *)&sa, &sl); } while (n < 0 && errno == EINTR);
+    if (n < 0) { int e = errno; free(buf); if (e == EAGAIN || e == EWOULDBLOCK) return zv_null(); zs_die("Socket.recvFrom: %s", strerror(e)); }
+    int64_t port; V host = sa_host(&sa, sl, &port); V r = assoc_new();
+    assoc_set(r, "data", utf8_lossy(buf, n)); assoc_set(r, "host", host); assoc_set(r, "port", zv_int(port)); free(buf); return r;
+}
+V m_Socket_resolve(V h) {
+    ZStr *host = need_s(h, "Socket.resolve", 1); struct addrinfo hints, *res, *q; memset(&hints, 0, sizeof hints); hints.ai_socktype = SOCK_STREAM;
+    int rc = getaddrinfo(host->d, NULL, &hints, &res); if (rc) zs_die("%s: %s", host->d, gai_strerror(rc));
+    V r = zv_arr_new(4);
+    for (q = res; q; q = q->ai_next) { int64_t port; V s = sa_host((struct sockaddr_storage *)q->ai_addr, q->ai_addrlen, &port); zv_append(r, s); }
+    freeaddrinfo(res); return r;
+}
+static V net_name(V h, int peer, const char *f) {
+    NetH *x = net_get(h, f); struct sockaddr_storage sa; socklen_t sl = sizeof sa;
+    int rc = peer ? getpeername(x->fd, (struct sockaddr *)&sa, &sl) : getsockname(x->fd, (struct sockaddr *)&sa, &sl);
+    if (rc) zs_die("%s: %s", f, strerror(errno));
+    int64_t port; V host = sa_host(&sa, sl, &port); V r = assoc_new(); assoc_set(r, "host", host); assoc_set(r, "port", zv_int(port)); return r;
+}
+V m_Socket_localAddr(V h) { return net_name(h, 0, "Socket.localAddr"); }
+V m_Socket_peerAddr(V h) { return net_name(h, 1, "Socket.peerAddr"); }
+
+V m_System_bytes(V s) {
+    ZStr *x = need_s(s, "System.bytes", 1); V r = zv_arr_new(x->len);
+    for (int64_t i = 0; i < x->len; i++) zv_append(r, zv_int((unsigned char)x->d[i]));
+    return r;
+}
+V m_System_fromBytes(V a) {
+    ZArr *x = need_a(a, "System.fromBytes", 1); char *buf = xmalloc((size_t)x->n + 1);
+    for (int64_t i = 0; i < x->n; i++) {
+        V e = x->vals[i]; if (e.tag != ZS_INT || e.u.i < 0 || e.u.i > 255) zs_die("System.fromBytes: elementy muszą być liczbami 0..255");
+        buf[i] = (char)e.u.i;
+    }
+    V r = utf8_lossy(buf, x->n); free(buf); return r;
+}
