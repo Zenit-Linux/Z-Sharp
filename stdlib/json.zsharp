@@ -1,0 +1,263 @@
+namespace Json;
+
+##
+ * Std.Json — JSON (RFC 8259).
+ *   decode($tekst)            -> wartość Z#: obiekt => tablica asocjacyjna, tablica => lista, liczba => int (gdy całkowita, mieści się w int64) albo float
+ *   encode($wartość)          -> tekst; encodePretty($wartość, $wcięcie = 2) -> tekst z wcięciami
+ *   valid($tekst)             -> bool
+ * Tablica Z# jest zapisywana jako lista JSON, gdy jej klucze to 0..n-1, w przeciwnym razie jako obiekt. Pusta tablica => `[]`.
+ * Klucze obiektów będące zapisem liczby całkowitej ("7") stają się kluczami int (zasada tablic Z#).
+ * Błędy: Exception z komunikatem `Json.decode: ... (linia L, kolumna K)`.
+##
+
+func lineCol($s, $pos) {
+    $line = 1;
+    $col = 1;
+    for ($i = 0; $i < $pos && $i < strlen($s); $i++) {
+        if (substr($s, $i, 1) === "\n") { $line++; $col = 1; } else { $col++; }
+    }
+    return [$line, $col];
+}
+
+func fail($s, $pos, $msg) {
+    $lc = lineCol($s, $pos);
+    throw new Exception("Json.decode: " . $msg . " (linia " . $lc[0] . ", kolumna " . $lc[1] . ")");
+}
+
+func skipWs($s, $i, $n) {
+    while ($i < $n) {
+        $c = substr($s, $i, 1);
+        if ($c === " " || $c === "\n" || $c === "\t" || $c === "\r") { $i++; } else { break; }
+    }
+    return $i;
+}
+
+func hex4($s, $i, $n) {
+    if ($i + 4 > $n) { fail($s, $i, "ucięta sekwencja \\u"); }
+    $v = 0;
+    for ($k = 0; $k < 4; $k++) {
+        $d = index_of("0123456789abcdef", lower(substr($s, $i + $k, 1)));
+        if ($d < 0) { fail($s, $i + $k, "niepoprawna cyfra szesnastkowa w \\u"); }
+        $v = $v * 16 + $d;
+    }
+    return $v;
+}
+
+##
+ * Parsuje tekst w cudzysłowie zaczynający się od $i (na znaku `"`); zwraca [tekst, pozycja po zamykającym cudzysłowie].
+##
+func parseString($s, $i, $n) {
+    $i++;
+    $parts = [];
+    $start = $i;
+    while (true) {
+        if ($i >= $n) { fail($s, $i, "nieterminowany tekst"); }
+        $c = substr($s, $i, 1);
+        if ($c === "\"") {
+            $parts[] = substr($s, $start, $i - $start);
+            return [join($parts, ""), $i + 1];
+        }
+        if ($c === "\\") {
+            $parts[] = substr($s, $start, $i - $start);
+            if ($i + 1 >= $n) { fail($s, $i, "nieterminowany tekst"); }
+            $e = substr($s, $i + 1, 1);
+            $i += 2;
+            if ($e === "n") { $parts[] = "\n"; }
+            else if ($e === "t") { $parts[] = "\t"; }
+            else if ($e === "r") { $parts[] = "\r"; }
+            else if ($e === "b") { $parts[] = chr(8); }
+            else if ($e === "f") { $parts[] = chr(12); }
+            else if ($e === "/") { $parts[] = "/"; }
+            else if ($e === "\\") { $parts[] = "\\"; }
+            else if ($e === "\"") { $parts[] = "\""; }
+            else if ($e === "u") {
+                $cp = hex4($s, $i, $n);
+                $i += 4;
+                if ($cp >= 55296 && $cp < 56320) {
+                    if ($i + 6 <= $n && substr($s, $i, 2) === "\\u") {
+                        $lo = hex4($s, $i + 2, $n);
+                        if ($lo >= 56320 && $lo < 57344) { $cp = 65536 + (($cp - 55296) << 10) + ($lo - 56320); $i += 6; }
+                        else { $cp = 65533; }
+                    } else { $cp = 65533; }
+                } else if ($cp >= 56320 && $cp < 57344) { $cp = 65533; }
+                $parts[] = chr($cp);
+            } else { fail($s, $i - 1, "niepoprawna sekwencja ucieczki \\" . $e); }
+            $start = $i;
+            continue;
+        }
+        if (ord($c) < 32) { fail($s, $i, "znak sterujący w tekście (wymagana sekwencja ucieczki)"); }
+        $i++;
+    }
+    return [null, $i];
+}
+
+func isDigit($c) { return $c !== "" && index_of("0123456789", $c) >= 0; }
+
+func parseNumber($s, $i, $n) {
+    $start = $i;
+    $isFloat = false;
+    if (substr($s, $i, 1) === "-") { $i++; }
+    if ($i >= $n || !isDigit(substr($s, $i, 1))) { fail($s, $i, "oczekiwano cyfry"); }
+    if (substr($s, $i, 1) === "0") {
+        $i++;
+        if ($i < $n && isDigit(substr($s, $i, 1))) { fail($s, $i, "zbędne zero wiodące"); }
+    } else {
+        while ($i < $n && isDigit(substr($s, $i, 1))) { $i++; }
+    }
+    if ($i < $n && substr($s, $i, 1) === ".") {
+        $isFloat = true;
+        $i++;
+        if ($i >= $n || !isDigit(substr($s, $i, 1))) { fail($s, $i, "oczekiwano cyfry po kropce"); }
+        while ($i < $n && isDigit(substr($s, $i, 1))) { $i++; }
+    }
+    if ($i < $n && (substr($s, $i, 1) === "e" || substr($s, $i, 1) === "E")) {
+        $isFloat = true;
+        $i++;
+        if ($i < $n && (substr($s, $i, 1) === "+" || substr($s, $i, 1) === "-")) { $i++; }
+        if ($i >= $n || !isDigit(substr($s, $i, 1))) { fail($s, $i, "oczekiwano cyfry wykładnika"); }
+        while ($i < $n && isDigit(substr($s, $i, 1))) { $i++; }
+    }
+    $t = substr($s, $start, $i - $start);
+    if (!$isFloat && strlen($t) <= 18) { return [intval($t), $i]; }
+    $f = floatval($t);
+    if (!$isFloat && $f > -9.2e18 && $f < 9.2e18) { return [intval($t), $i]; }
+    return [$f, $i];
+}
+
+func parseValue($s, $i, $n, $depth) {
+    if ($depth > 512) { fail($s, $i, "zbyt głębokie zagnieżdżenie"); }
+    $i = skipWs($s, $i, $n);
+    if ($i >= $n) { fail($s, $i, "nieoczekiwany koniec danych"); }
+    $c = substr($s, $i, 1);
+    if ($c === "{") {
+        $obj = [];
+        $i = skipWs($s, $i + 1, $n);
+        if ($i < $n && substr($s, $i, 1) === "}") { return [$obj, $i + 1]; }
+        while (true) {
+            $i = skipWs($s, $i, $n);
+            if ($i >= $n || substr($s, $i, 1) !== "\"") { fail($s, $i, "oczekiwano klucza w cudzysłowie"); }
+            $k = parseString($s, $i, $n);
+            $i = skipWs($s, $k[1], $n);
+            if ($i >= $n || substr($s, $i, 1) !== ":") { fail($s, $i, "oczekiwano `:`"); }
+            $v = parseValue($s, $i + 1, $n, $depth + 1);
+            $obj[$k[0]] = $v[0];
+            $i = skipWs($s, $v[1], $n);
+            if ($i >= $n) { fail($s, $i, "nieterminowany obiekt"); }
+            $d = substr($s, $i, 1);
+            if ($d === ",") { $i++; continue; }
+            if ($d === "}") { return [$obj, $i + 1]; }
+            fail($s, $i, "oczekiwano `,` lub `}`");
+        }
+    }
+    if ($c === "[") {
+        $arr = [];
+        $i = skipWs($s, $i + 1, $n);
+        if ($i < $n && substr($s, $i, 1) === "]") { return [$arr, $i + 1]; }
+        while (true) {
+            $v = parseValue($s, $i, $n, $depth + 1);
+            $arr[] = $v[0];
+            $i = skipWs($s, $v[1], $n);
+            if ($i >= $n) { fail($s, $i, "nieterminowana tablica"); }
+            $d = substr($s, $i, 1);
+            if ($d === ",") { $i++; continue; }
+            if ($d === "]") { return [$arr, $i + 1]; }
+            fail($s, $i, "oczekiwano `,` lub `]`");
+        }
+    }
+    if ($c === "\"") { return parseString($s, $i, $n); }
+    if ($c === "t" && substr($s, $i, 4) === "true") { return [true, $i + 4]; }
+    if ($c === "f" && substr($s, $i, 5) === "false") { return [false, $i + 5]; }
+    if ($c === "n" && substr($s, $i, 4) === "null") { return [null, $i + 4]; }
+    if ($c === "-" || isDigit($c)) { return parseNumber($s, $i, $n); }
+    fail($s, $i, "nieoczekiwany znak `" . $c . "`");
+    return [null, $i];
+}
+
+func decode($text) {
+    $n = strlen($text);
+    $i = 0;
+    if ($n >= 3 && substr($text, 0, 3) === "\xEF\xBB\xBF") { $i = 3; }
+    $r = parseValue($text, $i, $n, 0);
+    $j = skipWs($text, $r[1], $n);
+    if ($j < $n) { fail($text, $j, "dane po końcu wartości"); }
+    return $r[0];
+}
+
+func valid($text) {
+    try { decode($text); return true; }
+    catch (Exception $e) { return false; }
+}
+
+# ── kodowanie ──
+
+func needsEscape($s) {
+    $n = strlen($s);
+    for ($i = 0; $i < $n; $i++) {
+        $o = ord(substr($s, $i, 1));
+        if ($o < 32 || $o === 34 || $o === 92) { return true; }
+    }
+    return false;
+}
+
+func quote($s) {
+    if (!needsEscape($s)) { return "\"" . $s . "\""; }
+    # kopiujemy odcinki bez znaków specjalnych w całości (cięcie tylko na znakach ASCII — bezpieczne dla UTF-8)
+    $parts = ["\""];
+    $n = strlen($s);
+    $start = 0;
+    for ($i = 0; $i < $n; $i++) {
+        $o = ord(substr($s, $i, 1));
+        if ($o >= 32 && $o !== 34 && $o !== 92) { continue; }
+        if ($i > $start) { $parts[] = substr($s, $start, $i - $start); }
+        $start = $i + 1;
+        if ($o === 34) { $parts[] = "\\\""; }
+        else if ($o === 92) { $parts[] = "\\\\"; }
+        else if ($o === 10) { $parts[] = "\\n"; }
+        else if ($o === 13) { $parts[] = "\\r"; }
+        else if ($o === 9) { $parts[] = "\\t"; }
+        else if ($o === 8) { $parts[] = "\\b"; }
+        else if ($o === 12) { $parts[] = "\\f"; }
+        else { $parts[] = "\\u00" . pad_left(to_hex($o), 2, "0"); }
+    }
+    if ($n > $start) { $parts[] = substr($s, $start, $n - $start); }
+    $parts[] = "\"";
+    return join($parts, "");
+}
+
+func isList($a) {
+    $i = 0;
+    foreach ($a as $k => $v) {
+        if ($k !== $i) { return false; }
+        $i++;
+    }
+    return true;
+}
+
+func enc($v, $pretty, $ind, $level, $depth) {
+    if ($depth > 512) { throw new Exception("Json.encode: zbyt głębokie zagnieżdżenie"); }
+    if ($v === null) { return "null"; }
+    if ($v === true) { return "true"; }
+    if ($v === false) { return "false"; }
+    if (is_int($v)) { return strval($v); }
+    if (is_float($v)) {
+        if ($v !== $v || $v - $v !== 0.0) { throw new Exception("Json.encode: NaN i nieskończoność nie mają zapisu w JSON"); }
+        return strval($v);
+    }
+    if (is_string($v)) { return quote($v); }
+    if (!is_array($v)) { throw new Exception("Json.encode: nieobsługiwany typ " . typeof($v)); }
+    if (count($v) === 0) { return "[]"; }
+    $parts = [];
+    $list = isList($v);
+    foreach ($v as $k => $x) {
+        $e = enc($x, $pretty, $ind, $level + 1, $depth + 1);
+        $parts[] = $list ? $e : quote(strval($k)) . ($pretty ? ": " : ":") . $e;
+    }
+    $open = $list ? "[" : "{";
+    $close = $list ? "]" : "}";
+    if (!$pretty) { return $open . join($parts, ",") . $close; }
+    $pad = repeat(" ", $ind * ($level + 1));
+    return $open . "\n" . $pad . join($parts, ",\n" . $pad) . "\n" . repeat(" ", $ind * $level) . $close;
+}
+
+func encode($v) { return enc($v, false, 0, 0, 0); }
+func encodePretty($v, $indent = 2) { return enc($v, true, $indent, 0, 0); }
