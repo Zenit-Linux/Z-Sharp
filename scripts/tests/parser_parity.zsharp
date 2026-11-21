@@ -1,6 +1,21 @@
-#!/usr/bin/env bash
+#!/usr/bin/env zsi
 # Parytet parsera: S-expr Rust (--sexp) == parser w Z# (lib/parser.zsharp).
-. "$(dirname "$0")/../scripts/lib.sh"; ensure_stage0; n=0
-for f in "$ROOT"/tests/*.zsharp "$ROOT"/examples/*.zsharp "$ROOT"/lib/*.zsharp; do
-  diff <("$ZSC0" --sexp "$f" 2>&1) <("$ZSC0" run "$ROOT/tests/parse_cli.zsharp" "$f" 2>&1) >/dev/null || { echo "RÓŻNICA parsera: $f"; exit 1; }; n=$((n+1))
-done; echo "parser parity: $n plików OK"
+import Std.Os;
+import Workspace.Scripts;
+
+func runParserParity() {
+    Scripts.ensureStage0();
+    $z = Scripts.zsc0();
+    $r = Scripts.root();
+    $n = 0;
+    foreach (Scripts.paritySources($r) as $f) {
+        $rust = join(Scripts.lines(Scripts.combined(Scripts.sh($z, ["--sexp", $f]))), "\n");
+        $zs = join(Scripts.lines(Scripts.combined(Scripts.sh($z, ["run", $r . "/tests/parse_cli.zsharp", $f]))), "\n");
+        if ($rust !== $zs) { echo "RÓŻNICA parsera: " . $f; return false; }
+        $n++;
+    }
+    echo "parser parity: " . $n . " plików OK";
+    return true;
+}
+
+if (!runParserParity()) { Os.exit(1); }
