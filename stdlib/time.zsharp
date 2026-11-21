@@ -1,0 +1,435 @@
+namespace Time;
+
+##
+ * Std.Time — czas i data (kalendarz proleptyczny gregoriański, UTC albo stałe przesunięcie względem UTC).
+ *
+ * Moment w czasie = liczba całkowita sekund Uniksa (UTC). Rozbity czas ("czesci") to tablica
+ *   ["year","month","day","hour","minute","second","nano","offset"]   (offset = sekundy na wschód od UTC).
+ * Nazwane strefy czasowe (Europe/Warsaw) nie są obsługiwane; strefa lokalna = przesunięcie z localOffset().
+ *
+ *   Zegar      : nowSeconds, nowMillis, nowNanos, monotonic, sleep, localOffset
+ *   Kalendarz  : isLeap, daysInMonth, make, fromUnix, toUnix, local, weekday, yearDay
+ *   Arytmetyka : add, addDays, addMonths, diff, compare, startOfDay
+ *   Tekst      : toIso, parseIso, format, parse, formatDuration, parseDuration
+ * Czasy trwania to całkowite milisekundy.
+##
+
+func floorDiv($a, $b) {
+    $r = $a % $b;
+    $q = ($a - $r) / $b;
+    if ($r < 0) { $q = $q - 1; }
+    return $q;
+}
+
+func floorMod($a, $b) {
+    $r = $a % $b;
+    if ($r < 0) { $r += $b; }
+    return $r;
+}
+
+func pad($n, $w) { return pad_left(strval($n), $w, "0"); }
+
+# ── zegar ──
+func nowNanos() { return System.nowNanos(); }
+func nowSeconds() { return floorDiv(System.nowNanos(), 1000000000); }
+func nowMillis() { return floorDiv(System.nowNanos(), 1000000); }
+func monotonic() { return System.monotonic(); }
+func sleep($ms) { System.sleep($ms); return null; }
+func localOffset($ts = null) { return System.localOffset($ts === null ? nowSeconds() : $ts); }
+
+# ── kalendarz ──
+func isLeap($y) { return ($y % 4 === 0 && $y % 100 !== 0) || $y % 400 === 0; }
+
+func daysInMonth($y, $m) {
+    if ($m === 2) { return isLeap($y) ? 29 : 28; }
+    if ($m === 4 || $m === 6 || $m === 9 || $m === 11) { return 30; }
+    return 31;
+}
+
+func daysFromCivil($y, $m, $d) {
+    if ($m <= 2) { $y = $y - 1; }
+    $era = floorDiv($y, 400);
+    $yoe = $y - $era * 400;
+    $mp = $m > 2 ? $m - 3 : $m + 9;
+    $doy = floorDiv(153 * $mp + 2, 5) + $d - 1;
+    $doe = $yoe * 365 + floorDiv($yoe, 4) - floorDiv($yoe, 100) + $doy;
+    return $era * 146097 + $doe - 719468;
+}
+
+func civilFromDays($z) {
+    $z = $z + 719468;
+    $era = floorDiv($z, 146097);
+    $doe = $z - $era * 146097;
+    $yoe = floorDiv($doe - floorDiv($doe, 1460) + floorDiv($doe, 36524) - floorDiv($doe, 146096), 365);
+    $y = $yoe + $era * 400;
+    $doy = $doe - (365 * $yoe + floorDiv($yoe, 4) - floorDiv($yoe, 100));
+    $mp = floorDiv(5 * $doy + 2, 153);
+    $d = $doy - floorDiv(153 * $mp + 2, 5) + 1;
+    $m = $mp < 10 ? $mp + 3 : $mp - 9;
+    if ($m <= 2) { $y = $y + 1; }
+    return [$y, $m, $d];
+}
+
+##
+ * Buduje i waliduje rozbity czas; rzuca Exception dla nieistniejących dat (np. 31 kwietnia).
+##
+func make($y, $m, $d, $h = 0, $mi = 0, $s = 0, $offset = 0, $nano = 0) {
+    if ($m < 1 || $m > 12) { throw new Exception("Time.make: miesiąc poza zakresem: " . $m); }
+    if ($d < 1 || $d > daysInMonth($y, $m)) { throw new Exception("Time.make: nieprawidłowy dzień: " . $y . "-" . pad($m, 2) . "-" . pad($d, 2)); }
+    if ($h < 0 || $h > 23 || $mi < 0 || $mi > 59 || $s < 0 || $s > 59) { throw new Exception("Time.make: godzina/minuta/sekunda poza zakresem"); }
+    if ($nano < 0 || $nano > 999999999) { throw new Exception("Time.make: nano poza zakresem"); }
+    return ["year" => $y, "month" => $m, "day" => $d, "hour" => $h, "minute" => $mi, "second" => $s, "nano" => $nano, "offset" => $offset];
+}
+
+func fromUnix($ts, $offset = 0, $nano = 0) {
+    $t = $ts + $offset;
+    $days = floorDiv($t, 86400);
+    $rem = $t - $days * 86400;
+    $c = civilFromDays($days);
+    return ["year" => $c[0], "month" => $c[1], "day" => $c[2], "hour" => floorDiv($rem, 3600), "minute" => floorDiv($rem % 3600, 60),
+            "second" => $rem % 60, "nano" => $nano, "offset" => $offset];
+}
+
+func toUnix($p) {
+    return daysFromCivil($p["year"], $p["month"], $p["day"]) * 86400 + $p["hour"] * 3600 + $p["minute"] * 60 + $p["second"] - $p["offset"];
+}
+
+##
+ * Bieżący (lub podany) moment w lokalnym przesunięciu systemu.
+##
+func local($ts = null) {
+    if ($ts === null) { $ts = nowSeconds(); }
+    return fromUnix($ts, localOffset($ts));
+}
+
+##
+ * Dzień tygodnia: 0 = niedziela ... 6 = sobota.
+##
+func weekday($p) { return floorMod(daysFromCivil($p["year"], $p["month"], $p["day"]) + 4, 7); }
+
+func yearDay($p) { return daysFromCivil($p["year"], $p["month"], $p["day"]) - daysFromCivil($p["year"], 1, 1) + 1; }
+
+# ── arytmetyka ──
+func add($p, $seconds) { return fromUnix(toUnix($p) + $seconds, $p["offset"], $p["nano"]); }
+func addDays($p, $n) { return add($p, $n * 86400); }
+
+func addMonths($p, $n) {
+    $idx = $p["year"] * 12 + ($p["month"] - 1) + $n;
+    $y = floorDiv($idx, 12);
+    $m = floorMod($idx, 12) + 1;
+    $d = $p["day"];
+    $max = daysInMonth($y, $m);
+    if ($d > $max) { $d = $max; }
+    return make($y, $m, $d, $p["hour"], $p["minute"], $p["second"], $p["offset"], $p["nano"]);
+}
+
+##
+ * Różnica $a - $b w sekundach.
+##
+func diff($a, $b) { return toUnix($a) - toUnix($b); }
+
+func compare($a, $b) {
+    $x = toUnix($a);
+    $y = toUnix($b);
+    if ($x !== $y) { return $x < $y ? -1 : 1; }
+    if ($a["nano"] !== $b["nano"]) { return $a["nano"] < $b["nano"] ? -1 : 1; }
+    return 0;
+}
+
+func startOfDay($p) { return make($p["year"], $p["month"], $p["day"], 0, 0, 0, $p["offset"], 0); }
+
+# ── tekst ──
+func offsetText($off, $colon) {
+    $sign = $off < 0 ? "-" : "+";
+    $a = $off < 0 ? -$off : $off;
+    return $sign . pad(floorDiv($a, 3600), 2) . ($colon ? ":" : "") . pad(floorDiv($a % 3600, 60), 2);
+}
+
+##
+ * ISO 8601 / RFC 3339: 2026-11-21T12:50:00Z, 2026-11-21T12:50:00.123+01:00 (ułamek tylko gdy nano != 0).
+##
+func toIso($p) {
+    $s = pad($p["year"], 4) . "-" . pad($p["month"], 2) . "-" . pad($p["day"], 2) . "T" . pad($p["hour"], 2) . ":" . pad($p["minute"], 2) . ":" . pad($p["second"], 2);
+    if ($p["nano"] !== 0) {
+        $f = pad($p["nano"], 9);
+        while (strlen($f) > 1 && substr($f, strlen($f) - 1, 1) === "0") { $f = substr($f, 0, strlen($f) - 1); }
+        $s .= "." . $f;
+    }
+    return $p["offset"] === 0 ? $s . "Z" : $s . offsetText($p["offset"], true);
+}
+
+func digitsAt($s, $i, $min, $max) {
+    $j = $i;
+    $n = strlen($s);
+    while ($j < $n && $j - $i < $max && index_of("0123456789", substr($s, $j, 1)) >= 0) { $j++; }
+    if ($j - $i < $min) { return null; }
+    return [intval(substr($s, $i, $j - $i)), $j];
+}
+
+func parseFail($text, $why) { throw new Exception("Time.parse: " . $why . " w \"" . $text . "\""); }
+
+##
+ * Parsuje ISO 8601: `RRRR-MM-DD`, `RRRR-MM-DD[T ]gg:mm[:ss[.u]][Z|±gg[:mm]]` (bez strefy => offset 0).
+##
+func parseIso($text) {
+    $n = strlen($text);
+    $a = digitsAt($text, 0, 4, 4);
+    if ($a === null || substr($text, 4, 1) !== "-") { parseFail($text, "oczekiwano RRRR-MM-DD"); }
+    $b = digitsAt($text, 5, 2, 2);
+    if ($b === null || substr($text, 7, 1) !== "-") { parseFail($text, "oczekiwano RRRR-MM-DD"); }
+    $c = digitsAt($text, 8, 2, 2);
+    if ($c === null) { parseFail($text, "oczekiwano RRRR-MM-DD"); }
+    $h = 0; $mi = 0; $s = 0; $nano = 0; $off = 0;
+    $i = $c[1];
+    if ($i < $n) {
+        $sep = substr($text, $i, 1);
+        if ($sep !== "T" && $sep !== "t" && $sep !== " ") { parseFail($text, "oczekiwano `T` po dacie"); }
+        $x = digitsAt($text, $i + 1, 2, 2);
+        if ($x === null || substr($text, $x[1], 1) !== ":") { parseFail($text, "oczekiwano gg:mm"); }
+        $y = digitsAt($text, $x[1] + 1, 2, 2);
+        if ($y === null) { parseFail($text, "oczekiwano gg:mm"); }
+        $h = $x[0]; $mi = $y[0]; $i = $y[1];
+        if ($i < $n && substr($text, $i, 1) === ":") {
+            $z = digitsAt($text, $i + 1, 2, 2);
+            if ($z === null) { parseFail($text, "oczekiwano sekund"); }
+            $s = $z[0]; $i = $z[1];
+            if ($i < $n && (substr($text, $i, 1) === "." || substr($text, $i, 1) === ",")) {
+                $f = digitsAt($text, $i + 1, 1, 9);
+                if ($f === null) { parseFail($text, "oczekiwano ułamka sekundy"); }
+                $nano = $f[0] * intval(pow10(9 - ($f[1] - $i - 1)));
+                $i = $f[1];
+                while ($i < $n && index_of("0123456789", substr($text, $i, 1)) >= 0) { $i++; }
+            }
+        }
+        if ($i < $n) {
+            $t = substr($text, $i, 1);
+            if ($t === "Z" || $t === "z") { $i++; }
+            else if ($t === "+" || $t === "-") {
+                $oh = digitsAt($text, $i + 1, 2, 2);
+                if ($oh === null) { parseFail($text, "oczekiwano przesunięcia strefy"); }
+                $om = [0, $oh[1]];
+                if ($oh[1] < $n && substr($text, $oh[1], 1) === ":") { $om = digitsAt($text, $oh[1] + 1, 2, 2); }
+                else if ($oh[1] < $n) { $om = digitsAt($text, $oh[1], 2, 2); }
+                if ($om === null) { parseFail($text, "oczekiwano minut przesunięcia"); }
+                $off = ($oh[0] * 3600 + $om[0] * 60) * ($t === "-" ? -1 : 1);
+                $i = $om[1];
+            } else { parseFail($text, "nieoczekiwany znak `" . $t . "`"); }
+        }
+    }
+    if ($i < $n) { parseFail($text, "dane po końcu czasu"); }
+    return make($a[0], $b[0], $c[0], $h, $mi, $s, $off, $nano);
+}
+
+func pow10($k) {
+    $r = 1;
+    for ($i = 0; $i < $k; $i++) { $r = $r * 10; }
+    return $r;
+}
+
+func dayNames() { return ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]; }
+func monthNames() { return ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]; }
+
+##
+ * strftime (podzbiór): %Y %y %m %d %e %H %I %M %S %f(ms) %N(nano) %p %a %A %b %B %j %u %w %z %:z %Z %s %F %T %D %R %% — nazwy angielskie.
+##
+func format($p, $fmt) {
+    $out = [];
+    $n = strlen($fmt);
+    $start = 0;
+    for ($i = 0; $i < $n; $i++) {
+        if (substr($fmt, $i, 1) !== "%") { continue; }
+        if ($i > $start) { $out[] = substr($fmt, $start, $i - $start); }
+        $i++;
+        if ($i >= $n) { throw new Exception("Time.format: format kończy się na %"); }
+        $c = substr($fmt, $i, 1);
+        if ($c === ":" && $i + 1 < $n && substr($fmt, $i + 1, 1) === "z") { $i++; $c = ":z"; }
+        $out[] = fmtOne($p, $c);
+        $start = $i + 1;
+    }
+    if ($n > $start) { $out[] = substr($fmt, $start, $n - $start); }
+    return join($out, "");
+}
+
+func fmtOne($p, $c) {
+    if ($c === "Y") { return strval($p["year"]); }
+    if ($c === "y") { return pad(floorMod($p["year"], 100), 2); }
+    if ($c === "m") { return pad($p["month"], 2); }
+    if ($c === "d") { return pad($p["day"], 2); }
+    if ($c === "e") { return pad_left(strval($p["day"]), 2, " "); }
+    if ($c === "H") { return pad($p["hour"], 2); }
+    if ($c === "I") { $h = $p["hour"] % 12; return pad($h === 0 ? 12 : $h, 2); }
+    if ($c === "M") { return pad($p["minute"], 2); }
+    if ($c === "S") { return pad($p["second"], 2); }
+    if ($c === "f") { return pad(floorDiv($p["nano"], 1000000), 3); }
+    if ($c === "N") { return pad($p["nano"], 9); }
+    if ($c === "p") { return $p["hour"] < 12 ? "AM" : "PM"; }
+    if ($c === "a") { return substr(dayNames()[weekday($p)], 0, 3); }
+    if ($c === "A") { return dayNames()[weekday($p)]; }
+    if ($c === "b") { return substr(monthNames()[$p["month"] - 1], 0, 3); }
+    if ($c === "B") { return monthNames()[$p["month"] - 1]; }
+    if ($c === "j") { return pad(yearDay($p), 3); }
+    if ($c === "u") { $w = weekday($p); return strval($w === 0 ? 7 : $w); }
+    if ($c === "w") { return strval(weekday($p)); }
+    if ($c === "z") { return offsetText($p["offset"], false); }
+    if ($c === ":z") { return offsetText($p["offset"], true); }
+    if ($c === "Z") { return $p["offset"] === 0 ? "UTC" : offsetText($p["offset"], true); }
+    if ($c === "s") { return strval(toUnix($p)); }
+    if ($c === "F") { return pad($p["year"], 4) . "-" . pad($p["month"], 2) . "-" . pad($p["day"], 2); }
+    if ($c === "T") { return pad($p["hour"], 2) . ":" . pad($p["minute"], 2) . ":" . pad($p["second"], 2); }
+    if ($c === "R") { return pad($p["hour"], 2) . ":" . pad($p["minute"], 2); }
+    if ($c === "D") { return pad($p["month"], 2) . "/" . pad($p["day"], 2) . "/" . pad(floorMod($p["year"], 100), 2); }
+    if ($c === "%") { return "%"; }
+    throw new Exception("Time.format: nieznany znacznik %" . $c);
+}
+
+func nameIndex($text, $i, $names, $short) {
+    for ($k = 0; $k < count($names); $k++) {
+        $nm = $short ? substr($names[$k], 0, 3) : $names[$k];
+        if (lower(substr($text, $i, strlen($nm))) === lower($nm)) { return [$k, $i + strlen($nm)]; }
+    }
+    return null;
+}
+
+##
+ * Odwrotność format() dla znaczników: %Y %y %m %d %e %H %I %M %S %f %p %b %B %a %A %z %:z %Z %F %T %R %% oraz literałów.
+ * Brakujące pola: rok 1970, miesiąc/dzień 1, reszta 0. %s ustawia moment bezpośrednio.
+##
+func parse($text, $fmt) {
+    $y = 1970; $mo = 1; $d = 1; $h = 0; $mi = 0; $s = 0; $nano = 0; $off = 0; $pm = null; $unix = null;
+    $i = 0;
+    $n = strlen($text);
+    $fn = strlen($fmt);
+    for ($k = 0; $k < $fn; $k++) {
+        $c = substr($fmt, $k, 1);
+        if ($c !== "%") {
+            if ($i >= $n || substr($text, $i, 1) !== $c) { parseFail($text, "oczekiwano `" . $c . "` na pozycji " . $i); }
+            $i++;
+            continue;
+        }
+        $k++;
+        if ($k >= $fn) { throw new Exception("Time.parse: format kończy się na %"); }
+        $t = substr($fmt, $k, 1);
+        if ($t === ":" && $k + 1 < $fn && substr($fmt, $k + 1, 1) === "z") { $k++; $t = "z"; }
+        $r = null;
+        if ($t === "Y") { $r = digitsAt($text, $i, 4, 4); if ($r !== null) { $y = $r[0]; } }
+        else if ($t === "y") { $r = digitsAt($text, $i, 2, 2); if ($r !== null) { $y = $r[0] < 69 ? 2000 + $r[0] : 1900 + $r[0]; } }
+        else if ($t === "m") { $r = digitsAt($text, $i, 2, 2); if ($r !== null) { $mo = $r[0]; } }
+        else if ($t === "d" || $t === "e") {
+            if ($t === "e" && $i < $n && substr($text, $i, 1) === " ") { $i++; }
+            $r = digitsAt($text, $i, 1, 2); if ($r !== null) { $d = $r[0]; }
+        }
+        else if ($t === "H" || $t === "I") { $r = digitsAt($text, $i, 1, 2); if ($r !== null) { $h = $r[0]; } }
+        else if ($t === "M") { $r = digitsAt($text, $i, 2, 2); if ($r !== null) { $mi = $r[0]; } }
+        else if ($t === "S") { $r = digitsAt($text, $i, 2, 2); if ($r !== null) { $s = $r[0]; } }
+        else if ($t === "f") { $r = digitsAt($text, $i, 3, 3); if ($r !== null) { $nano = $r[0] * 1000000; } }
+        else if ($t === "p") {
+            $w = lower(substr($text, $i, 2));
+            if ($w === "am" || $w === "pm") { $pm = $w === "pm"; $r = [0, $i + 2]; }
+        }
+        else if ($t === "b") { $r = nameIndex($text, $i, monthNames(), true); if ($r !== null) { $mo = $r[0] + 1; } }
+        else if ($t === "B") { $r = nameIndex($text, $i, monthNames(), false); if ($r !== null) { $mo = $r[0] + 1; } }
+        else if ($t === "a") { $r = nameIndex($text, $i, dayNames(), true); }
+        else if ($t === "A") { $r = nameIndex($text, $i, dayNames(), false); }
+        else if ($t === "z") {
+            $sg = substr($text, $i, 1);
+            if ($sg === "Z") { $r = [0, $i + 1]; $off = 0; }
+            else if ($sg === "+" || $sg === "-") {
+                $oh = digitsAt($text, $i + 1, 2, 2);
+                if ($oh !== null) {
+                    $j = $oh[1];
+                    if ($j < $n && substr($text, $j, 1) === ":") { $j++; }
+                    $om = digitsAt($text, $j, 2, 2);
+                    if ($om !== null) { $off = ($oh[0] * 3600 + $om[0] * 60) * ($sg === "-" ? -1 : 1); $r = [0, $om[1]]; }
+                }
+            }
+        }
+        else if ($t === "Z") { if (substr($text, $i, 3) === "UTC") { $r = [0, $i + 3]; } }
+        else if ($t === "s") {
+            $neg = substr($text, $i, 1) === "-";
+            $r = digitsAt($text, $neg ? $i + 1 : $i, 1, 18);
+            if ($r !== null) { $unix = $neg ? -$r[0] : $r[0]; }
+        }
+        else if ($t === "%") { if (substr($text, $i, 1) === "%") { $r = [0, $i + 1]; } }
+        else if ($t === "F") {
+            $a = digitsAt($text, $i, 4, 4);
+            if ($a !== null && substr($text, $i + 4, 1) === "-") {
+                $b = digitsAt($text, $i + 5, 2, 2);
+                if ($b !== null && substr($text, $i + 7, 1) === "-") {
+                    $dd = digitsAt($text, $i + 8, 2, 2);
+                    if ($dd !== null) { $y = $a[0]; $mo = $b[0]; $d = $dd[0]; $r = [0, $dd[1]]; }
+                }
+            }
+        }
+        else if ($t === "T" || $t === "R") {
+            $a = digitsAt($text, $i, 2, 2);
+            if ($a !== null && substr($text, $i + 2, 1) === ":") {
+                $b = digitsAt($text, $i + 3, 2, 2);
+                if ($b !== null) {
+                    $h = $a[0]; $mi = $b[0]; $r = [0, $b[1]];
+                    if ($t === "T" && substr($text, $b[1], 1) === ":") {
+                        $cc = digitsAt($text, $b[1] + 1, 2, 2);
+                        if ($cc !== null) { $s = $cc[0]; $r = [0, $cc[1]]; } else { $r = null; }
+                    }
+                }
+            }
+        }
+        else { throw new Exception("Time.parse: nieznany znacznik %" . $t); }
+        if ($r === null) { parseFail($text, "nie pasuje do %" . $t . " na pozycji " . $i); }
+        $i = $r[1];
+    }
+    if ($i < $n) { parseFail($text, "dane po końcu formatu (pozycja " . $i . ")"); }
+    if ($unix !== null) { return fromUnix($unix, $off, $nano); }
+    if ($pm !== null) { $h = $h % 12 + ($pm ? 12 : 0); }
+    return make($y, $mo, $d, $h, $mi, $s, $off, $nano);
+}
+
+##
+ * Czas trwania (ms) -> "1d 2h 3m 4s 5ms" (pomija zerowe jednostki; 0 => "0s").
+##
+func formatDuration($ms) {
+    if ($ms === 0) { return "0s"; }
+    $sign = "";
+    if ($ms < 0) { $sign = "-"; $ms = -$ms; }
+    $units = [["d", 86400000], ["h", 3600000], ["m", 60000], ["s", 1000], ["ms", 1]];
+    $parts = [];
+    foreach ($units as $u) {
+        $q = floorDiv($ms, $u[1]);
+        if ($q > 0) { $parts[] = $q . $u[0]; $ms = $ms - $q * $u[1]; }
+    }
+    return $sign . join($parts, " ");
+}
+
+##
+ * "1h30m", "2d 4h", "250ms", "1.5s" -> milisekundy.
+##
+func parseDuration($text) {
+    $n = strlen($text);
+    $i = 0;
+    $total = 0;
+    $any = false;
+    $neg = false;
+    if ($n > 0 && substr($text, 0, 1) === "-") { $neg = true; $i = 1; }
+    while ($i < $n) {
+        $c = substr($text, $i, 1);
+        if ($c === " ") { $i++; continue; }
+        $j = $i;
+        while ($j < $n && index_of("0123456789.", substr($text, $j, 1)) >= 0) { $j++; }
+        if ($j === $i) { throw new Exception("Time.parseDuration: oczekiwano liczby w \"" . $text . "\""); }
+        $num = substr($text, $i, $j - $i);
+        $k = $j;
+        while ($k < $n && index_of("abcdefghijklmnopqrstuvwxyz", substr($text, $k, 1)) >= 0) { $k++; }
+        $unit = substr($text, $j, $k - $j);
+        $mul = null;
+        if ($unit === "d") { $mul = 86400000; }
+        else if ($unit === "h") { $mul = 3600000; }
+        else if ($unit === "m") { $mul = 60000; }
+        else if ($unit === "s") { $mul = 1000; }
+        else if ($unit === "ms") { $mul = 1; }
+        if ($mul === null) { throw new Exception("Time.parseDuration: nieznana jednostka \"" . $unit . "\" w \"" . $text . "\""); }
+        $total = $total + intval(floatval($num) * $mul + 0.5);
+        $any = true;
+        $i = $k;
+    }
+    if (!$any) { throw new Exception("Time.parseDuration: pusty czas trwania"); }
+    return $neg ? -$total : $total;
+}
