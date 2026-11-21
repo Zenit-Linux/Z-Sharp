@@ -1,0 +1,22 @@
+# M3: argumenty nazwane i rozwinięcie
+func area($w, $h = 2, $d = 3) { return $w * $h * $d; }
+func total(...$xs) { $t = 0; foreach ($xs as $x) { $t += $x; } return $t; }
+func three($a, $b, $c) { return $a . "-" . $b . "-" . $c; }
+
+echo area(2), area(2, 5), area(w: 4), area(d: 1, w: 3), area(2, d: 10);
+$p = [1, 2, 3];
+echo total(...$p), total(...$p, 4), total(10, ...$p);
+echo three(...$p);
+echo three(...["c" => "z", "a" => "x", "b" => "y"]);
+
+class Box {
+    public static $made = 0;
+    public $w; public $h;
+    func __construct($w, $h = 1) { $this->w = $w; $this->h = $h; Box.made += 1; }
+    func scale($k, $off = 0) { return $this->w * $this->h * $k + $off; }
+    static func unit() { return new Box(1); }
+}
+$b = new Box(h: 3, w: 4);
+echo $b->scale(2), $b->scale(k: 2, off: 1), $b->scale(...[5]);
+$u = Box.unit();
+echo Box.made;
