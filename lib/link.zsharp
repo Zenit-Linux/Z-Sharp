@@ -2,6 +2,8 @@ namespace link;
 
 import Workspace.parser;
 import Workspace.classes;
+import Workspace.closures;
+import Workspace.prelude;
 
 ##
  * Linker modułów dla backendów natywnych: łączy program wejściowy i zaimportowane moduły Z# (same funkcje)
@@ -123,9 +125,12 @@ func link($ast, $file) {
     $all = [];
     foreach ($lk->out as $s) { $all[] = $s; }
     foreach ($main as $s) { $all[] = $s; }
+    $all = prelude_pass($all);
     $ds = classes.desugar($all);
     foreach ($ds["errors"] as $e) { $lk->errors[] = [$e[0], $e[1], $e[2], $file]; }
-    $vr = variadic_pass($ds["ast"]);
+    $cl = closures.lift($ds["ast"]);
+    foreach ($cl["errors"] as $e) { $lk->errors[] = [$e[0], $e[1], $e[2], $file]; }
+    $vr = variadic_pass($cl["ast"]);
     foreach ($vr["errors"] as $e) { $lk->errors[] = [$e[0], $e[1], $e[2], $file]; }
     return ["ast" => $vr["ast"], "errors" => $lk->errors];
 }
@@ -191,4 +196,30 @@ func variadic_pass($ast) {
         $out[] = $s;
     }
     return ["ast" => $out, "errors" => $vp->errors];
+}
+
+func calls_of($x, $acc) {
+    if (!is_array($x)) { return $acc; }
+    if (parser.isNode($x) && $x[0] === ":Call" && $x[2][0] === ":Name") { $acc[$x[2][2]] = true; }
+    foreach ($x as $v) { $acc = calls_of($v, $acc); }
+    return $acc;
+}
+
+##
+ * Dokleja funkcje z prelude (map, filter, reduce...) użyte przez program, o ile program ich nie definiuje.
+##
+func prelude_pass($ast) {
+    $defined = [];
+    foreach ($ast as $s) { if ($s[0] === ":FuncStmt") { $defined[$s[2][2]] = true; } }
+    $used = calls_of($ast, []);
+    $want = [];
+    foreach (prelude.names() as $n) { if (has_key($used, $n) && !has_key($defined, $n)) { $want[$n] = true; } }
+    if (count($want) === 0) { return $ast; }
+    $out = [];
+    foreach (parser.parse(prelude.source()) as $s) {
+        $nm = $s[2][2];
+        if (has_key($want, $nm) || ($nm === "usort_rec" && has_key($want, "usort"))) { $out[] = $s; }
+    }
+    foreach ($ast as $s) { $out[] = $s; }
+    return $out;
 }
