@@ -1,0 +1,58 @@
+import Std.Toml;
+import Std.Json;
+$doc = Toml.decode("# komentarz
+title = \"TOML Example\"
+n = 1_000
+hex = 0xDEADbeef
+neg = -17
+f = 3.14
+e = 1e3
+big = +2.5e-2
+t = true
+d = 1979-05-27T07:32:00Z
+d2 = 1979-05-27 07:32:00
+tm = 07:32:00
+lit = 'C:\\path\\x'
+ml = \"\"\"
+Roses
+  are \\
+   red\"\"\"
+mll = '''
+raw \\n text'''
+arr = [1, 2, [3, 4], \"x\",
+  # c
+  5,
+]
+inl = { a = 1, b = { c = \"d\" } }
+dotted.key.here = 1
+\"quoted key\" = 2
+\"żółć\" = \"ą\\u00e9\\U0001F600\"
+
+[owner]
+name = \"Tom\"
+[owner.dob]
+y = 1979
+
+[[products]]
+name = \"Hammer\"
+sku = 738594937
+
+[[products]]
+
+[[products]]
+name = \"Nail\"
+[products.tags]
+x = 1
+[[products.parts]]
+p = 1
+[[products.parts]]
+p = 2
+");
+echo Json.encode($doc);
+echo Toml.encode($doc);
+echo Json.encode(Toml.decode(Toml.encode($doc)));
+foreach (["a = ", "a = 1 b = 2", "a = 1\na = 2", "[x]\n[x]", "a = 01", "a = \"abc", "a = [1, 2", "[a\n", "a = 1__0", "x = 'a'\n[x.y]", "= 1", "a = 1.", "a = {b=1,}"] as $bad) {
+  try { Toml.decode($bad); echo "no error: " . $bad; } catch (Exception $e) { echo $e->getMessage(); }
+}
+echo Toml.encode(["a" => 1.0, "b" => "q\"\n", "c" => [], "t" => ["k" => [1, 2], "l" => [["x" => 1], ["x" => 2]]], "s w" => 1, "n" => -0.5]);
+echo Toml.encode(Toml.decode("a = inf\nb = -inf\nc = nan\nd = +1.5"));
