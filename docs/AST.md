@@ -2,7 +2,7 @@
 
 Węzeł w Z#: `[":Rodzaj", linia, pole1, ...]`; listy to tablice; brak = `null`. Węzły bez własnej linii mają `0`.
 Kanoniczny zapis: `(Rodzaj@linia pole ...)`, listy `[a b]`, brak `_`, napisy w cudzysłowie z `\\ \" \n \t \r`.
-`zsc0 --sexp plik` (Rust) i `parser.dump` (Z#) dają identyczny tekst — to jest test parytetu (`tests/parser_parity.sh`).
+`zsc0 --sexp plik` (Rust) i `parser.dump` (Z#) dają identyczny tekst — to jest test parytetu (`scripts/tests/parser_parity.zsharp`).
 
 **Instrukcje:** `Expr e` · `Echo [e]` · `Block [s]` · `If c [then] else|_` · `While c [b]` · `DoWhile [b] c` ·
 `For [init] cond|_ [step] [b]` · `Foreach iter key|_ value [b]` · `Switch e [Case cond|_ [s]]` · `Return e|_` · `Break n` · `Continue n` ·
