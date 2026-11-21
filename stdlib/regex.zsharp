@@ -1,0 +1,633 @@
+namespace Regex;
+
+##
+ * Std.Regex — silnik wyrażeń regularnych (backtracking VM, bez zależności).
+ *
+ *   compile($wzorzec, $flagi = "")   skompilowane wyrażenie (flagi: i = ignoruj wielkość ASCII, m = ^/$ na liniach, s = . obejmuje \n)
+ *   test($re, $tekst)                czy wzorzec pasuje gdziekolwiek
+ *   fullMatch($re, $tekst)           czy cały tekst pasuje
+ *   find($re, $tekst, $od = 0)       pierwsze dopasowanie albo null
+ *   findAll($re, $tekst)             wszystkie dopasowania (nienakładające się)
+ *   replace($re, $tekst, $zamiennik, $wszystkie = true)
+ *   split($re, $tekst, $limit = 0)
+ *   escape($tekst)                   cytuje znaki specjalne
+ * Wszędzie `$re` może być skompilowanym wyrażeniem albo samym tekstem wzorca (kompilowanym przy każdym wywołaniu).
+ *
+ * Dopasowanie: ["text","start","end","groups","named"]; start/end to indeksy ZNAKÓW (nie bajtów); groups[0] = całość,
+ * grupy nieuczestniczące = null; named = ["nazwa" => tekst|null].
+ * Składnia: literały . [..] [^..] ^ $ \b \B | (..) (?:..) (?<nazwa>..) (?=..) (?!..) * + ? {n} {n,} {n,m} (+ wersje leniwe `?`),
+ *           \d \w \s \D \W \S (ASCII), \n \t \r \f \v \0 \xHH \uHHHH, odwołania wsteczne \1..\9.
+ * Zamiennik: $1 ${1} ${nazwa} $& $$ .  Brak lookbehind i klas Unicode; zbyt duże cofanie => wyjątek.
+##
+
+func fail($pat, $i, $msg) { throw new Exception("Regex: " . $msg . " (wzorzec \"" . $pat . "\", pozycja " . $i . ")"); }
+
+func isWord($c) { return strlen($c) === 1 && (is_alpha($c) || is_digit($c) || $c === "_"); }
+func isSpaceCh($c) { return $c === " " || $c === "\n" || $c === "\t" || $c === "\r" || $c === "\f" || $c === "\v"; }
+
+func hexval($c) {
+    $k = index_of("0123456789abcdef", lower($c));
+    return $k;
+}
+
+# ── wstępne skanowanie: numery i nazwy grup ──
+func prescan($c) {
+    $n = count($c);
+    $idx = [];
+    for ($i = 0; $i < $n; $i++) { $idx[] = 0; }
+    $names = [];
+    $k = 0;
+    $i = 0;
+    $incls = false;
+    while ($i < $n) {
+        $ch = $c[$i];
+        if ($ch === "\\") { $i += 2; continue; }
+        if ($incls) { if ($ch === "]") { $incls = false; } $i++; continue; }
+        if ($ch === "[") {
+            $incls = true; $i++;
+            if ($i < $n && $c[$i] === "^") { $i++; }
+            if ($i < $n && $c[$i] === "]") { $i++; }
+            continue;
+        }
+        if ($ch === "(") {
+            if ($i + 1 < $n && $c[$i + 1] === "?") {
+                if ($i + 2 < $n && $c[$i + 2] === "<" && $i + 3 < $n && $c[$i + 3] !== "=" && $c[$i + 3] !== "!") {
+                    $k++;
+                    $idx[$i] = $k;
+                    $j = $i + 3;
+                    $nm = "";
+                    while ($j < $n && $c[$j] !== ">") { $nm .= $c[$j]; $j++; }
+                    $names[$nm] = $k;
+                }
+            } else { $k++; $idx[$i] = $k; }
+        }
+        $i++;
+    }
+    return [$idx, $names, $k];
+}
+
+# ── parser: zwraca [węzeł, nowa pozycja] ──
+func classEsc($e) {
+    if ($e === "d") { return [1, "", ""]; }
+    if ($e === "w") { return [2, "", ""]; }
+    if ($e === "s") { return [3, "", ""]; }
+    if ($e === "D") { return [4, "", ""]; }
+    if ($e === "W") { return [5, "", ""]; }
+    if ($e === "S") { return [6, "", ""]; }
+    return null;
+}
+
+func simpleEsc($e) {
+    if ($e === "n") { return "\n"; }
+    if ($e === "t") { return "\t"; }
+    if ($e === "r") { return "\r"; }
+    if ($e === "f") { return "\f"; }
+    if ($e === "v") { return "\v"; }
+    if ($e === "0") { return chr(0); }
+    return null;
+}
+
+# \xHH / \uHHHH — $i wskazuje na literę x/u; zwraca [znak, nowa pozycja]
+func hexEsc($c, $i, $width, $pat) {
+    $n = count($c);
+    if ($i + $width >= $n + 0 && $i + $width > $n - 1 + 0) {
+        if ($i + $width > $n - 1) { if ($i + $width >= $n) { fail($pat, $i, "za krótka sekwencja \\x/\\u"); } }
+    }
+    $v = 0;
+    for ($k = 1; $k <= $width; $k++) {
+        $h = hexval($c[$i + $k]);
+        if ($h < 0) { fail($pat, $i, "niepoprawna cyfra szesnastkowa"); }
+        $v = $v * 16 + $h;
+    }
+    return [chr($v), $i + $width + 1];
+}
+
+func parseClass($c, $i, $pat) {
+    $n = count($c);
+    $i++;
+    $neg = false;
+    if ($i < $n && $c[$i] === "^") { $neg = true; $i++; }
+    $items = [];
+    $first = true;
+    while (true) {
+        if ($i >= $n) { fail($pat, $i, "niedomknięta klasa [..]"); }
+        $ch = $c[$i];
+        if ($ch === "]" && !$first) { $i++; break; }
+        $first = false;
+        $lo = null;
+        if ($ch === "\\") {
+            if ($i + 1 >= $n) { fail($pat, $i, "wzorzec kończy się na \\"); }
+            $e = $c[$i + 1];
+            $ce = classEsc($e);
+            if ($ce !== null) { $items[] = $ce; $i += 2; continue; }
+            $se = simpleEsc($e);
+            if ($se !== null) { $lo = $se; $i += 2; }
+            else if ($e === "x") { $r = hexEsc($c, $i + 1, 2, $pat); $lo = $r[0]; $i = $r[1]; }
+            else if ($e === "u") { $r = hexEsc($c, $i + 1, 4, $pat); $lo = $r[0]; $i = $r[1]; }
+            else { $lo = $e; $i += 2; }
+        } else { $lo = $ch; $i++; }
+        $hi = $lo;
+        if ($i + 1 < $n && $c[$i] === "-" && $c[$i + 1] !== "]") {
+            $h = $c[$i + 1];
+            if ($h === "\\") {
+                if ($i + 2 >= $n) { fail($pat, $i, "wzorzec kończy się na \\"); }
+                $e = $c[$i + 2];
+                $se = simpleEsc($e);
+                if ($se !== null) { $hi = $se; $i += 3; }
+                else if ($e === "x") { $r = hexEsc($c, $i + 2, 2, $pat); $hi = $r[0]; $i = $r[1]; }
+                else if ($e === "u") { $r = hexEsc($c, $i + 2, 4, $pat); $hi = $r[0]; $i = $r[1]; }
+                else { $hi = $e; $i += 3; }
+            } else { $hi = $h; $i += 2; }
+            if ($hi < $lo) { fail($pat, $i, "zły zakres w klasie"); }
+        }
+        $items[] = [0, $lo, $hi];
+    }
+    return [["class", $neg, $items], $i];
+}
+
+func parseAlt($c, $i, $gi, $pat) {
+    $n = count($c);
+    $branches = [];
+    while (true) {
+        $r = parseSeq($c, $i, $gi, $pat);
+        $branches[] = $r[0];
+        $i = $r[1];
+        if ($i < $n && $c[$i] === "|") { $i++; continue; }
+        break;
+    }
+    if (count($branches) === 1) { return [$branches[0], $i]; }
+    return [["alt", $branches], $i];
+}
+
+func parseSeq($c, $i, $gi, $pat) {
+    $n = count($c);
+    $items = [];
+    while ($i < $n && $c[$i] !== "|" && $c[$i] !== ")") {
+        $r = parseAtom($c, $i, $gi, $pat);
+        $node = $r[0];
+        $i = $r[1];
+        if ($i < $n) {
+            $q = $c[$i];
+            $min = -2; $max = -1;
+            if ($q === "*") { $min = 0; $max = -1; $i++; }
+            else if ($q === "+") { $min = 1; $max = -1; $i++; }
+            else if ($q === "?") { $min = 0; $max = 1; $i++; }
+            else if ($q === "{") {
+                $j = $i + 1;
+                $a = "";
+                while ($j < $n && is_digit($c[$j])) { $a .= $c[$j]; $j++; }
+                if ($a !== "" && $j < $n) {
+                    if ($c[$j] === "}") { $min = intval($a); $max = $min; $i = $j + 1; }
+                    else if ($c[$j] === ",") {
+                        $j++;
+                        $b = "";
+                        while ($j < $n && is_digit($c[$j])) { $b .= $c[$j]; $j++; }
+                        if ($j < $n && $c[$j] === "}") { $min = intval($a); $max = $b === "" ? -1 : intval($b); $i = $j + 1; }
+                    }
+                }
+            }
+            if ($min !== -2) {
+                if ($max !== -1 && $max < $min) { fail($pat, $i, "zły zakres powtórzeń {n,m}"); }
+                $greedy = true;
+                if ($i < $n && $c[$i] === "?") { $greedy = false; $i++; }
+                if ($node[0] === "bol" || $node[0] === "eol" || $node[0] === "wordb" || $node[0] === "look") { fail($pat, $i, "nie można powtarzać asercji"); }
+                $node = ["rep", $node, $min, $max, $greedy];
+            }
+        }
+        $items[] = $node;
+    }
+    if (count($items) === 1) { return [$items[0], $i]; }
+    return [["seq", $items], $i];
+}
+
+func parseAtom($c, $i, $gi, $pat) {
+    $n = count($c);
+    $ch = $c[$i];
+    if ($ch === "*" || $ch === "+" || $ch === "?") { fail($pat, $i, "brak czego powtarzać"); }
+    if ($ch === "(") {
+        $kind = "cap";
+        $start = $i;
+        $i++;
+        $name = "";
+        $neg = false;
+        if ($i < $n && $c[$i] === "?") {
+            if ($i + 1 >= $n) { fail($pat, $i, "niepoprawna grupa (?"); }
+            $d = $c[$i + 1];
+            if ($d === ":") { $kind = "nc"; $i += 2; }
+            else if ($d === "=" || $d === "!") { $kind = "look"; $neg = $d === "!"; $i += 2; }
+            else if ($d === "<" && $i + 2 < $n && $c[$i + 2] !== "=" && $c[$i + 2] !== "!") {
+                $i += 2;
+                while ($i < $n && $c[$i] !== ">") { $i++; }
+                $i++;
+            }
+            else { fail($pat, $i, "nieobsługiwana grupa (?" . $d . " (lookbehind nie jest wspierany)"); }
+        }
+        $r = parseAlt($c, $i, $gi, $pat);
+        $i = $r[1];
+        if ($i >= $n || $c[$i] !== ")") { fail($pat, $i, "niedomknięta grupa ("); }
+        $i++;
+        if ($kind === "cap") { return [["group", $gi[$start], $r[0]], $i]; }
+        if ($kind === "look") { return [["look", $neg, $r[0]], $i]; }
+        return [$r[0], $i];
+    }
+    if ($ch === "[") { return parseClass($c, $i, $pat); }
+    if ($ch === ".") { return [["any"], $i + 1]; }
+    if ($ch === "^") { return [["bol"], $i + 1]; }
+    if ($ch === "$") { return [["eol"], $i + 1]; }
+    if ($ch === "\\") {
+        if ($i + 1 >= $n) { fail($pat, $i, "wzorzec kończy się na \\"); }
+        $e = $c[$i + 1];
+        $ce = classEsc($e);
+        if ($ce !== null) { return [["class", false, [$ce]], $i + 2]; }
+        if ($e === "b") { return [["wordb", false], $i + 2]; }
+        if ($e === "B") { return [["wordb", true], $i + 2]; }
+        if ($e === "0") { return [["char", chr(0)], $i + 2]; }
+        if (is_digit($e)) { return [["backref", intval($e)], $i + 2]; }
+        $se = simpleEsc($e);
+        if ($se !== null) { return [["char", $se], $i + 2]; }
+        if ($e === "x") { $r = hexEsc($c, $i + 1, 2, $pat); return [["char", $r[0]], $r[1]]; }
+        if ($e === "u") { $r = hexEsc($c, $i + 1, 4, $pat); return [["char", $r[0]], $r[1]]; }
+        return [["char", $e], $i + 2];
+    }
+    return [["char", $ch], $i + 1];
+}
+
+# ── generator kodu: op 0 CHAR, 1 ANY, 2 CLASS, 3 SPLIT, 4 JMP, 5 SAVE, 6 BOL, 7 EOL, 8 WORDB, 9 BACKREF, 10 MATCH, 11 CHK, 12 LOOK ──
+func canEmpty($node) {
+    $t = $node[0];
+    if ($t === "char" || $t === "any" || $t === "class") { return false; }
+    if ($t === "seq") {
+        foreach ($node[1] as $x) { if (!canEmpty($x)) { return false; } }
+        return true;
+    }
+    if ($t === "alt") {
+        foreach ($node[1] as $x) { if (canEmpty($x)) { return true; } }
+        return false;
+    }
+    if ($t === "group") { return canEmpty($node[2]); }
+    if ($t === "rep") { return $node[2] === 0 || canEmpty($node[1]); }
+    return true;
+}
+
+func emit($node, $prog, $base) {
+    $t = $node[0];
+    if ($t === "char") { $prog[] = [0, $node[1], 0]; return $prog; }
+    if ($t === "any") { $prog[] = [1, 0, 0]; return $prog; }
+    if ($t === "class") { $prog[] = [2, $node[1], $node[2]]; return $prog; }
+    if ($t === "bol") { $prog[] = [6, 0, 0]; return $prog; }
+    if ($t === "eol") { $prog[] = [7, 0, 0]; return $prog; }
+    if ($t === "wordb") { $prog[] = [8, $node[1], 0]; return $prog; }
+    if ($t === "backref") { $prog[] = [9, $node[1], 0]; return $prog; }
+    if ($t === "seq") {
+        foreach ($node[1] as $x) { $prog = emit($x, $prog, $base); }
+        return $prog;
+    }
+    if ($t === "group") {
+        $prog[] = [5, 2 * $node[1], 0];
+        $prog = emit($node[2], $prog, $base);
+        $prog[] = [5, 2 * $node[1] + 1, 0];
+        return $prog;
+    }
+    if ($t === "look") {
+        $at = count($prog);
+        $prog[] = [12, $node[1], 0];
+        $prog = emit($node[2], $prog, $base);
+        $prog[] = [10, 0, 0];
+        $prog[$at] = [12, $node[1], count($prog)];
+        return $prog;
+    }
+    if ($t === "alt") {
+        $ends = [];
+        $bs = $node[1];
+        $cnt = count($bs);
+        for ($k = 0; $k < $cnt; $k++) {
+            if ($k < $cnt - 1) {
+                $at = count($prog);
+                $prog[] = [3, 0, 0];
+                $prog = emit($bs[$k], $prog, $base);
+                $ends[] = count($prog);
+                $prog[] = [4, 0, 0];
+                $prog[$at] = [3, $at + 1, count($prog)];
+            } else { $prog = emit($bs[$k], $prog, $base); }
+        }
+        foreach ($ends as $e) { $prog[$e] = [4, count($prog), 0]; }
+        return $prog;
+    }
+    if ($t === "rep") {
+        $sub = $node[1];
+        $min = $node[2];
+        $max = $node[3];
+        $greedy = $node[4];
+        if ($min > 1000 || $max > 1000) { throw new Exception("Regex: zbyt duże powtórzenie {n,m} (limit 1000)"); }
+        for ($k = 0; $k < $min; $k++) { $prog = emit($sub, $prog, $base); }
+        if ($max === -1) {
+            $at = count($prog);
+            $prog[] = [3, 0, 0];
+            $slot = $base + count($prog);
+            $guard = canEmpty($sub);
+            if ($guard) { $prog[] = [5, $slot, 0]; }
+            $prog = emit($sub, $prog, $base);
+            if ($guard) { $prog[] = [11, $slot, 0]; }
+            $prog[] = [4, $at, 0];
+            $end = count($prog);
+            $prog[$at] = $greedy ? [3, $at + 1, $end] : [3, $end, $at + 1];
+            return $prog;
+        }
+        $splits = [];
+        for ($k = $min; $k < $max; $k++) {
+            $splits[] = count($prog);
+            $prog[] = [3, 0, 0];
+            $prog = emit($sub, $prog, $base);
+        }
+        $end = count($prog);
+        foreach ($splits as $s) { $prog[$s] = $greedy ? [3, $s + 1, $end] : [3, $end, $s + 1]; }
+        return $prog;
+    }
+    throw new Exception("Regex: wewnętrzny błąd (węzeł " . $t . ")");
+}
+
+##
+ * Kompiluje wzorzec. Rzuca Exception z pozycją przy błędzie składni.
+##
+func compile($pattern, $flags = "") {
+    $c = chars($pattern);
+    $ps = prescan($c);
+    $r = parseAlt($c, 0, $ps[0], $pattern);
+    if ($r[1] < count($c)) { fail($pattern, $r[1], "niezrównoważony nawias )"); }
+    $ncap = $ps[2];
+    $base = 2 * ($ncap + 1);
+    $prog = [];
+    $prog = emit($r[0], $prog, $base);
+    $prog[] = [10, 0, 0];
+    return ["re" => true, "src" => $pattern, "prog" => $prog, "ncap" => $ncap, "names" => $ps[1],
+            "icase" => contains($flags, "i"), "multi" => contains($flags, "m"), "dotall" => contains($flags, "s")];
+}
+
+func ensure($re) { return is_string($re) ? compile($re, "") : $re; }
+
+# ── maszyna wirtualna ──
+func itemsHit($items, $c) {
+    foreach ($items as $it) {
+        $k = $it[0];
+        if ($k === 0) { if ($c >= $it[1] && $c <= $it[2]) { return true; } }
+        else if ($k === 1) { if (strlen($c) === 1 && is_digit($c)) { return true; } }
+        else if ($k === 2) { if (isWord($c)) { return true; } }
+        else if ($k === 3) { if (isSpaceCh($c)) { return true; } }
+        else if ($k === 4) { if (!(strlen($c) === 1 && is_digit($c))) { return true; } }
+        else if ($k === 5) { if (!isWord($c)) { return true; } }
+        else if ($k === 6) { if (!isSpaceCh($c)) { return true; } }
+    }
+    return false;
+}
+
+func classHit($neg, $items, $c, $icase) {
+    $r = itemsHit($items, $c);
+    if (!$r && $icase) { $r = itemsHit($items, lower($c)) || itemsHit($items, upper($c)); }
+    return $neg ? !$r : $r;
+}
+
+##
+ * Uruchamia program od $pc na pozycji $pos; zwraca tablicę slotów po dopasowaniu albo null.
+##
+func run($re, $c, $pc, $pos, $caps) {
+    $prog = $re["prog"];
+    $icase = $re["icase"];
+    $multi = $re["multi"];
+    $dotall = $re["dotall"];
+    $n = count($c);
+    $stack = [];
+    $sp = 0;
+    $steps = 0;
+    while (true) {
+        $steps++;
+        if ($steps > 5000000) { throw new Exception("Regex: zbyt duże cofanie (katastrofalny wzorzec?)"); }
+        $ins = $prog[$pc];
+        $op = $ins[0];
+        $ok = true;
+        if ($op === 0) {
+            if ($pos < $n && ($c[$pos] === $ins[1] || ($icase && lower($c[$pos]) === lower($ins[1])))) { $pos++; $pc++; } else { $ok = false; }
+        } else if ($op === 1) {
+            if ($pos < $n && ($dotall || $c[$pos] !== "\n")) { $pos++; $pc++; } else { $ok = false; }
+        } else if ($op === 2) {
+            if ($pos < $n && classHit($ins[1], $ins[2], $c[$pos], $icase)) { $pos++; $pc++; } else { $ok = false; }
+        } else if ($op === 3) {
+            $e = [$ins[2], $pos, 0];
+            if ($sp < count($stack)) { $stack[$sp] = $e; } else { $stack[] = $e; }
+            $sp++;
+            $pc = $ins[1];
+        } else if ($op === 4) {
+            $pc = $ins[1];
+        } else if ($op === 5) {
+            $e = [-1, $ins[1], $caps[$ins[1]]];
+            if ($sp < count($stack)) { $stack[$sp] = $e; } else { $stack[] = $e; }
+            $sp++;
+            $caps[$ins[1]] = $pos;
+            $pc++;
+        } else if ($op === 6) {
+            if ($pos === 0 || ($multi && $c[$pos - 1] === "\n")) { $pc++; } else { $ok = false; }
+        } else if ($op === 7) {
+            if ($pos === $n || ($multi && $c[$pos] === "\n")) { $pc++; } else { $ok = false; }
+        } else if ($op === 8) {
+            $a = $pos > 0 && isWord($c[$pos - 1]);
+            $b = $pos < $n && isWord($c[$pos]);
+            if (($a !== $b) !== $ins[1]) { $pc++; } else { $ok = false; }
+        } else if ($op === 9) {
+            $s = $caps[2 * $ins[1]];
+            $e2 = $caps[2 * $ins[1] + 1];
+            if ($s < 0 || $e2 < 0) { $ok = false; }
+            else {
+                $len = $e2 - $s;
+                if ($pos + $len > $n) { $ok = false; }
+                else {
+                    for ($k = 0; $k < $len; $k++) {
+                        $x = $c[$s + $k];
+                        $y = $c[$pos + $k];
+                        if ($x !== $y && !($icase && lower($x) === lower($y))) { $ok = false; break; }
+                    }
+                    if ($ok) { $pos += $len; $pc++; }
+                }
+            }
+        } else if ($op === 10) {
+            $caps[1] = $pos;
+            return $caps;
+        } else if ($op === 11) {
+            if ($caps[$ins[1]] === $pos) { $ok = false; } else { $pc++; }
+        } else if ($op === 12) {
+            $sub = run($re, $c, $pc + 1, $pos, $caps);
+            if (($sub !== null) !== $ins[1]) {
+                if ($sub !== null && !$ins[1]) { $caps = $sub; $caps[1] = -1; }
+                $pc = $ins[2];
+            } else { $ok = false; }
+        } else { throw new Exception("Regex: zły kod operacji " . $op); }
+        if (!$ok) {
+            $found = false;
+            while ($sp > 0) {
+                $sp--;
+                $e = $stack[$sp];
+                if ($e[0] < 0) { $caps[$e[1]] = $e[2]; }
+                else { $pc = $e[0]; $pos = $e[1]; $found = true; break; }
+            }
+            if (!$found) { return null; }
+        }
+    }
+}
+
+func freshCaps($re) {
+    $caps = [];
+    $total = 2 * ($re["ncap"] + 1) + count($re["prog"]);
+    for ($i = 0; $i < $total; $i++) { $caps[] = -1; }
+    return $caps;
+}
+
+func build($re, $c, $caps, $start) {
+    $groups = [];
+    for ($g = 0; $g <= $re["ncap"]; $g++) {
+        $s = $g === 0 ? $start : $caps[2 * $g];
+        $e = $g === 0 ? $caps[1] : $caps[2 * $g + 1];
+        if ($s < 0 || $e < 0) { $groups[] = null; }
+        else { $groups[] = join(array_slice($c, $s, $e - $s), ""); }
+    }
+    $named = [];
+    foreach (keys($re["names"]) as $nm) { $named[$nm] = $groups[$re["names"][$nm]]; }
+    return ["text" => $groups[0], "start" => $start, "end" => $caps[1], "groups" => $groups, "named" => $named];
+}
+
+func search($re, $c, $from, $anchored) {
+    $n = count($c);
+    $prog = $re["prog"];
+    $lit = null;
+    if ($prog[0][0] === 0 && !$re["icase"]) { $lit = $prog[0][1]; }
+    for ($s = $from; $s <= $n; $s++) {
+        if ($lit !== null) {
+            while ($s < $n && $c[$s] !== $lit) { $s++; }
+            if ($s >= $n) { return null; }
+        }
+        $caps = run($re, $c, 0, $s, freshCaps($re));
+        if ($caps !== null && (!$anchored || $caps[1] === $n)) { return build($re, $c, $caps, $s); }
+        if ($anchored) { return null; }
+    }
+    return null;
+}
+
+# ── API ──
+func find($re, $text, $from = 0) {
+    $re = ensure($re);
+    return search($re, chars($text), $from, false);
+}
+
+func test($re, $text) { return find($re, $text) !== null; }
+
+func fullMatch($re, $text) {
+    $re = ensure($re);
+    $c = chars($text);
+    $caps = run($re, $c, 0, 0, freshCaps($re));
+    if ($caps === null) { return false; }
+    if ($caps[1] === count($c)) { return true; }
+    # pełne dopasowanie może wymagać innej ścieżki: kotwiczymy sztucznie
+    $anch = compile("(?:" . $re["src"] . ")$", ($re["icase"] ? "i" : "") . ($re["multi"] ? "m" : "") . ($re["dotall"] ? "s" : ""));
+    $caps2 = run($anch, $c, 0, 0, freshCaps($anch));
+    return $caps2 !== null;
+}
+
+func findAll($re, $text) {
+    $re = ensure($re);
+    $c = chars($text);
+    $n = count($c);
+    $out = [];
+    $pos = 0;
+    while ($pos <= $n) {
+        $m = search($re, $c, $pos, false);
+        if ($m === null) { break; }
+        $out[] = $m;
+        $pos = $m["end"] > $m["start"] ? $m["end"] : $m["end"] + 1;
+    }
+    return $out;
+}
+
+func expand($re, $m, $tpl) {
+    $t = chars($tpl);
+    $n = count($t);
+    $out = [];
+    for ($i = 0; $i < $n; $i++) {
+        $ch = $t[$i];
+        if ($ch !== "$" || $i + 1 >= $n) { $out[] = $ch; continue; }
+        $d = $t[$i + 1];
+        if ($d === "$") { $out[] = "$"; $i++; }
+        else if ($d === "&") { $out[] = $m["text"]; $i++; }
+        else if (is_digit($d)) {
+            $j = $i + 1;
+            $num = "";
+            while ($j < $n && is_digit($t[$j]) && strlen($num) < 2) { $num .= $t[$j]; $j++; }
+            if (intval($num) > $re["ncap"] && strlen($num) === 2) { $num = substr($num, 0, 1); $j--; }
+            $g = intval($num);
+            if ($g <= $re["ncap"]) { if ($m["groups"][$g] !== null) { $out[] = $m["groups"][$g]; } }
+            $i = $j - 1;
+        }
+        else if ($d === "{") {
+            $j = $i + 2;
+            $nm = "";
+            while ($j < $n && $t[$j] !== "}") { $nm .= $t[$j]; $j++; }
+            if ($j >= $n) { $out[] = $ch; continue; }
+            $val = null;
+            if (has_key($re["names"], $nm)) { $val = $m["named"][$nm]; }
+            else if ($nm !== "" && is_digit(substr($nm, 0, 1)) && intval($nm) <= $re["ncap"]) { $val = $m["groups"][intval($nm)]; }
+            else { throw new Exception("Regex.replace: nieznana grupa \${" . $nm . "}"); }
+            if ($val !== null) { $out[] = $val; }
+            $i = $j;
+        }
+        else { $out[] = $ch; }
+    }
+    return join($out, "");
+}
+
+func replace($re, $text, $replacement, $all = true) {
+    $re = ensure($re);
+    $c = chars($text);
+    $n = count($c);
+    $out = [];
+    $pos = 0;
+    $last = 0;
+    while ($pos <= $n) {
+        $m = search($re, $c, $pos, false);
+        if ($m === null) { break; }
+        if ($m["start"] > $last) { $out[] = join(array_slice($c, $last, $m["start"] - $last), ""); }
+        $out[] = expand($re, $m, $replacement);
+        $last = $m["end"];
+        $pos = $m["end"] > $m["start"] ? $m["end"] : $m["end"] + 1;
+        if (!$all) { break; }
+    }
+    if ($last < $n) { $out[] = join(array_slice($c, $last, $n - $last), ""); }
+    return join($out, "");
+}
+
+func split($re, $text, $limit = 0) {
+    $re = ensure($re);
+    $c = chars($text);
+    $n = count($c);
+    $out = [];
+    $pos = 0;
+    $last = 0;
+    while ($pos <= $n) {
+        if ($limit > 0 && count($out) >= $limit - 1) { break; }
+        $m = search($re, $c, $pos, false);
+        if ($m === null) { break; }
+        if ($m["end"] === $m["start"]) {
+            if ($m["start"] >= $n) { break; }
+            if ($m["start"] === $last) { $pos = $m["start"] + 1; if ($m["start"] === 0) { continue; } }
+        }
+        $out[] = join(array_slice($c, $last, $m["start"] - $last), "");
+        $last = $m["end"];
+        $pos = $m["end"] > $m["start"] ? $m["end"] : $m["end"] + 1;
+    }
+    $out[] = join(array_slice($c, $last, $n - $last), "");
+    return $out;
+}
+
+func escape($text) {
+    $special = ".*+?^$()[]{}|\\/-";
+    $out = [];
+    foreach (chars($text) as $ch) {
+        if (strlen($ch) === 1 && index_of($special, $ch) >= 0) { $out[] = "\\" . $ch; } else { $out[] = $ch; }
+    }
+    return join($out, "");
+}
