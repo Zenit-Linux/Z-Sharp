@@ -1,6 +1,33 @@
-#!/usr/bin/env bash
+#!/usr/bin/env zsi
 # Parytet leksera: pozycje tokenów Rust (--tokens) == leksera w Z# (lib/lexer.zsharp) dla wszystkich programów testowych.
-. "$(dirname "$0")/../scripts/lib.sh"; ensure_stage0; n=0
-for f in "$ROOT"/tests/*.zsharp "$ROOT"/examples/*.zsharp "$ROOT"/lib/*.zsharp; do
-  diff <("$ZSC0" --tokens "$f" 2>&1 | awk '{print $1}') <("$ZSC0" run "$ROOT/tests/lexdump.zsharp" "$f" 2>&1) >/dev/null || { echo "RÓŻNICA leksera: $f"; exit 1; }; n=$((n+1))
-done; echo "lexer parity: $n plików OK"
+import Std.Os;
+import Workspace.Scripts;
+
+# pierwsze pole linii (jak `awk '{print $1}'`)
+func firstField($line) {
+    $t = trim($line);
+    $n = strlen($t);
+    for ($i = 0; $i < $n; $i++) {
+        $c = substr($t, $i, 1);
+        if ($c === " " || $c === "\t") { return substr($t, 0, $i); }
+    }
+    return $t;
+}
+
+func runLexerParity() {
+    Scripts.ensureStage0();
+    $z = Scripts.zsc0();
+    $r = Scripts.root();
+    $n = 0;
+    foreach (Scripts.paritySources($r) as $f) {
+        $rust = [];
+        foreach (Scripts.lines(Scripts.combined(Scripts.sh($z, ["--tokens", $f]))) as $ln) { $rust[] = firstField($ln); }
+        $zs = Scripts.lines(Scripts.combined(Scripts.sh($z, ["run", $r . "/tests/lexdump.zsharp", $f])));
+        if (join($rust, "\n") !== join($zs, "\n")) { echo "RÓŻNICA leksera: " . $f; return false; }
+        $n++;
+    }
+    echo "lexer parity: " . $n . " plików OK";
+    return true;
+}
+
+if (!runLexerParity()) { Os.exit(1); }
