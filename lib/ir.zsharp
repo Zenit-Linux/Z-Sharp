@@ -22,15 +22,21 @@ class IrTables {
         "is_alnum" => [1, 1], "is_space" => [1, 1], "is_hex_digit" => [1, 1], "array_slice" => [2, 3], "reverse" => [1, 1],
         "sort" => [1, 1], "push" => [2, -1], "dump" => [1, -1], "read_line" => [0, 0],
         "zs_obj_new" => [1, 1], "zs_obj_class" => [1, 1], "zs_obj_get" => [2, 2], "zs_obj_take" => [2, 2], "zs_obj_set" => [3, 3], "zs_obj_put" => [3, 3], "zs_no_method" => [2, 2], "zs_no_class" => [1, 1],
+        "zs_mkfn" => [2, 2], "zs_fn_id" => [1, 1], "zs_fn_cap" => [1, 1], "is_callable" => [1, 1], "zs_sget" => [1, 1], "zs_sset" => [2, 2],
         "necho" => [1, -1], "eecho" => [0, -1], "exit" => [0, 1]
     ];
     const MATH = ["sqrt" => 1, "floor" => 1, "ceil" => 1, "round" => 1, "abs" => 1, "min" => 2, "max" => 2, "pow" => 2];
     # moduły wbudowane: Moduł => [funkcja => arność]
     const MODULES = [
-        "System" => ["args" => 0, "env" => 1, "os" => 0, "architecture" => 0, "time" => 0, "cpuCount" => 0, "dirname" => 1, "resolveImport" => 2, "version" => 0, "exit" => -1],
-        "File" => ["read" => 1, "write" => 2, "append" => 2, "exists" => 1, "delete" => 1],
-        "Directory" => ["create" => 1, "exists" => 1, "list" => 1],
-        "Process" => ["run" => -1, "exec" => -1]
+        "System" => ["args" => 0, "env" => 1, "os" => 0, "architecture" => 0, "time" => 0, "cpuCount" => 0, "dirname" => 1, "resolveImport" => 2, "version" => 0, "exit" => -1,
+                     "setEnv" => 2, "unsetEnv" => 1, "environ" => 0, "cwd" => 0, "chdir" => 1, "pid" => 0, "hostname" => 0, "bytes" => 1, "fromBytes" => 1,
+                     "nowNanos" => 0, "monotonic" => 0, "sleep" => 1, "localOffset" => 1],
+        "File" => ["read" => 1, "write" => 2, "append" => 2, "exists" => 1, "delete" => 1,
+                   "stat" => 1, "rename" => 2, "realpath" => 1, "chmod" => 2, "symlink" => 2, "readlink" => 1],
+        "Directory" => ["create" => 1, "exists" => 1, "list" => 1, "remove" => 1],
+        "Process" => ["run" => -1, "exec" => -1],
+        "Socket" => ["tcpConnect" => 3, "tcpListen" => 2, "accept" => 1, "read" => 2, "write" => 2, "close" => 1, "setTimeout" => 2,
+                  "udpBind" => 2, "sendTo" => 4, "recvFrom" => 2, "resolve" => 1, "localAddr" => 1, "peerAddr" => 1]
     ];
     const SIMPLE_TYPES = ["int", "float", "string", "bool", "array"];
 }
