@@ -1,0 +1,4 @@
+import Std.Path;
+echo Path.join("/a/b", "../c", "d.txt"), Path.normalize("a/./b/../../.."), Path.dirname("/x/y/z/"), Path.basename("/x/y/z.tar.gz", ".gz");
+echo Path.ext("a/b.tar.gz"), Path.stem("a/b.tar.gz"), Path.withExt("a/b.txt", "md"), Path.relative("/a/b/c", "/a/d/e");
+echo Path.isSubpath("/a", "/a/b"), Path.split("/q/w.e"), Path.absolute("x", "/tmp");
