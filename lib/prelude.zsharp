@@ -1,0 +1,27 @@
+namespace prelude;
+
+##
+ * Funkcje wyższego rzędu dostępne bez importu (odpowiednik wbudowanych funkcji stage0).
+ * Backendy natywne nie mają ich w runtime C: linker (lib/link.zsharp) dokleja potrzebne funkcje jako zwykły kod Z#,
+ * o ile program ich nie definiuje sam. Semantyka musi być zgodna z stage0/zs-interp/src/builtins.rs.
+##
+
+func names() {
+    return ["map", "filter", "reduce", "each", "find", "any", "all", "usort", "sum"];
+}
+
+func source() {
+    $l = [];
+    $l[] = "func map($a, $f) { $o = []; foreach ($a as $k => $v) { $o[$k] = $f($v); } return $o; }";
+    $l[] = "func filter($a, $f) { $o = []; foreach ($a as $k => $v) { if ($f($v)) { $o[$k] = $v; } } return $o; }";
+    $l[] = "func reduce($a, $f, $acc) { foreach ($a as $v) { $acc = $f($acc, $v); } return $acc; }";
+    $l[] = "func each($a, $f) { foreach ($a as $v) { $f($v); } return null; }";
+    $l[] = "func find($a, $f) { foreach ($a as $v) { if ($f($v)) { return $v; } } return null; }";
+    $l[] = "func any($a, $f) { foreach ($a as $v) { if ($f($v)) { return true; } } return false; }";
+    $l[] = "func all($a, $f) { foreach ($a as $v) { if (!$f($v)) { return false; } } return true; }";
+    $l[] = "func sum($a) { $t = 0; foreach ($a as $v) { $t = $t + $v; } return $t; }";
+    # sortowanie przez scalanie (stabilne); komparator zwraca liczbę: <0, 0, >0
+    $l[] = "func usort($a, $f) { $v = values($a); return usort_rec($v, $f); }";
+    $l[] = "func usort_rec($v, $f) { $n = count($v); if ($n < 2) { return $v; } $m = intval($n / 2); $l = usort_rec(array_slice($v, 0, $m), $f); $r = usort_rec(array_slice($v, $m), $f); $o = []; $i = 0; $j = 0; $nl = count($l); $nr = count($r); while ($i < $nl && $j < $nr) { if ($f($l[$i], $r[$j]) <= 0) { $o[] = $l[$i]; $i++; } else { $o[] = $r[$j]; $j++; } } while ($i < $nl) { $o[] = $l[$i]; $i++; } while ($j < $nr) { $o[] = $r[$j]; $j++; } return $o; }";
+    return join($l, " ");
+}
