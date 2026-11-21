@@ -1,0 +1,11 @@
+# M3: funkcje wyższego rzędu (map/filter/reduce/each/find/any/all/usort/sum)
+$xs = [5, 3, 8, 1];
+echo map($xs, fn($x) => $x * $x);
+echo filter($xs, fn($x) => $x > 2);
+echo reduce($xs, fn($acc, $x) => $acc + $x, 0);
+echo sum($xs);
+echo find($xs, fn($x) => $x > 4), find($xs, fn($x) => $x > 100);
+echo any($xs, fn($x) => $x === 8), all($xs, fn($x) => $x > 1);
+echo usort($xs, fn($a, $b) => $a - $b);
+echo usort(["pear", "fig", "apple"], fn($a, $b) => strlen($a) - strlen($b));
+each($xs, func($x) { echo "i", $x; });
