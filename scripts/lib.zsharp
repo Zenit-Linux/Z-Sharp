@@ -1,10 +1,143 @@
-# wspólne dla skryptów: ROOT, ZSC0, lokalizacja repo zsc
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export ZS_HOME="$ROOT"
-ZSC0="${ZSC0:-$ROOT/target/release/zsc0}"
-ZSC_DIR="${ZSC_DIR:-}"
-if [ -z "$ZSC_DIR" ]; then for c in "$ROOT/../zsc" "$ROOT/zsc"; do [ -f "$c/src/main.zsharp" ] && ZSC_DIR="$(cd "$c" && pwd)" && break; done; fi
-ensure_stage0() { [ -x "$ZSC0" ] || (cd "$ROOT" && cargo build --release --quiet) || { echo "nie udało się zbudować stage0"; exit 1; }; }
-# repo zsc oczekuje katalogu Z-Sharp/ obok src/ — jeśli go brak, tworzymy symlink tymczasowy
-link_workspace() { [ -e "$ZSC_DIR/Z-Sharp" ] || { ln -s "$ROOT" "$ZSC_DIR/Z-Sharp"; CREATED_LINK=1; }; }
-unlink_workspace() { [ "${CREATED_LINK:-0}" = 1 ] && rm -f "$ZSC_DIR/Z-Sharp"; true; }
+namespace Scripts;
+
+import Std.Os;
+import Std.Path;
+
+##
+ * Wspólne funkcje skryptów repozytorium (odpowiednik dawnego lib.sh).
+ *   root()            katalog główny repo Z-Sharp (pierwszy katalog w górę od skryptu zawierający Z#.toml)
+ *   zsc0()            ścieżka stage0 ($ZSC0 albo target/release/zsc0); ensureStage0() buduje go przez cargo, gdy go brak
+ *   zscDir()          repo zsc ($ZSC_DIR, ../zsc albo ./zsc) albo null
+ *   linkWorkspace()/unlinkWorkspace()   tymczasowy symlink Z-Sharp obok src/ repo zsc
+ *   sh/must/die/step  uruchamianie poleceń i komunikaty
+##
+
+func root() {
+    $d = Path.dirname(Path.absolute(System.args()[0]));
+    while ($d !== "/" && !Os.isFile($d . "/Z#.toml")) { $d = Path.dirname($d); }
+    if (!Os.isFile($d . "/Z#.toml")) { die("nie znaleziono korzenia repo Z-Sharp (brak Z#.toml)"); }
+    System.setEnv("ZS_HOME", $d);
+    return $d;
+}
+
+func zsc0() {
+    $e = Os.env("ZSC0", "");
+    return $e !== "" ? $e : root() . "/target/release/zsc0";
+}
+
+func die($msg) {
+    eecho("BŁĄD: " . $msg);
+    Os.exit(1);
+}
+
+func step($title) { echo "== " . $title; return null; }
+
+##
+ * Uruchamia program i zbiera wyjście; zwraca ["status","stdout","stderr"] (nie rzuca przy niezerowym statusie).
+##
+func sh($cmd, $args = []) { return Os.run($cmd, $args); }
+
+##
+ * Uruchamia program, wymaga statusu 0; zwraca stdout. $what opisuje krok w komunikacie błędu.
+##
+func must($what, $cmd, $args = []) {
+    $r = Os.run($cmd, $args);
+    if ($r["status"] !== 0) {
+        eecho($r["stdout"] . $r["stderr"]);
+        die($what . " — kod wyjścia " . $r["status"]);
+    }
+    return $r["stdout"];
+}
+
+##
+ * Uruchamia program z odziedziczonym wyjściem (widoczny postęp); zwraca kod wyjścia.
+##
+func inherit($cmd, $args = []) { return Os.exec($cmd, $args); }
+
+func ensureStage0() {
+    if (Os.isFile(zsc0())) { return null; }
+    step("budowanie stage0 (cargo)");
+    $old = Os.cwd();
+    Os.chdir(root());
+    $code = Os.exec("cargo", ["build", "--release", "--quiet"]);
+    Os.chdir($old);
+    if ($code !== 0 || !Os.isFile(zsc0())) { die("nie udało się zbudować stage0"); }
+    return null;
+}
+
+func zscDir() {
+    $e = Os.env("ZSC_DIR", "");
+    if ($e !== "") { return Path.absolute($e); }
+    foreach ([root() . "/../zsc", root() . "/zsc"] as $c) {
+        if (Os.isFile($c . "/src/main.zsharp")) { return Path.normalize(Path.absolute($c)); }
+    }
+    return null;
+}
+
+func requireZscDir($who) {
+    $d = zscDir();
+    if ($d === null) { die($who . ": nie znaleziono repo zsc (ustaw ZSC_DIR)"); }
+    return $d;
+}
+
+##
+ * Repo zsc oczekuje katalogu Z-Sharp/ obok src/ — gdy go brak, tworzy symlink; zwraca true, jeśli go utworzył.
+##
+func linkWorkspace($zscDir) {
+    $l = $zscDir . "/Z-Sharp";
+    if (Os.exists($l)) { return false; }
+    Os.symlink(root(), $l);
+    return true;
+}
+
+func unlinkWorkspace($zscDir, $created) {
+    if ($created) { Os.remove($zscDir . "/Z-Sharp"); }
+    return null;
+}
+
+func tmp() { return Os.mkdtemp("zs-script-"); }
+
+# porównanie plików bajt w bajt (cmp), true gdy identyczne
+func sameFile($a, $b) { return Os.run("cmp", ["-s", $a, $b])["status"] === 0; }
+
+func fileSize($p) { return Os.size($p); }
+
+# liczba niepustych linii w plikach (jak `grep -cv '^\s*$'`)
+func loc($files) {
+    $n = 0;
+    foreach ($files as $f) {
+        if (!Os.isFile($f)) { continue; }
+        foreach (split(Os.readFile($f), "\n") as $ln) { if (trim($ln) !== "") { $n++; } }
+    }
+    return $n;
+}
+
+# pliki katalogu z danym rozszerzeniem (posortowane), pełne ścieżki
+func filesIn($dir, $ext) {
+    $out = [];
+    if (!Os.isDir($dir)) { return $out; }
+    foreach (sort(Os.list($dir)) as $n) {
+        if (ends_with($n, $ext) && Os.isFile($dir . "/" . $n)) { $out[] = $dir . "/" . $n; }
+    }
+    return $out;
+}
+
+# stdout + stderr procesu (jak `2>&1`)
+func combined($res) { return $res["stdout"] . $res["stderr"]; }
+
+# wszystkie programy źródłowe sprawdzane testami parytetu: tests/, examples/, lib/
+func paritySources($r) {
+    $out = [];
+    foreach (["tests", "examples", "lib"] as $d) {
+        foreach (filesIn($r . "/" . $d, ".zsharp") as $f) { $out[] = $f; }
+    }
+    return $out;
+}
+
+# lista linii tekstu bez końcowych pustych linii
+func lines($text) {
+    $l = split($text, "\n");
+    $n = count($l);
+    while ($n > 0 && $l[$n - 1] === "") { $n--; }
+    return array_slice($l, 0, $n);
+}
