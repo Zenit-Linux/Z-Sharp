@@ -1,0 +1,9 @@
+import Std.Json;
+$t = "{\"a\": [1, 2.5, -3e2, true, null, \"x\\ny\\u00e9\\ud83d\\ude00\"], \"b\": {\"c\": {}}, \"n\": 12345678901234567890, \"k\": []}";
+$v = Json.decode($t);
+echo $v["a"][2], $v["a"][5], $v["n"], $v["b"];
+echo Json.encode($v);
+echo Json.encodePretty(["x" => [1, 2, ["y" => null]], "s" => "q\"\\\t\x01", "e" => []]);
+echo Json.valid("[1,]"), Json.valid("[1]"), Json.valid("01");
+try { Json.decode("{\"a\":\n [1, ?]}"); } catch (Exception $e) { echo $e->getMessage(); }
+echo Json.encode(Json.decode("[1.0, 3, \"é\", 0.1, 1e25]"));
