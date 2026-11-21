@@ -1,0 +1,11 @@
+import Std.Time;
+$p = Time.fromUnix(1700000000);
+echo Time.toIso($p), Time.format($p, "%A, %d %B %Y %I:%M:%S %p %j %u %z"), Time.weekday($p);
+echo Time.toUnix(Time.parseIso("2026-11-21T12:50:00.5+01:00")), Time.toIso(Time.parseIso("2024-02-29")), Time.toIso(Time.parseIso("2026-11-21 12:50:01.123456Z"));
+echo Time.toIso(Time.addMonths(Time.make(2024, 1, 31), 1)), Time.toIso(Time.add(Time.make(1969, 12, 31, 23, 59, 59), 2));
+echo Time.toIso(Time.fromUnix(-1)), Time.toIso(Time.fromUnix(-86400 * 365 * 100)), Time.diff(Time.make(2026,3,1), Time.make(2026,2,1));
+echo Time.format(Time.parse("21/Nov/2026 03:04 PM +0130", "%d/%b/%Y %I:%M %p %z"), "%F %T %:z %s");
+echo Time.formatDuration(93784005), Time.parseDuration("1d 2h 3m 4s 5ms"), Time.parseDuration("1.5s");
+try { Time.make(2026, 4, 31); } catch (Exception $e) { echo $e->getMessage(); }
+try { Time.parseIso("2026-13-01"); } catch (Exception $e) { echo $e->getMessage(); }
+echo Time.nowSeconds() > 1700000000, Time.monotonic() > 0;
