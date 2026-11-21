@@ -5,7 +5,7 @@
 #include <setjmp.h>
 #include <stdio.h>
 
-enum { ZS_NULL = 0, ZS_BOOL = 1, ZS_INT = 2, ZS_FLOAT = 3, ZS_STR = 4, ZS_ARRAY = 5, ZS_OBJ = 6, ZS_EXC = 7 };
+enum { ZS_NULL = 0, ZS_BOOL = 1, ZS_INT = 2, ZS_FLOAT = 3, ZS_STR = 4, ZS_ARRAY = 5, ZS_OBJ = 6, ZS_EXC = 7, ZS_FN = 8 };
 
 typedef struct ZStr ZStr;
 typedef struct ZArr ZArr;
@@ -85,6 +85,9 @@ V b_pad_left3(V, V, V); V b_pad_right3(V, V, V);
 V b_array_slice(V, V); V b_array_slice3(V, V, V); V b_reverse(V); V b_sort(V); V b_push(V, V); V b_dump(V);
 V b_is_digit(V); V b_is_alpha(V); V b_is_alnum(V); V b_is_space(V); V b_is_hex_digit(V); V b_to_hex(V);
 V b_read_line(void);
+/* M3: wartości funkcyjne (domknięcia) i statyczne pola klas */
+V b_zs_mkfn(V id, V cap); V b_zs_fn_id(V f); V b_zs_fn_cap(V f); V b_is_callable(V f);
+V b_zs_sget(V name); V b_zs_sset(V name, V v);
 
 /* moduły: Math / System / File / Directory / Process */
 V m_Math_sqrt(V); V m_Math_floor(V); V m_Math_ceil(V); V m_Math_round(V); V m_Math_abs(V); V m_Math_min(V, V); V m_Math_max(V, V); V m_Math_pow(V, V);
@@ -93,6 +96,14 @@ V m_System_resolveImport(V, V); V m_System_cpuCount(void); V m_System_dirname(V)
 V m_File_read(V); V m_File_write(V, V); V m_File_append(V, V); V m_File_exists(V); V m_File_delete(V);
 V m_Directory_create(V); V m_Directory_exists(V); V m_Directory_list(V);
 V m_Process_run(V, V); V m_Process_exec(V, V);
+/* rozszerzenia systemowe dla Std.Os / Std.Time / Std.Net (zgodne z stage0/zs-interp/src/sysmods.rs) */
+V m_System_setEnv(V, V); V m_System_unsetEnv(V); V m_System_environ(void); V m_System_cwd(void); V m_System_chdir(V); V m_System_pid(void);
+V m_System_bytes(V); V m_System_fromBytes(V); V m_System_hostname(void); V m_System_nowNanos(void); V m_System_monotonic(void); V m_System_sleep(V); V m_System_localOffset(V);
+V m_File_stat(V); V m_File_rename(V, V); V m_File_realpath(V); V m_File_chmod(V, V); V m_File_symlink(V, V); V m_File_readlink(V);
+V m_Directory_remove(V);
+V m_Socket_tcpConnect(V, V, V); V m_Socket_tcpListen(V, V); V m_Socket_accept(V); V m_Socket_read(V, V); V m_Socket_write(V, V); V m_Socket_close(V);
+V m_Socket_setTimeout(V, V); V m_Socket_udpBind(V, V); V m_Socket_sendTo(V, V, V, V); V m_Socket_recvFrom(V, V); V m_Socket_resolve(V);
+V m_Socket_localAddr(V); V m_Socket_peerAddr(V);
 
 /* pomocniki backendu LLVM */
 V zl_float_lit(const char *s);
