@@ -1051,25 +1051,35 @@ class LlEmitter {
         $d[] = "declare void @zs_eecho_end()";
         $d[] = "declare { i64, i64 } @s_exit(" . $v . ")";
         $d[] = "declare { i64, i64 } @b_substr(" . $v . ", " . $v . ", " . $v . ", i32)";
-        foreach (["zv_dup", "zv_wr", "zv_neg", "zv_bitnot", "b_getmessage", "b_zs_obj_new", "b_zs_obj_class", "b_zs_no_class", "b_throw_v", "b_dump", "b_count", "b_strlen", "b_typeof", "b_is_int", "b_is_float",
+        foreach (["zv_dup", "zv_wr", "zv_neg", "zv_bitnot", "b_getmessage", "b_zs_obj_new", "b_zs_obj_class", "b_zs_no_class", "b_zs_fn_id", "b_zs_fn_cap", "b_is_callable", "b_zs_sget", "b_throw_v", "b_dump", "b_count", "b_strlen", "b_typeof", "b_is_int", "b_is_float",
                   "b_is_string", "b_is_bool", "b_is_array", "b_is_null", "b_strval", "b_boolval", "b_intval", "b_floatval", "b_ord", "b_chr",
                   "b_trim", "b_keys", "b_values", "b_upper", "b_lower", "b_chars", "b_reverse", "b_sort", "b_to_hex", "b_is_digit",
                   "b_is_alpha", "b_is_alnum", "b_is_space", "b_is_hex_digit", "m_Math_sqrt", "m_Math_floor", "m_Math_ceil", "m_Math_round",
-                  "m_Math_abs", "m_System_env", "m_System_dirname", "m_File_read", "m_File_exists", "m_File_delete", "m_Directory_create",
-                  "m_Directory_exists", "m_Directory_list"] as $f) {
+                  "m_Math_abs",
+                  ] as $f) {
             $d[] = "declare { i64, i64 } @" . $f . "(" . $v . ")";
         }
         foreach (["zv_add", "zv_sub", "zv_mul", "zv_div", "zv_mod", "zv_pow", "zv_concat", "zv_bitand", "zv_bitor", "zv_bitxor", "zv_shl", "zv_shr", "zv_index", "zv_index_opt", "b_contains", "b_starts_with",
                   "b_ends_with", "b_index_of", "b_repeat", "b_join", "b_in_array", "b_range", "b_has_key", "b_pad_left", "b_pad_right",
-                  "b_array_slice", "b_push", "m_Math_min", "m_Math_max", "m_Math_pow", "m_File_write", "m_File_append", "m_Process_run",
-                  "m_Process_exec", "b_split", "m_System_resolveImport", "b_zs_obj_get", "b_zs_obj_take", "b_zs_no_method"] as $f) {
+                  "b_array_slice", "b_push", "m_Math_min", "m_Math_max", "m_Math_pow",
+                  "b_split", "b_zs_obj_get", "b_zs_obj_take", "b_zs_no_method", "b_zs_mkfn", "b_zs_sset"] as $f) {
             $d[] = "declare { i64, i64 } @" . $f . "(" . $v . ", " . $v . ")";
         }
         foreach (["b_zs_obj_set", "b_zs_obj_put", "b_replace", "b_pad_left3", "b_pad_right3", "b_array_slice3"] as $f) {
             $d[] = "declare { i64, i64 } @" . $f . "(" . $v . ", " . $v . ", " . $v . ")";
         }
-        foreach (["m_System_args", "m_System_os", "m_System_architecture", "m_System_time", "m_System_cpuCount", "m_System_version", "b_read_line"] as $f) {
+        foreach (["b_read_line"] as $f) {
             $d[] = "declare { i64, i64 } @" . $f . "()";
+        }
+        # funkcje modułów wbudowanych (System, File, Directory, Process, Net) — deklaracje z tabeli IrTables.MODULES
+        foreach (IrTables.MODULES as $mod => $fns) {
+            foreach ($fns as $fn => $ar) {
+                if ($mod === "System" && $fn === "exit") { continue; }
+                $n = $ar < 0 ? 2 : $ar;
+                $ps = [];
+                for ($i = 0; $i < $n; $i++) { $ps[] = $v; }
+                $d[] = "declare { i64, i64 } @m_" . $mod . "_" . $fn . "(" . join($ps, ", ") . ")";
+            }
         }
         return $d;
     }
