@@ -1,0 +1,3 @@
+/a/c/d.txt .. /x/y z.tar
+.gz b.tar a/b.md ../../d/e
+true ["/q", "w.e"] /tmp/x
