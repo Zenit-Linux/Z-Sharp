@@ -1,1 +1,89 @@
+name: Build docs
 
+# Buduje stronę projektu (TypeScript w website/) i publikuje ją w GitHub Pages.
+# Wymaga: Settings → Pages → Build and deployment → Source: "GitHub Actions".
+on:
+  push:
+    branches: [main]
+    paths:
+      - "website/**"
+      - "docs/**"
+      - "index.html"
+      - "CHANGELOG.md"
+      - ".github/workflows/build-docs.yml"
+  pull_request:
+    paths:
+      - "website/**"
+      - "docs/**"
+      - "index.html"
+      - "CHANGELOG.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: website
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+
+      - name: Zależności
+        run: npm ci --no-audit --no-fund
+
+      - name: Typy (tsc)
+        run: npm run typecheck
+
+      - name: Testy
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: Złóż artefakt strony (układ jak w repozytorium)
+        working-directory: .
+        run: |
+          set -euo pipefail
+          rm -rf _site
+          mkdir -p _site/website
+          cp index.html _site/index.html
+          cp -r website/dist _site/website/dist
+          cp -r docs _site/docs
+          touch _site/.nojekyll
+          test -s _site/website/dist/app.js
+          test -s _site/website/dist/content/SPEC.md
+
+      - uses: actions/configure-pages@v5
+        if: github.event_name != 'pull_request'
+
+      - uses: actions/upload-pages-artifact@v3
+        if: github.event_name != 'pull_request'
+        with:
+          path: _site
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
