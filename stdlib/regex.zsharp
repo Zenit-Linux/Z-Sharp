@@ -3,7 +3,7 @@ namespace Regex;
 ##
  * Std.Regex — silnik wyrażeń regularnych (backtracking VM, bez zależności).
  *
- *   compile($wzorzec, $flagi = "")   skompilowane wyrażenie (flagi: i = ignoruj wielkość ASCII, m = ^/$ na liniach, s = . obejmuje \n)
+ *   compile($wzorzec, $flagi = "")   skompilowane wyrażenie (flagi: i = ignoruj wielkość ASCII, m = ^/$ na liniach, s = . obejmuje \n, u = \w \d \s \b rozumieją Unicode)
  *   test($re, $tekst)                czy wzorzec pasuje gdziekolwiek
  *   fullMatch($re, $tekst)           czy cały tekst pasuje
  *   find($re, $tekst, $od = 0)       pierwsze dopasowanie albo null
@@ -16,8 +16,11 @@ namespace Regex;
  * Dopasowanie: ["text","start","end","groups","named"]; start/end to indeksy ZNAKÓW (nie bajtów); groups[0] = całość,
  * grupy nieuczestniczące = null; named = ["nazwa" => tekst|null].
  * Składnia: literały . [..] [^..] ^ $ \b \B | (..) (?:..) (?<nazwa>..) (?=..) (?!..) * + ? {n} {n,} {n,m} (+ wersje leniwe `?`),
- *           \d \w \s \D \W \S (ASCII), \n \t \r \f \v \0 \xHH \uHHHH, odwołania wsteczne \1..\9.
- * Zamiennik: $1 ${1} ${nazwa} $& $$ .  Brak lookbehind i klas Unicode; zbyt duże cofanie => wyjątek.
+ *           (?<=..) (?<!..) (lookbehind o dowolnej długości), \d \w \s \D \W \S (ASCII; z flagą u: Unicode), \p{..} \P{..} (właściwości Unicode),
+ *           \n \t \r \f \v \0 \xHH \uHHHH, odwołania wsteczne \1..\9.
+ *   Właściwości \p{..}: L Lu Ll N Nd P S Z Zs (+ aliasy Alpha Alnum Upper Lower Digit Space Punct), Any, skrypty: Latin Greek Cyrillic Han Hiragana
+ *   Katakana Hangul Arabic Hebrew Thai Devanagari. Lu/Ll/L to tablice zakresów (łacina, greka, cyrylica i główne pisma) — przybliżenie, nie pełny UCD.
+ * Zamiennik: $1 ${1} ${nazwa} $& $$ .  Zbyt duże cofanie => wyjątek.
 ##
 
 func fail($pat, $i, $msg) { throw new Exception("Regex: " . $msg . " (wzorzec \"" . $pat . "\", pozycja " . $i . ")"); }
@@ -65,6 +68,140 @@ func prescan($c) {
     }
     return [$idx, $names, $k];
 }
+
+# ── Unicode: punkty kodowe i właściwości ──
+func cp($c) {
+    if (strlen($c) === 1) { return ord($c); }
+    $b = System.bytes($c);
+    $n = count($b);
+    $x = $b[0];
+    if ($x >= 240 && $n >= 4) { return (($x & 7) << 18) | (($b[1] & 63) << 12) | (($b[2] & 63) << 6) | ($b[3] & 63); }
+    if ($x >= 224 && $n >= 3) { return (($x & 15) << 12) | (($b[1] & 63) << 6) | ($b[2] & 63); }
+    if ($x >= 192 && $n >= 2) { return (($x & 31) << 6) | ($b[1] & 63); }
+    return $x;
+}
+
+func inRanges($v, $r) {
+    $n = count($r);
+    for ($i = 0; $i < $n; $i += 2) { if ($v >= $r[$i] && $v <= $r[$i + 1]) { return true; } }
+    return false;
+}
+
+func isUpperCp($v) {
+    if ($v < 128) { return $v >= 65 && $v <= 90; }
+    if (($v >= 192 && $v <= 222 && $v !== 215)) { return true; }
+    if ($v >= 256 && $v <= 311) { return $v % 2 === 0; }
+    if ($v >= 313 && $v <= 328) { return $v % 2 === 1; }
+    if ($v >= 330 && $v <= 375) { return $v % 2 === 0; }
+    if ($v === 376) { return true; }
+    if ($v >= 377 && $v <= 382) { return $v % 2 === 1; }
+    if ($v === 902 || ($v >= 904 && $v <= 906) || $v === 908 || $v === 910 || $v === 911 || ($v >= 913 && $v <= 929) || ($v >= 931 && $v <= 939)) { return true; }
+    if ($v >= 1024 && $v <= 1071) { return true; }
+    if (($v >= 1120 && $v <= 1153) || ($v >= 1162 && $v <= 1215)) { return $v % 2 === 0; }
+    if ($v === 1216) { return true; }
+    if ($v >= 1217 && $v <= 1229) { return $v % 2 === 1; }
+    if ($v >= 1232 && $v <= 1327) { return $v % 2 === 0; }
+    if ($v >= 7680 && $v <= 7935) { return $v % 2 === 0; }
+    if ($v >= 65313 && $v <= 65338) { return true; }
+    return false;
+}
+
+func isLowerCp($v) {
+    if ($v < 128) { return $v >= 97 && $v <= 122; }
+    if ($v === 181 || ($v >= 223 && $v <= 255 && $v !== 247)) { return true; }
+    if ($v >= 257 && $v <= 311) { return $v % 2 === 1; }
+    if ($v === 312 || $v === 329 || $v === 383) { return true; }
+    if ($v >= 314 && $v <= 328) { return $v % 2 === 0; }
+    if ($v >= 331 && $v <= 375) { return $v % 2 === 1; }
+    if ($v >= 378 && $v <= 382) { return $v % 2 === 0; }
+    if ($v === 912 || ($v >= 940 && $v <= 974)) { return true; }
+    if ($v >= 1072 && $v <= 1119) { return true; }
+    if (($v >= 1120 && $v <= 1153) || ($v >= 1162 && $v <= 1215)) { return $v % 2 === 1; }
+    if ($v === 1231) { return true; }
+    if ($v >= 1218 && $v <= 1230) { return $v % 2 === 0; }
+    if ($v >= 1233 && $v <= 1327) { return $v % 2 === 1; }
+    if ($v >= 7681 && $v <= 7935) { return $v % 2 === 1; }
+    if ($v >= 65345 && $v <= 65370) { return true; }
+    return false;
+}
+
+func isLetterCp($v) {
+    if ($v < 128) { return ($v >= 65 && $v <= 90) || ($v >= 97 && $v <= 122); }
+    return $v === 170 || $v === 181 || $v === 186 || inRanges($v, [192, 214, 216, 246, 248, 705, 880, 883, 886, 887, 891, 893, 895, 895, 902, 902,
+        904, 1013, 1015, 1153, 1162, 1327, 1329, 1366, 1377, 1415, 1488, 1514, 1568, 1610, 1646, 1647, 1649, 1747, 2308, 2361, 2392, 2401,
+        3585, 3632, 4352, 4607, 7680, 8191, 12353, 12438, 12449, 12538, 13312, 19903, 19968, 40959, 44032, 55203, 65313, 65338, 65345, 65370]);
+}
+
+func isDigitCp($v) {
+    if ($v < 128) { return $v >= 48 && $v <= 57; }
+    return inRanges($v, [1632, 1641, 1776, 1785, 2406, 2415, 2534, 2543, 3664, 3673, 65296, 65305]);
+}
+
+func isSpaceCp($v) {
+    return $v === 32 || ($v >= 9 && $v <= 13) || $v === 133 || $v === 160 || $v === 5760 || ($v >= 8192 && $v <= 8202) || $v === 8232 || $v === 8233 || $v === 8239 || $v === 8287 || $v === 12288;
+}
+
+func isPunctCp($v) {
+    if ($v < 128) { return ($v >= 33 && $v <= 35) || ($v >= 37 && $v <= 42) || ($v >= 44 && $v <= 47) || $v === 58 || $v === 59 || $v === 63 || $v === 64 || ($v >= 91 && $v <= 93) || $v === 95 || $v === 123 || $v === 125; }
+    return $v === 161 || $v === 167 || $v === 171 || $v === 182 || $v === 183 || $v === 187 || $v === 191 || inRanges($v, [8208, 8231, 8240, 8262, 8264, 8286, 12289, 12291, 12296, 12305, 12308, 12319, 65281, 65283, 65285, 65290, 65292, 65295]);
+}
+
+func isSymbolCp($v) {
+    if ($v < 128) { return $v === 36 || $v === 43 || ($v >= 60 && $v <= 62) || $v === 94 || $v === 96 || $v === 124 || $v === 126; }
+    return inRanges($v, [162, 166, 168, 169, 172, 172, 174, 177, 180, 180, 184, 184, 215, 215, 247, 247, 8352, 8399, 8592, 8703, 8704, 8959, 9472, 9983, 9984, 10175, 127744, 129791]);
+}
+
+func uniProp($name, $c) {
+    $v = cp($c);
+    if ($name === "Any") { return true; }
+    if ($name === "L" || $name === "Alpha" || $name === "Letter") { return isLetterCp($v); }
+    if ($name === "Lu" || $name === "Upper") { return isUpperCp($v); }
+    if ($name === "Ll" || $name === "Lower") { return isLowerCp($v); }
+    if ($name === "N" || $name === "Nd" || $name === "Digit") { return isDigitCp($v); }
+    if ($name === "Alnum") { return isLetterCp($v) || isDigitCp($v); }
+    if ($name === "P" || $name === "Punct") { return isPunctCp($v); }
+    if ($name === "S") { return isSymbolCp($v); }
+    if ($name === "Z" || $name === "Zs" || $name === "Space") { return isSpaceCp($v); }
+    if ($name === "Latin") { return ($v < 128 && isLetterCp($v)) || ($v >= 192 && $v <= 591 && $v !== 215 && $v !== 247) || ($v >= 7680 && $v <= 7935) || ($v >= 65313 && $v <= 65370); }
+    if ($name === "Greek") { return ($v >= 880 && $v <= 1023) || ($v >= 7936 && $v <= 8191); }
+    if ($name === "Cyrillic") { return $v >= 1024 && $v <= 1327; }
+    if ($name === "Han") { return ($v >= 13312 && $v <= 19903) || ($v >= 19968 && $v <= 40959); }
+    if ($name === "Hiragana") { return $v >= 12353 && $v <= 12447; }
+    if ($name === "Katakana") { return $v >= 12448 && $v <= 12543; }
+    if ($name === "Hangul") { return ($v >= 4352 && $v <= 4607) || ($v >= 44032 && $v <= 55215); }
+    if ($name === "Arabic") { return $v >= 1536 && $v <= 1791; }
+    if ($name === "Hebrew") { return $v >= 1424 && $v <= 1535; }
+    if ($name === "Thai") { return $v >= 3584 && $v <= 3711; }
+    if ($name === "Devanagari") { return $v >= 2304 && $v <= 2431; }
+    throw new Exception("Regex: nieznana właściwość Unicode \\p{" . $name . "}");
+}
+
+func knownProp($name) {
+    foreach (["Any", "L", "Alpha", "Letter", "Lu", "Upper", "Ll", "Lower", "N", "Nd", "Digit", "Alnum", "P", "Punct", "S", "Z", "Zs", "Space", "Latin", "Greek", "Cyrillic", "Han", "Hiragana", "Katakana", "Hangul", "Arabic", "Hebrew", "Thai", "Devanagari"] as $k) {
+        if ($k === $name) { return true; }
+    }
+    return false;
+}
+
+##
+ * Parsuje \p{Nazwa}, \P{Nazwa} lub \pL zaczynając od `\` na pozycji $i; zwraca [element klasy, nowa pozycja].
+##
+func propEsc($c, $i, $pat) {
+    $n = count($c);
+    $neg = $c[$i + 1] === "P";
+    $j = $i + 2;
+    $name = "";
+    if ($j < $n && $c[$j] === "{") {
+        $j++;
+        while ($j < $n && $c[$j] !== "}") { $name .= $c[$j]; $j++; }
+        if ($j >= $n) { fail($pat, $i, "niedomknięte \\p{"); }
+        $j++;
+    } else if ($j < $n) { $name = $c[$j]; $j++; }
+    if (!knownProp($name)) { fail($pat, $i, "nieznana właściwość Unicode \\p{" . $name . "}"); }
+    return [[7, $name, $neg], $j];
+}
+
+func isWordU($c) { $v = cp($c); return $v === 95 || isLetterCp($v) || isDigitCp($v); }
 
 # ── parser: zwraca [węzeł, nowa pozycja] ──
 func classEsc($e) {
@@ -118,6 +255,7 @@ func parseClass($c, $i, $pat) {
         if ($ch === "\\") {
             if ($i + 1 >= $n) { fail($pat, $i, "wzorzec kończy się na \\"); }
             $e = $c[$i + 1];
+            if ($e === "p" || $e === "P") { $r = propEsc($c, $i, $pat); $items[] = $r[0]; $i = $r[1]; continue; }
             $ce = classEsc($e);
             if ($ce !== null) { $items[] = $ce; $i += 2; continue; }
             $se = simpleEsc($e);
@@ -190,7 +328,7 @@ func parseSeq($c, $i, $gi, $pat) {
                 if ($max !== -1 && $max < $min) { fail($pat, $i, "zły zakres powtórzeń {n,m}"); }
                 $greedy = true;
                 if ($i < $n && $c[$i] === "?") { $greedy = false; $i++; }
-                if ($node[0] === "bol" || $node[0] === "eol" || $node[0] === "wordb" || $node[0] === "look") { fail($pat, $i, "nie można powtarzać asercji"); }
+                if ($node[0] === "bol" || $node[0] === "eol" || $node[0] === "wordb" || $node[0] === "look" || $node[0] === "lookbehind") { fail($pat, $i, "nie można powtarzać asercji"); }
                 $node = ["rep", $node, $min, $max, $greedy];
             }
         }
@@ -215,12 +353,13 @@ func parseAtom($c, $i, $gi, $pat) {
             $d = $c[$i + 1];
             if ($d === ":") { $kind = "nc"; $i += 2; }
             else if ($d === "=" || $d === "!") { $kind = "look"; $neg = $d === "!"; $i += 2; }
+            else if ($d === "<" && $i + 2 < $n && ($c[$i + 2] === "=" || $c[$i + 2] === "!")) { $kind = "lookbehind"; $neg = $c[$i + 2] === "!"; $i += 3; }
             else if ($d === "<" && $i + 2 < $n && $c[$i + 2] !== "=" && $c[$i + 2] !== "!") {
                 $i += 2;
                 while ($i < $n && $c[$i] !== ">") { $i++; }
                 $i++;
             }
-            else { fail($pat, $i, "nieobsługiwana grupa (?" . $d . " (lookbehind nie jest wspierany)"); }
+            else { fail($pat, $i, "nieobsługiwana grupa (?" . $d); }
         }
         $r = parseAlt($c, $i, $gi, $pat);
         $i = $r[1];
@@ -228,6 +367,7 @@ func parseAtom($c, $i, $gi, $pat) {
         $i++;
         if ($kind === "cap") { return [["group", $gi[$start], $r[0]], $i]; }
         if ($kind === "look") { return [["look", $neg, $r[0]], $i]; }
+        if ($kind === "lookbehind") { return [["lookbehind", $neg, $r[0]], $i]; }
         return [$r[0], $i];
     }
     if ($ch === "[") { return parseClass($c, $i, $pat); }
@@ -237,6 +377,7 @@ func parseAtom($c, $i, $gi, $pat) {
     if ($ch === "\\") {
         if ($i + 1 >= $n) { fail($pat, $i, "wzorzec kończy się na \\"); }
         $e = $c[$i + 1];
+        if ($e === "p" || $e === "P") { $r = propEsc($c, $i, $pat); return [["class", false, [$r[0]]], $r[1]]; }
         $ce = classEsc($e);
         if ($ce !== null) { return [["class", false, [$ce]], $i + 2]; }
         if ($e === "b") { return [["wordb", false], $i + 2]; }
@@ -252,7 +393,7 @@ func parseAtom($c, $i, $gi, $pat) {
     return [["char", $ch], $i + 1];
 }
 
-# ── generator kodu: op 0 CHAR, 1 ANY, 2 CLASS, 3 SPLIT, 4 JMP, 5 SAVE, 6 BOL, 7 EOL, 8 WORDB, 9 BACKREF, 10 MATCH, 11 CHK, 12 LOOK ──
+# ── generator kodu: op 0 CHAR, 1 ANY, 2 CLASS, 3 SPLIT, 4 JMP, 5 SAVE, 6 BOL, 7 EOL, 8 WORDB, 9 BACKREF, 10 MATCH, 11 CHK, 12 LOOK, 13 LOOKBEHIND, 14 ENDAT ──
 func canEmpty($node) {
     $t = $node[0];
     if ($t === "char" || $t === "any" || $t === "class") { return false; }
@@ -294,6 +435,15 @@ func emit($node, $prog, $base) {
         $prog = emit($node[2], $prog, $base);
         $prog[] = [10, 0, 0];
         $prog[$at] = [12, $node[1], count($prog)];
+        return $prog;
+    }
+    if ($t === "lookbehind") {
+        $at = count($prog);
+        $slot = $base + $at;
+        $prog[] = [13, $node[1], 0, $slot];
+        $prog = emit($node[2], $prog, $base);
+        $prog[] = [14, $slot, 0];
+        $prog[$at] = [13, $node[1], count($prog), $slot];
         return $prog;
     }
     if ($t === "alt") {
@@ -360,15 +510,26 @@ func compile($pattern, $flags = "") {
     $prog = emit($r[0], $prog, $base);
     $prog[] = [10, 0, 0];
     return ["re" => true, "src" => $pattern, "prog" => $prog, "ncap" => $ncap, "names" => $ps[1],
-            "icase" => contains($flags, "i"), "multi" => contains($flags, "m"), "dotall" => contains($flags, "s")];
+            "icase" => contains($flags, "i"), "multi" => contains($flags, "m"), "dotall" => contains($flags, "s"), "unicode" => contains($flags, "u")];
 }
 
 func ensure($re) { return is_string($re) ? compile($re, "") : $re; }
 
 # ── maszyna wirtualna ──
-func itemsHit($items, $c) {
+func itemsHit($items, $c, $u = false) {
     foreach ($items as $it) {
         $k = $it[0];
+        if ($u && $k >= 1 && $k <= 6) {
+            $v = cp($c);
+            if ($k === 1 && isDigitCp($v)) { return true; }
+            if ($k === 2 && ($v === 95 || isLetterCp($v) || isDigitCp($v))) { return true; }
+            if ($k === 3 && isSpaceCp($v)) { return true; }
+            if ($k === 4 && !isDigitCp($v)) { return true; }
+            if ($k === 5 && !($v === 95 || isLetterCp($v) || isDigitCp($v))) { return true; }
+            if ($k === 6 && !isSpaceCp($v)) { return true; }
+            continue;
+        }
+        if ($k === 7) { if (uniProp($it[1], $c) !== $it[2]) { return true; } continue; }
         if ($k === 0) { if ($c >= $it[1] && $c <= $it[2]) { return true; } }
         else if ($k === 1) { if (strlen($c) === 1 && is_digit($c)) { return true; } }
         else if ($k === 2) { if (isWord($c)) { return true; } }
@@ -380,9 +541,9 @@ func itemsHit($items, $c) {
     return false;
 }
 
-func classHit($neg, $items, $c, $icase) {
-    $r = itemsHit($items, $c);
-    if (!$r && $icase) { $r = itemsHit($items, lower($c)) || itemsHit($items, upper($c)); }
+func classHit($neg, $items, $c, $icase, $u = false) {
+    $r = itemsHit($items, $c, $u);
+    if (!$r && $icase) { $r = itemsHit($items, lower($c), $u) || itemsHit($items, upper($c), $u); }
     return $neg ? !$r : $r;
 }
 
@@ -394,6 +555,7 @@ func run($re, $c, $pc, $pos, $caps) {
     $icase = $re["icase"];
     $multi = $re["multi"];
     $dotall = $re["dotall"];
+    $uni = $re["unicode"];
     $n = count($c);
     $stack = [];
     $sp = 0;
@@ -409,7 +571,7 @@ func run($re, $c, $pc, $pos, $caps) {
         } else if ($op === 1) {
             if ($pos < $n && ($dotall || $c[$pos] !== "\n")) { $pos++; $pc++; } else { $ok = false; }
         } else if ($op === 2) {
-            if ($pos < $n && classHit($ins[1], $ins[2], $c[$pos], $icase)) { $pos++; $pc++; } else { $ok = false; }
+            if ($pos < $n && classHit($ins[1], $ins[2], $c[$pos], $icase, $uni)) { $pos++; $pc++; } else { $ok = false; }
         } else if ($op === 3) {
             $e = [$ins[2], $pos, 0];
             if ($sp < count($stack)) { $stack[$sp] = $e; } else { $stack[] = $e; }
@@ -428,8 +590,8 @@ func run($re, $c, $pc, $pos, $caps) {
         } else if ($op === 7) {
             if ($pos === $n || ($multi && $c[$pos] === "\n")) { $pc++; } else { $ok = false; }
         } else if ($op === 8) {
-            $a = $pos > 0 && isWord($c[$pos - 1]);
-            $b = $pos < $n && isWord($c[$pos]);
+            $a = $pos > 0 && ($uni ? isWordU($c[$pos - 1]) : isWord($c[$pos - 1]));
+            $b = $pos < $n && ($uni ? isWordU($c[$pos]) : isWord($c[$pos]));
             if (($a !== $b) !== $ins[1]) { $pc++; } else { $ok = false; }
         } else if ($op === 9) {
             $s = $caps[2 * $ins[1]];
@@ -458,6 +620,18 @@ func run($re, $c, $pc, $pos, $caps) {
                 if ($sub !== null && !$ins[1]) { $caps = $sub; $caps[1] = -1; }
                 $pc = $ins[2];
             } else { $ok = false; }
+        } else if ($op === 13) {
+            $hit = false;
+            for ($st = $pos; $st >= 0 && !$hit; $st--) {
+                $c2 = $caps;
+                $c2[$ins[3]] = $pos;
+                $sub = run($re, $c, $pc + 1, $st, $c2);
+                if ($sub !== null) { $hit = true; if (!$ins[1]) { $caps = $sub; $caps[1] = -1; } }
+            }
+            if ($hit !== $ins[1]) { $pc = $ins[2]; } else { $ok = false; }
+        } else if ($op === 14) {
+            if ($pos === $caps[$ins[1]]) { $caps[1] = $pos; return $caps; }
+            $ok = false;
         } else { throw new Exception("Regex: zły kod operacji " . $op); }
         if (!$ok) {
             $found = false;
