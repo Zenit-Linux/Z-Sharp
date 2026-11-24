@@ -1,0 +1,113 @@
+namespace Csv;
+
+##
+ * Std.Csv — CSV (RFC 4180) z konfigurowalnym separatorem.
+ *   parse($tekst, $sep = ",")          -> lista wierszy (każdy wiersz = lista pól)
+ *   parseHeader($tekst, $sep = ",")    -> lista tablic asocjacyjnych (nagłówek z pierwszego wiersza)
+ *   encode($wiersze, $sep = ",")       -> tekst (pola z separatorem, cudzysłowem lub nową linią są cytowane)
+ *   encodeHeader($rekordy, $kolumny = null, $sep = ",")
+ * Obsługa: pola w cudzysłowach, "" jako cudzysłów, nowe linie w polach, \r\n, końcowy znak nowej linii, BOM UTF-8.
+ * Wszystkie pola są tekstami (bez zgadywania typów).
+##
+
+func parse($text, $sep = ",") {
+    if (strlen($sep) !== 1) { throw new Exception("Csv: separator musi mieć 1 znak"); }
+    if (starts_with($text, "\xEF\xBB\xBF")) { $text = substr($text, 3); }
+    $rows = [];
+    $row = [];
+    $field = "";
+    $inQuotes = false;
+    $quoted = false;
+    $n = strlen($text);
+    $line = 1;
+    $i = 0;
+    while ($i < $n) {
+        $c = substr($text, $i, 1);
+        if ($inQuotes) {
+            if ($c === "\"") {
+                if ($i + 1 < $n && substr($text, $i + 1, 1) === "\"") { $field .= "\""; $i += 2; continue; }
+                $inQuotes = false;
+                $i++;
+                continue;
+            }
+            if ($c === "\n") { $line++; }
+            $field .= $c;
+            $i++;
+            continue;
+        }
+        if ($c === "\"" && $field === "" && !$quoted) { $inQuotes = true; $quoted = true; $i++; continue; }
+        if ($c === $sep) { $row[] = $field; $field = ""; $quoted = false; $i++; continue; }
+        if ($c === "\r" || $c === "\n") {
+            if ($c === "\r" && $i + 1 < $n && substr($text, $i + 1, 1) === "\n") { $i++; }
+            $row[] = $field;
+            $rows[] = $row;
+            $row = [];
+            $field = "";
+            $quoted = false;
+            $line++;
+            $i++;
+            continue;
+        }
+        if ($quoted) { throw new Exception("Csv: linia " . $line . ": znaki po zamykającym cudzysłowie"); }
+        $field .= $c;
+        $i++;
+    }
+    if ($inQuotes) { throw new Exception("Csv: niezamknięty cudzysłów (linia " . $line . ")"); }
+    if ($field !== "" || $quoted || count($row) > 0) { $row[] = $field; $rows[] = $row; }
+    return $rows;
+}
+
+func parseHeader($text, $sep = ",") {
+    $rows = parse($text, $sep);
+    if (count($rows) === 0) { return []; }
+    $head = $rows[0];
+    $out = [];
+    for ($r = 1; $r < count($rows); $r++) {
+        $rec = [];
+        for ($c = 0; $c < count($head); $c++) {
+            $rec[$head[$c]] = $c < count($rows[$r]) ? $rows[$r][$c] : "";
+        }
+        $out[] = $rec;
+    }
+    return $out;
+}
+
+func quote($v, $sep) {
+    $s = $v === null ? "" : (is_bool($v) ? ($v ? "true" : "false") : strval($v));
+    if ($s === "" ) { return $s; }
+    if (contains($s, $sep) || contains($s, "\"") || contains($s, "\n") || contains($s, "\r") || starts_with($s, " ") || ends_with($s, " ")) {
+        return "\"" . replace($s, "\"", "\"\"") . "\"";
+    }
+    return $s;
+}
+
+func encode($rows, $sep = ",") {
+    $out = "";
+    foreach ($rows as $row) {
+        $line = "";
+        $first = true;
+        foreach ($row as $v) {
+            if (!$first) { $line .= $sep; }
+            $line .= quote($v, $sep);
+            $first = false;
+        }
+        $out .= $line . "\r\n";
+    }
+    return $out;
+}
+
+func encodeHeader($records, $columns = null, $sep = ",") {
+    if ($columns === null) {
+        $columns = [];
+        foreach ($records as $rec) {
+            foreach (keys($rec) as $k) { if (!in_array($k, $columns)) { $columns[] = $k; } }
+        }
+    }
+    $rows = [$columns];
+    foreach ($records as $rec) {
+        $row = [];
+        foreach ($columns as $c) { $row[] = has_key($rec, $c) ? $rec[$c] : ""; }
+        $rows[] = $row;
+    }
+    return encode($rows, $sep);
+}
