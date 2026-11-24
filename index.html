@@ -1,1 +1,42 @@
-
+<!doctype html>
+<html lang="pl" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Z# — język programowania</title>
+  <meta name="description" content="Z# — dynamicznie typowany język o składni znajomej z PHP: interpreter, kompilator natywny (C/LLVM), biblioteka standardowa.">
+  <meta name="color-scheme" content="light dark">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%236d3fe0'/%3E%3Ctext x='32' y='45' font-size='38' font-family='monospace' font-weight='bold' text-anchor='middle' fill='white'%3EZ%23%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="website/dist/app.css">
+  <script>
+    // ustaw motyw przed pierwszym malowaniem (bez migotania)
+    try { var t = localStorage.getItem("zsharp-theme"); if (!t) t = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"; document.documentElement.dataset.theme = t; } catch (e) {}
+  </script>
+</head>
+<body>
+  <header class="site">
+    <div class="bar">
+      <a class="logo" href="#/">Z#</a>
+      <nav class="main" aria-label="Główna nawigacja">
+        <a data-page="home" href="#/">Start</a>
+        <a data-page="docs" href="#/docs">Dokumentacja</a>
+        <a data-page="stdlib" href="#/stdlib">Biblioteka</a>
+        <a data-page="playground" href="#/playground">Przykłady</a>
+        <a data-page="status" href="#/status">Status</a>
+      </nav>
+      <button id="theme-toggle" type="button" aria-label="Przełącz motyw">🌙 Ciemny</button>
+    </div>
+  </header>
+  <main id="app">
+    <noscript>
+      <div class="card">
+        <h1>Z#</h1>
+        <p>Ta strona wymaga JavaScriptu. Dokumentacja w formie tekstowej: <a href="docs/SPEC.md">SPEC.md</a>, <a href="docs/STDLIB.md">STDLIB.md</a>, <a href="docs/STATUS.md">STATUS.md</a>.</p>
+      </div>
+    </noscript>
+    <p class="muted">Ładowanie… Jeśli strona się nie wczytuje, zbuduj ją: <code>cd website &amp;&amp; npm ci &amp;&amp; npm run build</code>.</p>
+  </main>
+  <footer class="site">Z# · licencja GPL-3.0 · strona zbudowana w TypeScript (katalog <code>website/</code>)</footer>
+  <script type="module" src="website/dist/app.js"></script>
+</body>
+</html>
