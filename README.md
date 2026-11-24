@@ -26,7 +26,7 @@ cargo build --release         # target/release/zsc0 (stage0) + libzs_runtime.a
 | `wrapper/` | źródło binarki `z#` (wrapper nad zsc/zsi/zst/zzc) |
 | `runtime/native/`, `runtime/include/` | natywny runtime w C (`zs_rt.c`, `zs_native.h`) dla backendów C i LLVM |
 | `tests/` | `basics`, `nomain`, sema, `zamm_test`, `runtime_test`, parytet leksera/parsera (`scripts/tests/*_parity.zsharp`), `bad/`, `m3/`, `std/`, `scripts/tests/run_all.zsharp` |
-| `stdlib/` | biblioteka standardowa `Std.*` (json, toml, regex, time, path, os, net) — `docs/STDLIB.md` |
+| `stdlib/` | biblioteka standardowa `Std.*` (json, toml, regex, time, path, os, net, base64, hash, csv, random, text) — `docs/STDLIB.md` |
 | `scripts/` | skrypty w Z# (`bootstrap`, `fixpoint`, `stage3`, `core_status`, `lib`, `tests/`) oraz `Linux-Distributions/{install,remove}.sh` |
 | `docs/` | `SPEC.md` (0.4), `AST.md`, `BOOTSTRAP.md`, `STDLIB.md` |
 
