@@ -1,6 +1,7 @@
 namespace emit_llvm;
 
 import Workspace.ir;
+import Workspace.regions;
 
 ##
  * Backend LLVM: Z# IR -> tekstowy LLVM IR (.ll), linkowany z runtime/native/zs_rt.c (clang/llc).
@@ -23,6 +24,8 @@ class LlEmitter {
     public $lbl;
     public $loops;
     public $loopId;
+    public $fnCounts;
+    public $rdStack;
     public $tries;
     public $hid;
     public $curFunc;
@@ -45,6 +48,8 @@ class LlEmitter {
         $this->loops = [];
         $this->loopId = 0;
         $this->tries = [];
+        $this->rdStack = [];
+        $this->fnCounts = [];
         $this->hid = 0;
         $this->curFunc = "";
         $this->term = false;
@@ -531,6 +536,36 @@ class LlEmitter {
 
     func block($list) { foreach ($list as $s) { $this->stmt($s); } }
 
+    # ── ZAMM: region iteracji pętli (patrz lib/regions.zsharp i emit_c.zsharp) ──
+    func regionBegin($loop, $body, $hdr, $pre, $id) {
+        if (count($this->tries) > 0) { $this->rdStack[] = null; return; }
+        $names = regions.region_carry($loop, $body, $hdr, $pre, $this->fnCounts);
+        $slot = "%rdslot" . $id;
+        $this->allocas[] = "  " . $slot . " = alloca i32, align 4";
+        $d = $this->rt("zs_cur_depth", "i32", []);
+        $this->line("store i32 " . $d . ", ptr " . $slot . ", align 4");
+        $this->rdStack[] = [$slot, $names];
+    }
+    func regionEnter() {
+        $r = $this->rdStack[count($this->rdStack) - 1];
+        if ($r === null) { return; }
+        $this->rt("zs_enter", "i32", []);
+    }
+    func regionExit() {
+        $r = $this->rdStack[count($this->rdStack) - 1];
+        if ($r === null) { return; }
+        $l = $this->r();
+        $this->line($l . " = load i32, ptr " . $r[0] . ", align 4");
+        foreach ($r[1][0] as $n) {
+            $v = $this->load($n);
+            $c = $this->rt("zs_carry_v", "V", [["V", $v], ["i32", $l]]);
+            $this->store($n, $c);
+        }
+        $this->rt("zs_pop", "void", [["i32", $l]]);
+        foreach ($r[1][1] as $n) { $this->store($n, $this->nullv()); }
+    }
+    func regionEnd() { $this->rdStack = array_slice($this->rdStack, 0, count($this->rdStack) - 1); }
+
     func pushLoop() { $this->loopId++; $this->loops[] = [$this->loopId, "loop", count($this->tries)]; return $this->loopId; }
     func popLoop() { $this->loops = array_slice($this->loops, 0, count($this->loops) - 1); }
 
@@ -577,7 +612,7 @@ class LlEmitter {
 
     func jb($h) {
         $p = $this->r();
-        $this->line($p . " = getelementptr inbounds i8, ptr " . $h . ", i64 8");
+        $this->line($p . " = getelementptr inbounds i8, ptr " . $h . ", i64 16");
         return $p;
     }
 
@@ -707,15 +742,20 @@ class LlEmitter {
             $lc = "cont_" . $id;
             $lb = "brk_" . $id;
             $lbody = $this->newLabel("wbody");
+            $this->regionBegin($s, $s[3], [$s[2]], [], $id);
             $this->terminate("br label %" . $lc);
             $this->label($lc);
+            $this->regionExit();
             $this->setLine($line);
             $c = $this->truthy($this->expr($s[2]));
             $this->terminate("br i1 " . $c . ", label %" . $lbody . ", label %" . $lb);
             $this->label($lbody);
+            $this->regionEnter();
             $this->block($s[3]);
             $this->terminate("br label %" . $lc);
             $this->label($lb);
+            $this->regionExit();
+            $this->regionEnd();
             $this->popLoop();
             return;
         }
@@ -724,15 +764,20 @@ class LlEmitter {
             $lc = "cont_" . $id;
             $lb = "brk_" . $id;
             $ltop = $this->newLabel("dtop");
+            $this->regionBegin($s, $s[2], [$s[3]], [], $id);
             $this->terminate("br label %" . $ltop);
             $this->label($ltop);
+            $this->regionEnter();
             $this->block($s[2]);
             $this->terminate("br label %" . $lc);
             $this->label($lc);
+            $this->regionExit();
             $this->setLine($line);
             $c = $this->truthy($this->expr($s[3]));
             $this->terminate("br i1 " . $c . ", label %" . $ltop . ", label %" . $lb);
             $this->label($lb);
+            $this->regionExit();
+            $this->regionEnd();
             $this->popLoop();
             return;
         }
@@ -743,6 +788,9 @@ class LlEmitter {
             $ltest = $this->newLabel("ftest");
             $lbody = $this->newLabel("fbody");
             $lstep = $this->newLabel("fstep");
+            $hdr = $s[4];
+            $hdr[] = $s[3];
+            $this->regionBegin($s, $s[5], $hdr, [], $id);
             foreach ($s[2] as $e) { $this->setLine($line); $this->expr($e); }
             $this->terminate("br label %" . $ltest);
             $this->label($ltest);
@@ -752,12 +800,16 @@ class LlEmitter {
                 $this->terminate("br i1 " . $c . ", label %" . $lbody . ", label %" . $lb);
             } else { $this->terminate("br label %" . $lbody); }
             $this->label($lbody);
+            $this->regionEnter();
             $this->block($s[5]);
             $this->terminate("br label %" . $lc);
             $this->label($lc);
+            $this->regionExit();
             foreach ($s[4] as $e) { $this->expr($e); }
             $this->terminate("br label %" . $ltest);
             $this->label($lb);
+            $this->regionExit();
+            $this->regionEnd();
             $this->popLoop();
             return;
         }
@@ -767,6 +819,7 @@ class LlEmitter {
             $lb = "brk_" . $id;
             $this->setLine($line);
             $it = $this->val($s[2]);
+            $this->regionBegin($s, $s[5], [], [$s[3], $s[4]], $id);
             $itSlot = $this->slot();
             $this->storeTo($itSlot, $it);
             $tg = $this->r();
@@ -801,9 +854,11 @@ class LlEmitter {
                 $kv = $this->rt("zv_key_at", "V", [["V", $cur], ["i64", $i]]);
                 $this->store($s[3], $kv);
             }
+            $this->regionEnter();
             $this->block($s[5]);
             $this->terminate("br label %" . $lc);
             $this->label($lc);
+            $this->regionExit();
             $i2 = $this->r();
             $this->line($i2 . " = load i64, ptr " . $iSlot . ", align 8");
             $i3 = $this->r();
@@ -811,6 +866,8 @@ class LlEmitter {
             $this->line("store i64 " . $i3 . ", ptr " . $iSlot . ", align 8");
             $this->terminate("br label %" . $lhead);
             $this->label($lb);
+            $this->regionExit();
+            $this->regionEnd();
             $this->popLoop();
             return;
         }
@@ -925,6 +982,7 @@ class LlEmitter {
     func funcDef($name) {
         $f = $this->ir["funcs"][$name];
         $this->curFunc = $name;
+        $this->fnCounts = regions.var_counts($f["body"], []);
         $this->beginFunc($f["has_try"]);
         $pn = [];
         $sig = [];
@@ -946,7 +1004,24 @@ class LlEmitter {
             $i++;
         }
         $this->block($f["body"]);
-        return $this->finishFunc("define internal { i64, i64 } @\"f_" . $name . "\"(" . join($sig, ", ") . ")", "V");
+        $inner = $this->finishFunc("define internal { i64, i64 } @\"f_" . $name . "__z\"(" . join($sig, ", ") . ")", "V");
+        # ZAMM: wrapper otwierający/zamykający arenę ramki (wynik promowany do areny wywołującego)
+        $w = [];
+        $w[] = "define internal { i64, i64 } @\"f_" . $name . "\"(" . join($sig, ", ") . ") {";
+        $w[] = "entry:";
+        $w[] = "  %lv = call i32 @zs_enter()";
+        $args = [];
+        $i = 0;
+        foreach ($f["params"] as $p) { $args[] = "i64 %a" . $i . "x, i64 %a" . $i . "y"; $i++; }
+        $w[] = "  %r = call { i64, i64 } @\"f_" . $name . "__z\"(" . join($args, ", ") . ")";
+        $w[] = "  %rx = extractvalue { i64, i64 } %r, 0";
+        $w[] = "  %ry = extractvalue { i64, i64 } %r, 1";
+        $w[] = "  %o = call { i64, i64 } @zs_leave(i32 %lv, i64 %rx, i64 %ry)";
+        $w[] = "  ret { i64, i64 } %o";
+        $w[] = "}";
+        $w[] = "";
+        foreach ($w as $l) { $inner[] = $l; }
+        return $inner;
     }
 
     func generate($triple) {
@@ -954,6 +1029,7 @@ class LlEmitter {
         $funcs = [];
         foreach ($ir["order"] as $name) { foreach ($this->funcDef($name) as $l) { $funcs[] = $l; } }
         $this->curFunc = "";
+        $this->fnCounts = regions.var_counts($ir["top"], []);
         $this->beginFunc($ir["top_has_try"]);
         $this->initLocals($ir["toplocals"], []);
         $this->block($ir["top"]);
@@ -997,6 +1073,7 @@ class LlEmitter {
         $o[] = "entry:";
         $o[] = "  call void @zs_init(i32 %argc, ptr %argv)";
         $o[] = "  call void @zs_strings_init()";
+        $o[] = "  %top_lv = call i32 @zs_enter()";
         $o[] = "  %rc = call i32 @zs_top()";
         if (has_key($ir["funcs"], "main") && !$ir["calls_main"]) {
             $o[] = "  %m = call { i64, i64 } @\"f_main\"()";
@@ -1021,6 +1098,11 @@ class LlEmitter {
         $v = "i64, i64";
         $d[] = "declare void @zs_init(i32, ptr)";
         $d[] = "declare void @zs_shutdown()";
+        $d[] = "declare i32 @zs_enter()";
+        $d[] = "declare { i64, i64 } @zs_leave(i32, i64, i64)";
+        $d[] = "declare { i64, i64 } @zs_carry_v(i64, i64, i32)";
+        $d[] = "declare void @zs_pop(i32)";
+        $d[] = "declare i32 @zs_cur_depth()";
         $d[] = "declare { i64, i64 } @zv_strn(ptr, i64)";
         $d[] = "declare { i64, i64 } @zl_float_lit(ptr)";
         $d[] = "declare void @zl_try_enter(ptr)";
