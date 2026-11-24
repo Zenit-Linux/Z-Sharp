@@ -1,0 +1,59 @@
+namespace regions;
+
+##
+ * ZAMM: analiza zmiennych pętli dla regionów iteracji (wspólna dla backendów C i LLVM).
+ * Pętla dostaje własną arenę na iterację; zmienne żyjące między iteracjami (lub po pętli) są promowane do poziomu pętli,
+ * zmienne „prywatne dla iteracji” — nie; ich wartości giną razem z areną, więc na wyjściu z regionu są zerowane (inaczej
+ * zewnętrzna pętla mogłaby przenieść wiszący wskaźnik).
+##
+##
+ * ZAMM: liczba wystąpień zmiennych w poddrzewie AST: węzły `:Var`, nazwy zmiennych `foreach`
+ * (`[":Foreach", l, wyrażenie, klucz, wartość, ciało]`) i zmienne `catch`. Wynik: nazwa => liczba.
+##
+func var_counts($n, $acc) {
+    if (!is_array($n)) { return $acc; }
+    $t = $n[0] ?? null;
+    if ($t === ":Var" && is_string($n[2] ?? null)) { $acc[$n[2]] = ($acc[$n[2]] ?? 0) + 1; return $acc; }
+    if ($t === ":Foreach") {
+        if (is_string($n[3] ?? null)) { $acc[$n[3]] = ($acc[$n[3]] ?? 0) + 1; }
+        if (is_string($n[4] ?? null)) { $acc[$n[4]] = ($acc[$n[4]] ?? 0) + 1; }
+    }
+    if ($t === ":Try") {
+        foreach (($n[3] ?? []) as $c) { if (is_array($c) && is_string($c[3] ?? null)) { $acc[$c[3]] = ($acc[$c[3]] ?? 0) + 1; } }
+    }
+    foreach ($n as $c) { if (is_array($c)) { $acc = var_counts($c, $acc); } }
+    return $acc;
+}
+
+##
+ * ZAMM: które zmienne pętli trzeba przenosić między iteracjami (promować do poziomu pętli).
+ * Zmienna jest *prywatna dla iteracji* (nie wymaga promocji), gdy występuje wyłącznie w tej pętli, nie jest czytana w warunku/kroku
+ * i w ciele jest przypisana (prosty `$x = …`) zanim zostanie przeczytana. Pozostałe są przenoszone (konserwatywnie).
+ * $loop: cała instrukcja pętli; $body: lista instrukcji ciała; $hdr: wyrażenia nagłówka czytane co iterację; $pre: zmienne ustawiane przez nagłówek (foreach).
+##
+func region_carry($loop, $body, $hdr, $pre, $fnCounts) {
+    # wystąpienia liczone tylko w ciele i wyrażeniach czytanych co iterację (wyrażenie przed pętlą: init `for`, obiekt `foreach`, jest poza regionem)
+    $cnt = var_counts($body, []);
+    foreach ($hdr as $e) { $cnt = var_counts($e, $cnt); }
+    foreach ($pre as $v) { if (is_string($v)) { $cnt[$v] = ($cnt[$v] ?? 0) + 1; } }
+    $defined = [];
+    foreach ($pre as $v) { if (is_string($v)) { $defined[$v] = true; } }
+    $bad = [];
+    foreach ($hdr as $e) { foreach (var_counts($e, []) as $n => $c) { $bad[$n] = true; } }
+    foreach ($body as $st) {
+        $simple = is_array($st) && ($st[0] ?? null) === ":Expr" && is_array($st[2] ?? null) && ($st[2][0] ?? null) === ":Assign"
+            && is_array($st[2][2] ?? null) && ($st[2][2][0] ?? null) === ":Var";
+        if ($simple) {
+            foreach (var_counts($st[2][3], []) as $n => $c) { if (!has_key($defined, $n)) { $bad[$n] = true; } }
+            $defined[$st[2][2][2]] = true;
+        } else {
+            foreach (var_counts($st, []) as $n => $c) { if (!has_key($defined, $n)) { $bad[$n] = true; } }
+        }
+    }
+    $out = [];
+    $priv = [];
+    foreach ($cnt as $n => $c) {
+        if (has_key($bad, $n) || ($fnCounts[$n] ?? 0) !== $c) { $out[] = $n; } else { $priv[] = $n; }
+    }
+    return [$out, $priv];
+}
