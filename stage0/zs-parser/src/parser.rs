@@ -535,6 +535,13 @@ impl Parser {
             T::Op(O::LBracket) => {
                 let mut items = vec![];
                 while !self.is_op(O::RBracket) {
+                    if self.is_op(O::Ellipsis) {
+                        let sl = self.line(); self.pos += 1;
+                        let inner = self.expr()?;
+                        items.push((None, Expr { kind: ExprKind::Spread(Box::new(inner)), line: sl }));
+                        if !self.eat_op(O::Comma) { break; }
+                        continue;
+                    }
                     let first = self.expr()?;
                     if self.eat_op(O::FatArrow) { let v = self.expr()?; items.push((Some(first), v)); }
                     else { items.push((None, first)); }
