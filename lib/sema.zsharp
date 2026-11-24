@@ -72,6 +72,8 @@ class Analyzer {
         if ($e[0] === ":Var") { $out[] = $e[2]; }
         else if ($e[0] === ":Array") {
             foreach ($e[2] as $it) { foreach ($this->valueVars($it[3]) as $x) { $out[] = $x; } }
+        } else if ($e[0] === ":Spread") {
+            foreach ($this->valueVars($e[2]) as $x) { $out[] = $x; }
         } else if ($e[0] === ":Ternary") {
             if ($e[3] !== null) { foreach ($this->valueVars($e[3]) as $x) { $out[] = $x; } }
             foreach ($this->valueVars($e[4]) as $x) { $out[] = $x; }
