@@ -1,0 +1,110 @@
+namespace Random;
+
+##
+ * Std.Random — deterministyczny generator pseudolosowy (xorshift128, 32 bity) + pomocniki.
+ *   new Rng($ziarno = null)  — generator; bez ziarna: z zegara i pid
+ *   Rng: nextInt() [0, 2^32), int($min, $max) [włącznie], float() [0,1), bool(), pick($lista), shuffle($lista),
+ *        sample($lista, $n), bytes($n), uuid4(), hex($n)
+ * To NIE jest generator kryptograficzny — do tokenów/sekretów nie używać.
+ * Ten sam seed daje tę samą sekwencję w interpreterze i w kodzie natywnym.
+##
+
+class Rng {
+    public $x;
+    public $y;
+    public $z;
+    public $w;
+
+    function __construct($seed = null) {
+        if ($seed === null) { $seed = (System.nowNanos() ^ (System.pid() << 16)) & 0xFFFFFFFF; }
+        # splitmix-podobne rozsiewanie ziarna (bez mnożeń 64-bitowych)
+        $s = $seed & 0xFFFFFFFF;
+        $this->x = $this->mix($s + 0x9E3779B9);
+        $this->y = $this->mix($s + 0x3C6EF372);
+        $this->z = $this->mix($s + 0xDAA66D2B);
+        $this->w = $this->mix($s + 0x78DDE6E4);
+        if (($this->x | $this->y | $this->z | $this->w) === 0) { $this->w = 1; }
+    }
+
+    function mix($v) {
+        $v = $v & 0xFFFFFFFF;
+        $v = ($v ^ ($v >> 16)) & 0xFFFFFFFF;
+        $v = (($v << 5) ^ ($v >> 3) ^ $v) & 0xFFFFFFFF;
+        $v = ($v ^ (($v << 13) & 0xFFFFFFFF)) & 0xFFFFFFFF;
+        $v = ($v ^ ($v >> 17)) & 0xFFFFFFFF;
+        $v = ($v ^ (($v << 5) & 0xFFFFFFFF)) & 0xFFFFFFFF;
+        return $v;
+    }
+
+    function nextInt() {
+        $t = ($this->x ^ (($this->x << 11) & 0xFFFFFFFF)) & 0xFFFFFFFF;
+        $this->x = $this->y;
+        $this->y = $this->z;
+        $this->z = $this->w;
+        $this->w = ($this->w ^ ($this->w >> 19) ^ $t ^ ($t >> 8)) & 0xFFFFFFFF;
+        return $this->w;
+    }
+
+    function int($min, $max) {
+        if ($max < $min) { throw new Exception("Random: max < min"); }
+        $span = $max - $min + 1;
+        if ($span <= 0 || $span > 4294967296) { throw new Exception("Random: zakres większy niż 2^32"); }
+        # odrzucanie, żeby uniknąć obciążenia modulo
+        $limit = 4294967296 - (4294967296 % $span);
+        $r = $this->nextInt();
+        while ($r >= $limit) { $r = $this->nextInt(); }
+        return $min + ($r % $span);
+    }
+
+    function float() {
+        return $this->nextInt() / 4294967296.0;
+    }
+
+    function bool() { return ($this->nextInt() & 1) === 1; }
+
+    function pick($list) {
+        $n = count($list);
+        if ($n === 0) { throw new Exception("Random: pusta lista"); }
+        return $list[$this->int(0, $n - 1)];
+    }
+
+    function shuffle($list) {
+        $a = values($list);
+        for ($i = count($a) - 1; $i > 0; $i--) {
+            $j = $this->int(0, $i);
+            $t = $a[$i];
+            $a[$i] = $a[$j];
+            $a[$j] = $t;
+        }
+        return $a;
+    }
+
+    function sample($list, $n) {
+        if ($n > count($list)) { throw new Exception("Random: próbka większa niż lista"); }
+        return array_slice($this->shuffle($list), 0, $n);
+    }
+
+    function bytes($n) {
+        $out = [];
+        for ($i = 0; $i < $n; $i++) { $out[] = $this->nextInt() & 255; }
+        return $out;
+    }
+
+    function hex($n) {
+        $r = "";
+        foreach ($this->bytes($n) as $b) { $r .= ($b < 16 ? "0" : "") . to_hex($b); }
+        return $r;
+    }
+
+    function uuid4() {
+        $b = $this->bytes(16);
+        $b[6] = ($b[6] & 0x0F) | 0x40;
+        $b[8] = ($b[8] & 0x3F) | 0x80;
+        $h = "";
+        for ($i = 0; $i < 16; $i++) {
+            $h .= ($b[$i] < 16 ? "0" : "") . to_hex($b[$i]);
+            if ($i === 3 || $i === 5 || $i === 7 || $i === 9) { $h .= "-"; }
+        }
+        return $h;
+    }
+}
