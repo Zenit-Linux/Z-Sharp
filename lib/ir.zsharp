@@ -30,7 +30,7 @@ class IrTables {
     const MODULES = [
         "System" => ["args" => 0, "env" => 1, "os" => 0, "architecture" => 0, "time" => 0, "cpuCount" => 0, "dirname" => 1, "resolveImport" => 2, "version" => 0, "exit" => -1,
                      "setEnv" => 2, "unsetEnv" => 1, "environ" => 0, "cwd" => 0, "chdir" => 1, "pid" => 0, "hostname" => 0, "bytes" => 1, "fromBytes" => 1,
-                     "nowNanos" => 0, "monotonic" => 0, "sleep" => 1, "localOffset" => 1],
+                     "nowNanos" => 0, "monotonic" => 0, "sleep" => 1, "localOffset" => 1, "gc" => 0, "gcStats" => 0],
         "File" => ["read" => 1, "write" => 2, "append" => 2, "exists" => 1, "delete" => 1,
                    "stat" => 1, "rename" => 2, "realpath" => 1, "chmod" => 2, "symlink" => 2, "readlink" => 1],
         "Directory" => ["create" => 1, "exists" => 1, "list" => 1, "remove" => 1],
