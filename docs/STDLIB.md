@@ -1,6 +1,6 @@
 # Biblioteka standardowa Z# (`Std.*`) — M5
 
-Minimalistyczna: tylko to, czego potrzebują narzędzia i skrypty. Siedem modułów, zero zależności zewnętrznych.
+Minimalistyczna: tylko to, czego potrzebują narzędzia i skrypty. Dwanaście modułów, zero zależności zewnętrznych.
 Import: `import Std.Json;` — nazwa modułu w kodzie to ostatni segment (`Json.decode(...)`).
 
 | Moduł | Plik | Zakres |
@@ -11,7 +11,12 @@ Import: `import Std.Json;` — nazwa modułu w kodzie to ostatni segment (`Json.
 | `Std.Time` | `stdlib/time.zsharp` | zegar, kalendarz, ISO 8601, `strftime`/`strptime`, czasy trwania |
 | `Std.Path` | `stdlib/path.zsharp` | ścieżki POSIX (czysty tekst) |
 | `Std.Os` | `stdlib/os.zsharp` | system: środowisko, pliki, procesy, `which` |
-| `Std.Net` | `stdlib/net.zsharp` | TCP/UDP/DNS, URL, klient i serwer HTTP/1.1 (bez TLS) |
+| `Std.Net` | `stdlib/net.zsharp` | TCP/UDP/DNS, URL, klient i serwer HTTP/1.1 (HTTPS przez `curl`) |
+| `Std.Base64` | `stdlib/base64.zsharp` | Base64 (standardowy i URL-safe), bajty, hex |
+| `Std.Hash` | `stdlib/hash.zsharp` | SHA-256, SHA-1, MD5, HMAC-SHA256, CRC-32, Adler-32, FNV-1a |
+| `Std.Csv` | `stdlib/csv.zsharp` | CSV (RFC 4180): `parse`, `parseHeader`, `encode`, `encodeHeader` |
+| `Std.Random` | `stdlib/random.zsharp` | deterministyczny generator `Rng` (xorshift128), `uuid4`, `shuffle`, `sample` |
+| `Std.Text` | `stdlib/text.zsharp` | `format` (interpolacja `{klucz}`), wielkość liter, `slug`, `wrap`, `truncate`, `levenshtein` … |
 
 Gdzie leży kod: stage0 (Rust) wkompilowuje `stdlib/*.zsharp` w binarkę i przy imporcie rozpakowuje je do `~/.cache/z-sharp/`;
 backendy natywne (C, LLVM) czytają je z `$ZS_STD` albo `$ZS_HOME/stdlib`. Wszystkie moduły działają identycznie w interpreterze
@@ -64,7 +69,7 @@ HTTP: `request($metoda, $url, $opcje)`, `get`, `post`, `put`, `delete` → `["st
 Serwer: `serve($host, $port, $handler, $maxŻądań = 0)`, `readRequest`, `response($status, $nagłówki, $treść)`; `$handler($req)` zwraca tekst albo `response(...)`.
 
 ### Ograniczenia sieci (świadome)
-* **Brak HTTPS/TLS** — `https://` kończy się czytelnym wyjątkiem. TLS wymagałby zależności; do HTTPS użyj `curl` przez `Os.run`.
+* **HTTPS przez zewnętrzne `curl`** (musi być w PATH; weryfikacja certyfikatu i proxy ze środowiska; treść żądania ≤ 100 kB). Własnego TLS brak.
 * Dane są tekstem UTF-8; treści binarne nie są bezpieczne (nieprawidłowe sekwencje zamieniane na U+FFFD). `Socket.read` dobiera brakujące bajty
   niepełnego znaku na końcu porcji, więc wielobajtowe znaki nie są uszkadzane na granicy odczytu.
 * Serwer jest jednowątkowy i obsługuje jedno żądanie na połączenie (`Connection: close`).
@@ -72,3 +77,30 @@ Serwer: `serve($host, $port, $handler, $maxŻądań = 0)`, `readRequest`, `respo
 ## Testy
 `tests/std/*.zsharp` + `*.out` (złote wyniki z interpretera, powtarzane na backendzie C: `scripts/tests/run_all.zsharp --native --filter=tests/std/`),
 `tests/std/net_server.zsharp` + `net_client.zsharp` (pętla zwrotna: serwer w tle, klient porównywany z `net_client.out`).
+
+## Dodatki (M5, sesja „M3/M4/M5 domknięte")
+* `Std.Time`: strefy z regułami DST (EU/US/AU/NZ): `zoneInfo, zoneOffset, zoneAbbr, isDst, inZone, makeInZone, addInZone`; `%Z` w formatowaniu.
+* `Std.Regex`: lookbehind `(?<=..)`/`(?<!..)`, `\p{L}`, `\P{..}`, flaga `u` (tablice Unicode przybliżone).
+* `System.gc()` (pusta, zgodność) / `System.gcStats()` (liczniki ZAMM) — patrz `docs/MEMORY.md`.
+
+## Std.Base64
+`encode($tekst)`, `decode($b64)`, `encodeUrl/decodeUrl` (alfabet `-_`, bez `=`), `encodeBytes($bajty)`, `decodeBytes($b64)` → tablica 0..255, `valid`,
+`hexEncode($tekst|$bajty)`, `hexDecode($hex)` → bajty. `decode` akceptuje oba alfabety i ignoruje białe znaki.
+
+## Std.Hash
+`sha256`, `sha1`, `md5`, `hmacSha256($klucz, $dane)` → hex; wersje `*Bytes` → tablica bajtów. `crc32($dane, $start = 0)`, `adler32`, `fnv1a` → int.
+Argument to tekst (bajty UTF-8) lub tablica bajtów. Wartości sprawdzone względem `hashlib`/`zlib`/`hmac` Pythona. Czysta arytmetyka 32-bitowa
+(int w Z# ma kontrolę przepełnienia, dlatego każdy krok jest maskowany). MD5/SHA-1 tylko dla zgodności.
+
+## Std.Csv
+`parse($tekst, $sep = ",")` → lista wierszy; `parseHeader` → lista tablic asocjacyjnych; `encode($wiersze, $sep)`; `encodeHeader($rekordy, $kolumny = null, $sep)`.
+Cudzysłowy, `""`, nowe linie w polach, `\r\n`, BOM. Pola zawsze jako teksty; błędy (niezamknięty cudzysłów) → `Exception` z linią.
+
+## Std.Random
+`$g = new Rng($ziarno = null)` (po `import Std.Random;`): `nextInt, int($min,$max), float, bool, pick, shuffle, sample, bytes, hex, uuid4`.
+Ta sama wartość ziarna daje tę samą sekwencję w interpreterze i w kodzie natywnym. **Nie** do celów kryptograficznych.
+
+## Std.Text
+`format($szablon, $dane)` — interpolacja `{imie}`, `{a.b.0}`, `{0}`, `{{`/`}}` (brak klucza → wyjątek). `lines, words, isBlank, capitalize, title, snake, kebab, camel, slug,
+length` (znaki Unicode), `truncate, wrap, indent, dedent, center, countOf, commonPrefix, levenshtein, reverseText`.
+Uwaga: `substr` działa na bajtach, więc moduł iteruje po `chars()`, gdy tekst może zawierać znaki spoza ASCII.
