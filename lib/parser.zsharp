@@ -565,6 +565,13 @@ class Parser {
         if ($k === "op" && $x === "[") {
             $items = [];
             while (!$this->isOp("]")) {
+                if ($this->isOp("...")) {
+                    $sl = $this->line();
+                    $this->bump();
+                    $items[] = node("Item", 0, null, node("Spread", $sl, $this->expr()));
+                    if (!$this->eatOp(",")) { break; }
+                    continue;
+                }
                 $first = $this->expr();
                 if ($this->eatOp("=>")) { $v = $this->expr(); $items[] = node("Item", 0, $first, $v); }
                 else { $items[] = node("Item", 0, null, $first); }
