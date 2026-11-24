@@ -19,9 +19,18 @@ typedef struct V {
 struct ZStr { int64_t len; char d[]; };
 struct ZExc { int kind; /* 0 Exception, 1 Error */ V msg; int64_t line; };
 
-typedef struct ZsHandler { struct ZsHandler *prev; jmp_buf jb; } ZsHandler;
+typedef struct ZsHandler { struct ZsHandler *prev; uint32_t depth; jmp_buf jb; } ZsHandler;
 
 extern ZsHandler *zs_h;
+extern uint32_t zs_depth;
+uint32_t zs_enter(void);            /* ZAMM: nowa arena (ramka funkcji lub iteracja pętli); zwraca jej poziom */
+V zs_leave(uint32_t level, V result); /* ZAMM: zwolnienie areny ramki (i regionów pętli w niej); wynik promowany do areny wywołującego */
+V zs_carry_slow(V v, uint32_t lvl);
+static inline V zs_carry(V v, uint32_t lvl) { return v.tag >= ZS_STR ? zs_carry_slow(v, lvl) : v; }   /* zmienna przenoszona między iteracjami */
+V zs_carry_v(V v, uint32_t lvl);
+void zs_pop(uint32_t lvl);          /* wyjście z regionu pętli (zwolnienie aren głębszych niż lvl) */
+uint32_t zs_cur_depth(void);
+void zs_try_push(ZsHandler *h);     /* rejestruje obsługę wyjątku wraz z głębokością ramki */
 extern V zs_cur_exc;
 extern int64_t zs_line;
 #define L(n) (zs_line = (n))
@@ -96,8 +105,9 @@ V m_System_resolveImport(V, V); V m_System_cpuCount(void); V m_System_dirname(V)
 V m_File_read(V); V m_File_write(V, V); V m_File_append(V, V); V m_File_exists(V); V m_File_delete(V);
 V m_Directory_create(V); V m_Directory_exists(V); V m_Directory_list(V);
 V m_Process_run(V, V); V m_Process_exec(V, V);
-/* rozszerzenia systemowe dla Std.Os / Std.Time / Std.Net (zgodne z stage0/zs-interp/src/sysmods.rs) */
+/* rozszerzenia systemowe dla Std.Os / Std.Time / Std.Net (zgodne z stage0/zs-interp/src/sys.rs) */
 V m_System_setEnv(V, V); V m_System_unsetEnv(V); V m_System_environ(void); V m_System_cwd(void); V m_System_chdir(V); V m_System_pid(void);
+V m_System_gc(void); V m_System_gcStats(void);
 V m_System_bytes(V); V m_System_fromBytes(V); V m_System_hostname(void); V m_System_nowNanos(void); V m_System_monotonic(void); V m_System_sleep(V); V m_System_localOffset(V);
 V m_File_stat(V); V m_File_rename(V, V); V m_File_realpath(V); V m_File_chmod(V, V); V m_File_symlink(V, V); V m_File_readlink(V);
 V m_Directory_remove(V);
