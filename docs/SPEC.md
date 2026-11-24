@@ -1168,3 +1168,6 @@ stage0 plan jest taki ze bedzie napisany w rust (bedzie to sam zsc) natomiast zs
 - `necho(a, b)` — wypisuje teksty jeden za drugim, bez separatora i bez nowej linii.
 - `eecho(a, b)` — jak `echo`, ale na standardowe wyjście błędów.
 - Tekst wartości: `null`, `true`/`false`, liczby całkowite, float z `.0` dla całkowitych < 1e15, tablice jako `[1, "a"]`.
+
+
+> **Uwaga (M4):** założenie „bez GC / ZAMM" jest zrealizowane w runtime natywnym (chained arenas, promocja ucieczek, regiony pętli) — patrz `docs/MEMORY.md`.
