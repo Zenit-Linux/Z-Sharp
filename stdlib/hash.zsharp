@@ -1,0 +1,228 @@
+namespace Hash;
+
+##
+ * Std.Hash — sumy kontrolne i skróty (czysty Z#, tylko arytmetyka 32-bitowa).
+ *   Skróty kryptograficzne: sha256, sha1, md5, hmacSha256   (tekst → hex; *Bytes → tablica bajtów)
+ *   Sumy kontrolne        : crc32, adler32, fnv1a            (tekst → int)
+ * Argument to tekst (liczony jako bajty UTF-8) albo tablica bajtów 0..255.
+ * MD5 i SHA-1 są złamane kryptograficznie — używaj ich tylko do zgodności i sum kontrolnych.
+##
+
+func toBytes($data) { return is_array($data) ? $data : System.bytes(strval($data)); }
+func m32($x) { return $x & 0xFFFFFFFF; }
+func rotl($x, $n) { return (($x << $n) | ($x >> (32 - $n))) & 0xFFFFFFFF; }
+func rotr($x, $n) { return (($x >> $n) | ($x << (32 - $n))) & 0xFFFFFFFF; }
+func not32($x) { return (~$x) & 0xFFFFFFFF; }
+
+func hex32($w, $little) {
+    $out = [];
+    if ($little) { for ($i = 0; $i < 4; $i++) { $out[] = ($w >> (8 * $i)) & 255; } }
+    else { for ($i = 3; $i >= 0; $i--) { $out[] = ($w >> (8 * $i)) & 255; } }
+    return $out;
+}
+
+func hexOf($bytes) {
+    $r = "";
+    foreach ($bytes as $b) { $r .= ($b < 16 ? "0" : "") . to_hex($b); }
+    return $r;
+}
+
+##
+ * Dopełnienie Merkle–Damgård: bajt 0x80, zera, 64-bitowa długość w bitach (big- lub little-endian).
+##
+func pad($bytes, $little) {
+    $n = count($bytes);
+    $bytes[] = 128;
+    while (count($bytes) % 64 !== 56) { $bytes[] = 0; }
+    $bits = $n * 8;
+    if ($little) { for ($i = 0; $i < 8; $i++) { $bytes[] = ($bits >> (8 * $i)) & 255; } }
+    else { for ($i = 7; $i >= 0; $i--) { $bytes[] = ($bits >> (8 * $i)) & 255; } }
+    return $bytes;
+}
+
+# ── SHA-256 ──
+func sha256K() {
+    return [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+    ];
+}
+
+func sha256Bytes($data) {
+    $k = sha256K();
+    $h = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+    $m = pad(toBytes($data), false);
+    $total = count($m);
+    for ($off = 0; $off < $total; $off += 64) {
+        $w = [];
+        for ($i = 0; $i < 16; $i++) {
+            $j = $off + $i * 4;
+            $w[] = ($m[$j] << 24) | ($m[$j + 1] << 16) | ($m[$j + 2] << 8) | $m[$j + 3];
+        }
+        for ($i = 16; $i < 64; $i++) {
+            $x = $w[$i - 15];
+            $y = $w[$i - 2];
+            $s0 = rotr($x, 7) ^ rotr($x, 18) ^ ($x >> 3);
+            $s1 = rotr($y, 17) ^ rotr($y, 19) ^ ($y >> 10);
+            $w[] = m32($w[$i - 16] + $s0 + $w[$i - 7] + $s1);
+        }
+        $a = $h[0]; $b = $h[1]; $c = $h[2]; $d = $h[3]; $e = $h[4]; $f = $h[5]; $g = $h[6]; $hh = $h[7];
+        for ($i = 0; $i < 64; $i++) {
+            $S1 = rotr($e, 6) ^ rotr($e, 11) ^ rotr($e, 25);
+            $ch = ($e & $f) ^ (not32($e) & $g);
+            $t1 = m32($hh + $S1 + $ch + $k[$i] + $w[$i]);
+            $S0 = rotr($a, 2) ^ rotr($a, 13) ^ rotr($a, 22);
+            $maj = ($a & $b) ^ ($a & $c) ^ ($b & $c);
+            $t2 = m32($S0 + $maj);
+            $hh = $g; $g = $f; $f = $e; $e = m32($d + $t1);
+            $d = $c; $c = $b; $b = $a; $a = m32($t1 + $t2);
+        }
+        $h = [m32($h[0] + $a), m32($h[1] + $b), m32($h[2] + $c), m32($h[3] + $d), m32($h[4] + $e), m32($h[5] + $f), m32($h[6] + $g), m32($h[7] + $hh)];
+    }
+    $out = [];
+    foreach ($h as $x) { foreach (hex32($x, false) as $b) { $out[] = $b; } }
+    return $out;
+}
+func sha256($data) { return hexOf(sha256Bytes($data)); }
+
+# ── SHA-1 ──
+func sha1Bytes($data) {
+    $h = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
+    $m = pad(toBytes($data), false);
+    $total = count($m);
+    for ($off = 0; $off < $total; $off += 64) {
+        $w = [];
+        for ($i = 0; $i < 16; $i++) {
+            $j = $off + $i * 4;
+            $w[] = ($m[$j] << 24) | ($m[$j + 1] << 16) | ($m[$j + 2] << 8) | $m[$j + 3];
+        }
+        for ($i = 16; $i < 80; $i++) { $w[] = rotl($w[$i - 3] ^ $w[$i - 8] ^ $w[$i - 14] ^ $w[$i - 16], 1); }
+        $a = $h[0]; $b = $h[1]; $c = $h[2]; $d = $h[3]; $e = $h[4];
+        for ($i = 0; $i < 80; $i++) {
+            if ($i < 20) { $f = ($b & $c) | (not32($b) & $d); $kk = 0x5A827999; }
+            else if ($i < 40) { $f = $b ^ $c ^ $d; $kk = 0x6ED9EBA1; }
+            else if ($i < 60) { $f = ($b & $c) | ($b & $d) | ($c & $d); $kk = 0x8F1BBCDC; }
+            else { $f = $b ^ $c ^ $d; $kk = 0xCA62C1D6; }
+            $t = m32(rotl($a, 5) + $f + $e + $kk + $w[$i]);
+            $e = $d; $d = $c; $c = rotl($b, 30); $b = $a; $a = $t;
+        }
+        $h = [m32($h[0] + $a), m32($h[1] + $b), m32($h[2] + $c), m32($h[3] + $d), m32($h[4] + $e)];
+    }
+    $out = [];
+    foreach ($h as $x) { foreach (hex32($x, false) as $b) { $out[] = $b; } }
+    return $out;
+}
+func sha1($data) { return hexOf(sha1Bytes($data)); }
+
+# ── MD5 ──
+func md5K() {
+    return [
+        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+        0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+        0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+        0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+        0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+        0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+        0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391
+    ];
+}
+
+func md5Bytes($data) {
+    $k = md5K();
+    $s = [7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+          5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+          4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+          6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21];
+    $a0 = 0x67452301; $b0 = 0xEFCDAB89; $c0 = 0x98BADCFE; $d0 = 0x10325476;
+    $m = pad(toBytes($data), true);
+    $total = count($m);
+    for ($off = 0; $off < $total; $off += 64) {
+        $w = [];
+        for ($i = 0; $i < 16; $i++) {
+            $j = $off + $i * 4;
+            $w[] = $m[$j] | ($m[$j + 1] << 8) | ($m[$j + 2] << 16) | ($m[$j + 3] << 24);
+        }
+        $a = $a0; $b = $b0; $c = $c0; $d = $d0;
+        for ($i = 0; $i < 64; $i++) {
+            if ($i < 16) { $f = ($b & $c) | (not32($b) & $d); $g = $i; }
+            else if ($i < 32) { $f = ($d & $b) | (not32($d) & $c); $g = (5 * $i + 1) % 16; }
+            else if ($i < 48) { $f = $b ^ $c ^ $d; $g = (3 * $i + 5) % 16; }
+            else { $f = $c ^ ($b | not32($d)); $g = (7 * $i) % 16; }
+            $f = m32($f + $a + $k[$i] + $w[$g]);
+            $a = $d; $d = $c; $c = $b;
+            $b = m32($b + rotl($f, $s[$i]));
+        }
+        $a0 = m32($a0 + $a); $b0 = m32($b0 + $b); $c0 = m32($c0 + $c); $d0 = m32($d0 + $d);
+    }
+    $out = [];
+    foreach ([$a0, $b0, $c0, $d0] as $x) { foreach (hex32($x, true) as $b) { $out[] = $b; } }
+    return $out;
+}
+func md5($data) { return hexOf(md5Bytes($data)); }
+
+# ── HMAC-SHA256 ──
+func hmacSha256Bytes($key, $data) {
+    $kb = toBytes($key);
+    if (count($kb) > 64) { $kb = sha256Bytes($kb); }
+    while (count($kb) < 64) { $kb[] = 0; }
+    $ipad = [];
+    $opad = [];
+    foreach ($kb as $b) { $ipad[] = $b ^ 0x36; $opad[] = $b ^ 0x5c; }
+    foreach (toBytes($data) as $b) { $ipad[] = $b; }
+    $inner = sha256Bytes($ipad);
+    foreach ($inner as $b) { $opad[] = $b; }
+    return sha256Bytes($opad);
+}
+func hmacSha256($key, $data) { return hexOf(hmacSha256Bytes($key, $data)); }
+
+# ── sumy kontrolne ──
+func crcTable() {
+    $t = [];
+    for ($n = 0; $n < 256; $n++) {
+        $c = $n;
+        for ($k = 0; $k < 8; $k++) {
+            if (($c & 1) === 1) { $c = 0xEDB88320 ^ ($c >> 1); } else { $c = $c >> 1; }
+        }
+        $t[] = $c;
+    }
+    return $t;
+}
+
+##
+ * CRC-32 (IEEE 802.3, jak w zlib/gzip/PNG). Zwraca int 0..2^32-1; `$start` pozwala kontynuować wcześniejszą sumę.
+##
+func crc32($data, $start = 0) {
+    $t = crcTable();
+    $c = $start ^ 0xFFFFFFFF;
+    foreach (toBytes($data) as $b) { $c = $t[($c ^ $b) & 255] ^ ($c >> 8); }
+    return ($c ^ 0xFFFFFFFF) & 0xFFFFFFFF;
+}
+
+func adler32($data) {
+    $a = 1;
+    $b = 0;
+    foreach (toBytes($data) as $x) {
+        $a = ($a + $x) % 65521;
+        $b = ($b + $a) % 65521;
+    }
+    return ($b << 16) | $a;
+}
+
+##
+ * FNV-1a, 32 bity (mnożenie przez 16777619 rozbite na przesunięcia, żeby nie przekraczać zakresu int).
+##
+func fnv1a($data) {
+    $h = 0x811C9DC5;
+    foreach (toBytes($data) as $b) {
+        $h = ($h ^ $b) & 0xFFFFFFFF;
+        $h = m32($h + ($h << 1) + ($h << 4) + ($h << 7) + ($h << 8) + ($h << 24));
+    }
+    return $h;
+}
