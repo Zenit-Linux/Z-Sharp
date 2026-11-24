@@ -113,6 +113,7 @@ fn expr(s: &S) -> R<Expr> {
         "Var" => ExprKind::Var(name(at(f, 0)?)?),
         "Name" => ExprKind::Name(name(at(f, 0)?)?),
         "Array" => ExprKind::Array(list(at(f, 0)?)?.iter().map(|i| { let (_, g) = node(i, "Item")?; Ok((opt_expr(at(g, 0)?)?, expr(at(g, 1)?)?)) }).collect::<R<Vec<_>>>()?),
+        "Spread" => ExprKind::Spread(bx(at(f, 0)?)?),
         "Index" => ExprKind::Index(bx(at(f, 0)?)?, match at(f, 1)? { S::Null => None, o => Some(bx(o)?) }),
         "Prop" => ExprKind::Prop(bx(at(f, 0)?)?, name(at(f, 1)?)?),
         "Dot" => ExprKind::Dot(bx(at(f, 0)?)?, name(at(f, 1)?)?),
