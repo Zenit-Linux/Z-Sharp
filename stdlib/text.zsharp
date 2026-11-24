@@ -1,0 +1,240 @@
+namespace Text;
+
+func format($tpl, $data = []) {
+    $cs = chars($tpl);
+    $n = count($cs);
+    $out = "";
+    $i = 0;
+    while ($i < $n) {
+        $c = $cs[$i];
+        if ($c === "{") {
+            if ($i + 1 < $n && $cs[$i + 1] === "{") { $out .= "{"; $i += 2; continue; }
+            $j = $i + 1;
+            $key = "";
+            while ($j < $n && $cs[$j] !== "}") { $key .= $cs[$j]; $j++; }
+            if ($j >= $n) { throw new Exception("Text.format: niezamknięte '{' na pozycji " . $i); }
+            $val = lookup($data, trim($key));
+            $out .= $val === null ? "" : strval($val);
+            $i = $j + 1;
+            continue;
+        }
+        if ($c === "}") {
+            if ($i + 1 < $n && $cs[$i + 1] === "}") { $out .= "}"; $i += 2; continue; }
+            throw new Exception("Text.format: nadmiarowe '}' na pozycji " . $i);
+        }
+        $out .= $c;
+        $i++;
+    }
+    return $out;
+}
+
+##
+ * Wyszukuje klucz "a.b.0" w zagnieżdżonych tablicach; brak klucza → wyjątek.
+##
+func lookup($data, $path) {
+    $cur = $data;
+    foreach (split($path, ".") as $k) {
+        if (!is_array($cur)) { throw new Exception("Text.format: brak wartości dla {" . $path . "}"); }
+        if (has_key($cur, $k)) { $cur = $cur[$k]; }
+        else if (is_digit($k) && has_key($cur, intval($k))) { $cur = $cur[intval($k)]; }
+        else { throw new Exception("Text.format: brak wartości dla {" . $path . "}"); }
+    }
+    return $cur;
+}
+
+func lines($s) {
+    $s = replace($s, "\r\n", "\n");
+    $parts = split($s, "\n");
+    if (count($parts) > 0 && $parts[count($parts) - 1] === "") { $parts = array_slice($parts, 0, count($parts) - 1); }
+    return $parts;
+}
+
+func words($s) {
+    $out = [];
+    $cur = "";
+    foreach (chars($s) as $c) {
+        if (is_space($c)) { if ($cur !== "") { $out[] = $cur; $cur = ""; } }
+        else { $cur .= $c; }
+    }
+    if ($cur !== "") { $out[] = $cur; }
+    return $out;
+}
+
+func isBlank($s) { return trim($s) === ""; }
+
+func capitalize($s) { return strlen($s) === 0 ? $s : upper(substr($s, 0, 1)) . substr($s, 1); }
+
+func title($s) {
+    $out = [];
+    foreach (words($s) as $w) { $out[] = capitalize(lower($w)); }
+    return implode($out, " ");
+}
+
+func implode($parts, $sep) {
+    $r = "";
+    $first = true;
+    foreach ($parts as $p) {
+        if (!$first) { $r .= $sep; }
+        $r .= $p;
+        $first = false;
+    }
+    return $r;
+}
+
+func splitIdent($s) {
+    $out = [];
+    $cur = "";
+    $prevLower = false;
+    foreach (chars($s) as $c) {
+        if ($c === "_" || $c === "-" || is_space($c)) {
+            if ($cur !== "") { $out[] = lower($cur); $cur = ""; }
+            $prevLower = false;
+            continue;
+        }
+        $o = ord($c);
+        $isUpper = $o >= 65 && $o <= 90;
+        if ($isUpper && $prevLower && $cur !== "") { $out[] = lower($cur); $cur = ""; }
+        $cur .= $c;
+        $prevLower = ($o >= 97 && $o <= 122) || ($o >= 48 && $o <= 57);
+    }
+    if ($cur !== "") { $out[] = lower($cur); }
+    return $out;
+}
+
+func snake($s) { return implode(splitIdent($s), "_"); }
+func kebab($s) { return implode(splitIdent($s), "-"); }
+func camel($s) {
+    $out = "";
+    $first = true;
+    foreach (splitIdent($s) as $w) { $out .= $first ? $w : capitalize($w); $first = false; }
+    return $out;
+}
+
+func slug($s) {
+    $map = ["ą" => "a", "ć" => "c", "ę" => "e", "ł" => "l", "ń" => "n", "ó" => "o", "ś" => "s", "ź" => "z", "ż" => "z",
+            "Ą" => "a", "Ć" => "c", "Ę" => "e", "Ł" => "l", "Ń" => "n", "Ó" => "o", "Ś" => "s", "Ź" => "z", "Ż" => "z",
+            "ä" => "a", "ö" => "o", "ü" => "u", "ß" => "ss", "é" => "e", "è" => "e", "à" => "a", "ç" => "c"];
+    foreach ($map as $from => $to) { $s = replace($s, $from, $to); }
+    $out = "";
+    $dash = false;
+    foreach (chars(lower($s)) as $c) {
+        $o = ord($c);
+        if (strlen($c) === 1 && (($o >= 97 && $o <= 122) || ($o >= 48 && $o <= 57))) { $out .= $c; $dash = false; }
+        else if (!$dash && $out !== "") { $out .= "-"; $dash = true; }
+    }
+    if (ends_with($out, "-")) { $out = substr($out, 0, strlen($out) - 1); }
+    return $out;
+}
+
+func length($s) { return count(chars($s)); }
+
+func truncate($s, $max, $end = "…") {
+    $cs = chars($s);
+    if (count($cs) <= $max) { return $s; }
+    $keep = $max - length($end);
+    if ($keep < 0) { $keep = 0; }
+    $r = "";
+    for ($i = 0; $i < $keep; $i++) { $r .= $cs[$i]; }
+    return $r . $end;
+}
+
+##
+ * Zawijanie wierszy na granicach słów (słowo dłuższe niż $width zostaje w całości).
+##
+func wrap($s, $width) {
+    $out = [];
+    foreach (lines($s) as $line) {
+        $cur = "";
+        foreach (words($line) as $w) {
+            if ($cur === "") { $cur = $w; }
+            else if (length($cur) + 1 + length($w) <= $width) { $cur .= " " . $w; }
+            else { $out[] = $cur; $cur = $w; }
+        }
+        $out[] = $cur;
+    }
+    return implode($out, "\n");
+}
+
+func indent($s, $prefix = "    ") {
+    $out = [];
+    foreach (lines($s) as $line) { $out[] = $line === "" ? "" : $prefix . $line; }
+    return implode($out, "\n");
+}
+
+func dedent($s) {
+    $ls = lines($s);
+    $min = -1;
+    foreach ($ls as $line) {
+        if (trim($line) === "") { continue; }
+        $k = 0;
+        while ($k < strlen($line) && (substr($line, $k, 1) === " " || substr($line, $k, 1) === "\t")) { $k++; }
+        if ($min < 0 || $k < $min) { $min = $k; }
+    }
+    if ($min <= 0) { return implode($ls, "\n"); }
+    $out = [];
+    foreach ($ls as $line) { $out[] = strlen($line) >= $min ? substr($line, $min) : trim($line); }
+    return implode($out, "\n");
+}
+
+func center($s, $width, $ch = " ") {
+    $len = length($s);
+    if ($len >= $width) { return $s; }
+    $total = $width - $len;
+    $left = ($total - $total % 2) / 2;
+    return repeat($ch, $left) . $s . repeat($ch, $total - $left);
+}
+
+func countOf($s, $needle) {
+    if ($needle === "") { return 0; }
+    $n = 0;
+    $from = 0;
+    while (true) {
+        $p = index_of(substr($s, $from), $needle);
+        if ($p === false || $p === null || $p < 0) { break; }
+        $n++;
+        $from += $p + strlen($needle);
+    }
+    return $n;
+}
+
+func commonPrefix($a, $b) {
+    $x = chars($a);
+    $y = chars($b);
+    $n = count($x) < count($y) ? count($x) : count($y);
+    $r = "";
+    for ($i = 0; $i < $n && $x[$i] === $y[$i]; $i++) { $r .= $x[$i]; }
+    return $r;
+}
+
+##
+ * Odległość Levenshteina po znakach Unicode.
+##
+func levenshtein($a, $b) {
+    $x = chars($a);
+    $y = chars($b);
+    $n = count($x);
+    $m = count($y);
+    if ($n === 0) { return $m; }
+    if ($m === 0) { return $n; }
+    $prev = [];
+    for ($j = 0; $j <= $m; $j++) { $prev[] = $j; }
+    for ($i = 1; $i <= $n; $i++) {
+        $cur = [$i];
+        for ($j = 1; $j <= $m; $j++) {
+            $cost = $x[$i - 1] === $y[$j - 1] ? 0 : 1;
+            $best = $prev[$j] + 1;
+            if ($cur[$j - 1] + 1 < $best) { $best = $cur[$j - 1] + 1; }
+            if ($prev[$j - 1] + $cost < $best) { $best = $prev[$j - 1] + $cost; }
+            $cur[] = $best;
+        }
+        $prev = $cur;
+    }
+    return $prev[$m];
+}
+
+func reverseText($s) {
+    $cs = chars($s);
+    $r = "";
+    for ($i = count($cs) - 1; $i >= 0; $i--) { $r .= $cs[$i]; }
+    return $r;
+}
