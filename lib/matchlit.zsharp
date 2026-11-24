@@ -1,0 +1,58 @@
+namespace matchlit;
+
+import Workspace.parser;
+
+##
+ * M3: wyrazenie match w backendzie natywnym. Przepisanie na natychmiast wywolane domkniecie:
+ *     match ($s) { a, b => X, default => Y }
+ *  => (function ($__m) { if ($__m === a || $__m === b) { return X; } return Y; })($s)
+ * Brak dopasowania (bez default) rzuca wyjatek jak interpreter. Domkniecia sa pozniej podnoszone przez lib/closures.zsharp.
+##
+
+func eqTest($line, $c) {
+    return [":Binary", $line, "Identical", [":Var", $line, "__m"], $c];
+}
+
+func rewriteMatch($n) {
+    $line = $n[1];
+    $body = [];
+    $hasDefault = false;
+    foreach ($n[3] as $arm) {
+        $conds = $arm[2];
+        $val = rewrite($arm[3]);
+        if ($conds === null) {
+            $body[] = [":Return", $line, $val];
+            $hasDefault = true;
+            break;
+        }
+        $c = null;
+        foreach ($conds as $x) {
+            $t = eqTest($line, rewrite($x));
+            $c = $c === null ? $t : [":Binary", $line, "Or", $c, $t];
+        }
+        $body[] = [":If", $line, $c, [[":Return", $line, $val]], null];
+    }
+    if (!$hasDefault) {
+        $body[] = [":Throw", $line, [":New", $line, "Exception", [[":Arg", 0, null, [":Str", $line, "brak dopasowania w match"], false]]]];
+    }
+    $params = [[":Param", 0, "__m", [], null, false]];
+    $fn = [":Func", $line, null, $params, [], $body, false];
+    return [":Call", $line, [":Closure", $line, $fn], [[":Arg", 0, null, rewrite($n[2]), false]]];
+}
+
+func rewrite($x) {
+    if (parser.isNode($x)) {
+        if ($x[0] === ":Match") { return rewriteMatch($x); }
+        $o = [$x[0], $x[1]];
+        for ($i = 2; $i < count($x); $i++) { $o[] = rewrite($x[$i]); }
+        return $o;
+    }
+    if (is_array($x)) {
+        $o = [];
+        foreach ($x as $k => $v) { $o[$k] = rewrite($v); }
+        return $o;
+    }
+    return $x;
+}
+
+func desugar($ast) { return rewrite($ast); }
