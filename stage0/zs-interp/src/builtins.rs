@@ -190,7 +190,7 @@ impl Interp {
                 Ok(Value::Int(st.code().unwrap_or(-1) as i64)) })(),
             // stage0: zadania wykonują się synchronicznie
             ("Task", "run") => (|| { let fv = arg(a, 0, f)?.clone(); self.call_value(&fv, vec![]) })(),
-            _ => return None,
+            _ => return self.call_sys(m, name, a),
         })
     }
 }
