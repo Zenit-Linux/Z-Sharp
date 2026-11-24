@@ -1,5 +1,35 @@
 # Zmiany (wersja pozostaje 0.0.1)
 
+## Sesja „zenitd jako poligon: extern w stage0"
+- **stage0**: wywołania `extern "c"` w interpreterze (`zs-interp/src/ffi.rs`): dlsym + do 6 argumentów całkowitych; `string` ↔ `char *` (null ↔ NULL). `zsc0 run`, `exec` i bundle uruchamiają teraz kod z libc (dotąd: błąd „linkowanie extern tylko w zsc").
+- **stage0**: `zsc0 bundle <pakiet.zbc> -o <wyjście>` — brakowało go w `main.rs`, mimo że `scripts/fixpoint.zsharp` go wołał (etap „standalone zsc" kończył się błędem).
+- **stage0**: wątek główny blokuje sygnały, więc `SIGCHLD` skierowany do procesu trafia do `signalfd` w wątku interpretera (wcześniej ginął; demony na `signalfd` widziały zakończenie dzieci dopiero po przeterminowaniu pollingu).
+- **stage0**: bundle jako PID 1 — przed zamontowaniem `/proc` `current_exe` zawodzi, więc ładunek jest szukany przez `argv[0]`; wątek interpretera próbuje coraz mniejszych stosów (1 GiB → 4 MiB), gdy rezerwacja się nie udaje (VM z małą pamięcią).
+- Test złoty `tests/m3/extern.zsharp`.
+
+## Sesja „rozbudowa stdlib"
+- Nowe moduły `Std.*` (czysty Z#, identyczne w interpreterze i w kodzie natywnym C): **Base64** (+hex), **Hash** (SHA-256/SHA-1/MD5/HMAC/CRC-32/Adler-32/FNV-1a),
+  **Csv** (RFC 4180), **Random** (`Rng`, xorshift128, `uuid4`), **Text** (`format` z interpolacją `{klucz}`, `slug`, `wrap`, `levenshtein`, …). Opis: `docs/STDLIB.md`.
+- Testy złote `tests/std/{base64,hash,csv,random,text}` (skróty zweryfikowane względem Pythona); zarejestrowane w `stage0/zs-interp/src/stdlib.rs`.
+- Naprawiony nieaktualny test `tests/std/net_client` (oczekiwał braku HTTPS; od czasu transportu przez `curl` sprawdza tylko prefiks błędu).
+- `run_all`: 27 grup OK w interpreterze; `--native`: nowe moduły OK, `tests/zamm_test.zsharp [natywny C]` nadal nie przechodzi (znany brak klas w tym teście).
+- Uwaga środowiskowa: `Cargo.lock` w wersji 4 wymaga cargo ≥ 1.78; z cargo 1.75 usuń plik i zbuduj ponownie.
+
+## Sesja „ZAMM i M6"
+- **M4 / ZAMM**: konserwatywny GC usunięty; runtime natywny używa aren per ramka (`zs_enter`/`zs_leave`), promocji ucieczek (return, bariera zapisu, statyki, wyjątki), regionów pętli z analizą żywotności (`lib/regions.zsharp`). Opis: `docs/MEMORY.md`. Testy: `tests/m4/zamm`, `tests/m4/gc_stress`. stage3 nadal daje identyczny C.
+- **M6**: VM bajtkodowa w stage0 (`vm.rs`, test różnicowy `tests/m6/vm`), `zsi --jit` z cache i fallbackiem. Opis: `docs/VM.md`.
+- **M3 (luki)**: wyrażenie `match` w backendzie natywnym (`lib/matchlit.zsharp`); wywołania funkcji wariadycznych z pominiętymi parametrami domyślnymi; `??` na zagnieżdżonych brakujących kluczach w runtime natywnym.
+
+## Sesja „M3/M4/M5 domknięte, strona WWW"
+- **M4 (etap pośredni, zastąpiony ZAMM)**: konserwatywny GC mark-and-sweep w `runtime/native/zs_rt.c` (klasy rozmiarów, chunki 64 KiB, wskaźniki wewnętrzne, korzenie: stos/rejestry/.data+.bss),
+  `System.gc()`, `System.gcStats()`, zmienne `ZS_GC*`, tryb `ZS_GC_STRESS`. Opis i odstępstwo od SPEC: `docs/MEMORY.md`. Test: `tests/m4/gc_stress`. stage3 nadal daje identyczny C.
+- **M3**: spread w literałach tablic `[...$a]` (Rust: `ExprKind::Spread`; Z#: parser, sema, nowy `lib/spreadlit.zsharp` w potoku po `link`). Test: `tests/m3/spread`.
+- **M5**: strefy czasowe w `Std.Time` (`inZone`, `makeInZone`, `addInZone`, `zoneInfo`, `%Z`), regex: lookbehind, `\p{..}`/`\P{..}`, flaga `u`; HTTPS w `Std.Net` przez `curl`.
+  Testy: `tests/std/time_zones`, `tests/std/regex_unicode`.
+- stage0: stdlib i prymitywy systemowe w `zs-interp/src/{stdlib,sys}.rs`, `System.gc/gcStats` (atrapy).
+- Strona `website/` (TypeScript + esbuild, testy `node:test`), `index.html` w korzeniu, workflow `build-docs.yml` (GitHub Pages), `check.yml` (CI).
+- Znane braki: domknięcia w zst js, natywny TLS, pełne tablice Unicode, `Socket` w `builtin_modules()` linkera (Std.Net natywnie nietestowany).
+
 ## Sesja „M3 domknięty, M5 stdlib, skrypty w Z#"
 - **M3 (domknięcia i nie tylko) w backendach natywnych**: `lib/closures.zsharp` (lifting domknięć z przechwyceniem przez wartość, funkcje strzałkowe,
   wywołania wartości `$f(...)`, `zs_call`/`zs_spread`), argumenty nazwane i spread także dla metod (`zs_invoke_n`), pola statyczne (`zs_sget/zs_sset`),
