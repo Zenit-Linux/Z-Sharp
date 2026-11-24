@@ -49,12 +49,20 @@ class Exception implements Throwable {
     public func getLine() { return $this->line; }
 }
 class Error extends Exception {}
+func reduce($a, $f, $acc) { foreach ($a as $v) { $acc = $f($acc, $v); } return $acc; }
+func each($a, $f) { foreach ($a as $v) { $f($v); } return null; }
+func find($a, $f) { foreach ($a as $v) { if ($f($v)) { return $v; } } return null; }
+func any($a, $f) { foreach ($a as $v) { if ($f($v)) { return true; } } return false; }
+func all($a, $f) { foreach ($a as $v) { if (!$f($v)) { return false; } } return true; }
+func sum($a) { $t = 0; foreach ($a as $v) { $t = $t + $v; } return $t; }
+func usort($a, $f) { $v = values($a); return usort_rec($v, $f); }
+func usort_rec($v, $f) { $n = count($v); if ($n < 2) { return $v; } $m = intval($n / 2); $l = usort_rec(array_slice($v, 0, $m), $f); $r = usort_rec(array_slice($v, $m), $f); $o = []; $i = 0; $j = 0; $nl = count($l); $nr = count($r); while ($i < $nl && $j < $nr) { if ($f($l[$i], $r[$j]) <= 0) { $o[] = $l[$i]; $i++; } else { $o[] = $r[$j]; $j++; } } while ($i < $nl) { $o[] = $l[$i]; $i++; } while ($j < $nr) { $o[] = $r[$j]; $j++; } return $o; }
 class TypeError extends Error {}
 class ValueError extends Error {}
 class IOError extends Error {}
 "#;
 
-pub const BUILTIN_MODULES: &[&str] = &["System", "Math", "File", "Directory", "Process", "Task"];
+pub const BUILTIN_MODULES: &[&str] = &["System", "Math", "File", "Directory", "Process", "Task", "Socket"];
 
 pub struct Interp {
     pub frames: Vec<Frame>,
@@ -63,7 +71,7 @@ pub struct Interp {
     pub modules: HashMap<String, Module>,
     pub aliases: HashMap<String, String>,
     pub loaded: HashSet<PathBuf>,
-    pub externs: HashSet<Name>,
+    pub externs: HashMap<Name, ExternItem>,
     pub dir_stack: Vec<PathBuf>,
     /// moduły z kontenera .zbc (klucz = ścieżka importu); gdy obecne, import nie dotyka systemu plików
     pub bundle: HashMap<String, Rc<Vec<Stmt>>>,
@@ -72,13 +80,37 @@ pub struct Interp {
     pub line: u32,
     pub args: Vec<String>,
     pub out: std::io::BufWriter<std::io::Stdout>,
+    pub socks: Vec<Option<crate::sys::Sock>>,
+    pub started: std::time::Instant,
+    /// M6: VM bajtkodowa (tier 1) włączona (domyślnie tak; `ZS_VM=0` wyłącza)
+    pub vm_on: bool,
+    pub this_name: Name,
+    pub vm_cache: HashMap<usize, Option<Rc<crate::vm::Prog>>>,
+}
+
+/// Wątek z dużym stosem (głęboka rekurencja AST). Na maszynach o małej pamięci (np. VM z 1 GB, PID 1)
+/// rezerwacja 1 GiB może się nie udać — wtedy próbujemy coraz mniejszych stosów.
+fn spawn_big_stack<F: FnOnce() -> i32 + Send + 'static>(f: F) -> std::thread::JoinHandle<i32> {
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(f)));
+    let mut last = None;
+    for shift in [30u32, 28, 26, 24, 22] {
+        let s2 = slot.clone();
+        match std::thread::Builder::new().stack_size(1usize << shift).spawn(move || {
+            let f = s2.lock().unwrap().take().expect("wątek interpretera uruchomiony dwukrotnie");
+            f()
+        }) {
+            Ok(h) => return h,
+            Err(e) => last = Some(e),
+        }
+    }
+    panic!("nie można utworzyć wątku interpretera: {}", last.unwrap());
 }
 
 /// Uruchamia plik .zs; zwraca kod wyjścia procesu.
 pub fn run_file(path: &str, args: Vec<String>) -> i32 {
     let path = path.to_string();
     // głęboka rekurencja drzewa AST wymaga dużego stosu
-    let h = std::thread::Builder::new().stack_size(1 << 30).spawn(move || {
+    let h = spawn_big_stack(move || {
         let src = match std::fs::read_to_string(&path) {
             Ok(s) => s, Err(e) => { eprintln!("{path}: {e}"); return 1; }
         };
@@ -91,13 +123,14 @@ pub fn run_file(path: &str, args: Vec<String>) -> i32 {
         let code = it.run_program(&prog);
         it.flush();
         code
-    }).unwrap();
+    });
+    crate::ffi::shield_main_thread_signals();
     h.join().unwrap_or(1)
 }
 
 /// Uruchamia skompilowany program `.zbc` (bez parsowania źródeł); zwraca kod wyjścia procesu.
 pub fn run_zbc(text: String, args: Vec<String>) -> i32 {
-    let h = std::thread::Builder::new().stack_size(1 << 30).spawn(move || {
+    let h = spawn_big_stack(move || {
         let z = match zs_parser::reader::parse_zbc(&text) { Ok(z) => z, Err(e) => { eprintln!("zbc: {e}"); return 1; } };
         let mut it = Interp::new(args);
         for (k, v) in z.modules { it.bundle.insert(k, Rc::new(v)); }
@@ -105,7 +138,8 @@ pub fn run_zbc(text: String, args: Vec<String>) -> i32 {
         let code = it.run_program(&z.entry);
         it.flush();
         code
-    }).unwrap();
+    });
+    crate::ffi::shield_main_thread_signals();
     h.join().unwrap_or(1)
 }
 
@@ -113,6 +147,7 @@ pub fn run_zbc(text: String, args: Vec<String>) -> i32 {
 pub fn resolve_import_path(here: &Path, segs: &[&str]) -> Option<PathBuf> {
     if segs.is_empty() { return None; }
     if segs[0] == "Workspace" && segs.len() >= 2 { return zs_manifest::resolve_workspace_import(here, &segs[1..]); }
+    if segs[0] == "Std" && segs.len() == 2 { return crate::stdlib::locate(segs[1]); }
     let mut dirs: Vec<PathBuf> = vec![here.to_path_buf()];
     if let Ok(c) = std::env::current_dir() { dirs.push(c); }
     if let Ok(p) = std::env::var("ZS_PATH") { dirs.extend(p.split(':').map(PathBuf::from)); }
@@ -130,9 +165,11 @@ impl Interp {
         let mut it = Interp {
             frames: vec![Frame { vars: HashMap::new(), this: None, class: None, module: None }],
             funcs: HashMap::new(), classes: HashMap::new(), modules: HashMap::new(),
-            aliases: HashMap::new(), loaded: HashSet::new(), externs: HashSet::new(),
+            aliases: HashMap::new(), loaded: HashSet::new(), externs: HashMap::new(),
             dir_stack: vec![], bundle: HashMap::new(), main_called: false, cur_module: None, line: 0, args,
             out: std::io::BufWriter::new(std::io::stdout()),
+            socks: Vec::new(), started: std::time::Instant::now(),
+            this_name: rc("this"), vm_on: std::env::var("ZS_VM").map(|v| v != "0").unwrap_or(true), vm_cache: HashMap::new(),
         };
         let prelude = zs_parser::parse(PRELUDE).expect("prelude");
         it.hoist(&prelude).ok();
@@ -178,6 +215,7 @@ impl Interp {
         }
     }
 
+    pub(crate) fn flow_to_exc_pub(&mut self, f: &Flow) -> Option<Value> { self.flow_to_exc(f) }
     fn flow_to_exc(&mut self, f: &Flow) -> Option<Value> {
         match f {
             Flow::Throw(v) => Some(v.clone()),
@@ -407,7 +445,7 @@ impl Interp {
                 }
                 return res;
             }
-            StmtKind::Extern { lib: _, items } => { for i in items { self.externs.insert(i.name.clone()); } }
+            StmtKind::Extern { lib: _, items } => { for i in items { self.externs.insert(i.name.clone(), i.clone()); } }
         }
         Ok(())
     }
@@ -463,6 +501,12 @@ impl Interp {
             ExprKind::Array(items) => {
                 let mut a = ZArray::new();
                 for (k, v) in items {
+                    if let ExprKind::Spread(inner) = &v.kind {
+                        let sv = self.eval(inner)?;
+                        let Value::Array(src) = sv else { return rt(format!("`...` w literale tablicy wymaga tablicy, jest {}", sv.type_name())) };
+                        for (sk, x) in src.entries.iter() { match sk { Key::Int(_) => a.push(x.clone()), Key::Str(_) => a.set(sk.clone(), x.clone()) } }
+                        continue;
+                    }
                     match k {
                         Some(k) => { let kv = self.eval(k)?; let vv = self.eval(v)?; a.set(to_key(&kv).map_err(Flow::Err)?, vv); }
                         None => { let vv = self.eval(v)?; a.push(vv); }
@@ -470,6 +514,7 @@ impl Interp {
                 }
                 Value::Array(Rc::new(a))
             }
+            ExprKind::Spread(_) => return rt("`...` jest dozwolone tylko w literale tablicy albo w wywołaniu"),
             ExprKind::Index(b, i) => {
                 let base = self.eval(b)?;
                 let Some(i) = i else { return rt("`[]` bez indeksu jest dozwolone tylko przy zapisie") };
@@ -744,7 +789,7 @@ impl Interp {
             .or_else(|| self.funcs.get(n).cloned());
         if let Some(f) = f { if &**n == "main" { self.main_called = true; } return self.call_closure(&f, args); }
         if let Some(r) = self.call_builtin(n, &args) { return r; }
-        if self.externs.contains(n) { return rt(format!("funkcja extern `{}`: linkowanie extern jest dostępne tylko w zsc (stage0 interpreter go nie obsługuje)", n)); }
+        if let Some(item) = self.externs.get(n).cloned() { return crate::ffi::call_extern(&item, &args); }
         // zmienna o nazwie funkcji? nie — PHP-podobnie wymaga $f()
         rt(format!("niezdefiniowana funkcja `{}`", n))
     }
@@ -798,7 +843,7 @@ impl Interp {
                      class: Option<Name>, module: Option<Name>, args: CallArgs) -> R<Value> {
         if self.frames.len() > 2500 { return rt("przepełnienie stosu wywołań"); }
         let mut vars = captured.cloned().unwrap_or_default();
-        if let Some(t) = &this { vars.insert(rc("this"), t.clone()); }
+        if let Some(t) = &this { vars.insert(self.this_name.clone(), t.clone()); }
         self.frames.push(Frame { vars, this, class, module });
         let saved_line = self.line;
         let r = self.bind_and_run(decl, args);
@@ -808,8 +853,8 @@ impl Interp {
     }
 
     fn bind_and_run(&mut self, decl: &Rc<FuncDecl>, args: CallArgs) -> R<Value> {
-        let fname = decl.name.as_deref().unwrap_or("{closure}").to_string();
-        let mut positional: Vec<Value> = vec![];
+        let fname: &str = decl.name.as_deref().unwrap_or("{closure}");
+        let mut positional: Vec<Value> = Vec::with_capacity(args.len());
         let mut named: HashMap<Name, Value> = HashMap::new();
         for (n, v) in args { match n { Some(n) => { named.insert(n, v); } None => positional.push(v) } }
         let mut pos = positional.into_iter();
@@ -823,17 +868,39 @@ impl Interp {
                 else if let Some(v) = named.remove(&p.name) { v }
                 else if let Some(d) = &p.default { self.eval(d)? }
                 else { return rt(format!("{}: brak argumentu ${}", fname, p.name)); };
-            let v = self.check_type(&p.types, v, &format!("argument ${} funkcji {}", p.name, fname))?;
+            let v = if p.types.is_empty() { v } else { self.check_type(&p.types, v, &format!("argument ${} funkcji {}", p.name, fname))? };
             self.set_var(&p.name, v);
         }
         if let Some((n, _)) = named.iter().next() { return rt(format!("{}: nieznany argument nazwany `{}`", fname, n)); }
-        let ret = match self.exec_block(&decl.body) {
-            Ok(()) => Value::Null,
-            Err(Flow::Return(v)) => v,
-            Err(e) => return Err(e),
+        let prog = if self.vm_on { self.vm_prog(decl) } else { None };
+        let ret = if let Some(p) = prog { crate::vm::run(self, &p)? } else {
+            match self.exec_block(&decl.body) {
+                Ok(()) => Value::Null,
+                Err(Flow::Return(v)) => v,
+                Err(e) => return Err(e),
+            }
         };
         if decl.ret.is_empty() || decl.ret.iter().any(|t| &**t == "void") { return Ok(ret); }
         self.check_type(&decl.ret, ret, &format!("wartość zwracana funkcji {}", fname))
+    }
+
+    fn vm_prog(&mut self, decl: &Rc<FuncDecl>) -> Option<Rc<crate::vm::Prog>> {
+        let key = Rc::as_ptr(decl) as usize;
+        if let Some(p) = self.vm_cache.get(&key) { return p.clone(); }
+        let p = crate::vm::compile(decl).map(Rc::new);
+        if std::env::var("ZS_VM_STATS").is_ok() { eprintln!("[vm] {} -> {}", decl.name.as_deref().unwrap_or("{closure}"), if p.is_some() { "bajtkod" } else { "interpreter" }); }
+        self.vm_cache.insert(key, p.clone());
+        p
+    }
+
+    pub(crate) fn resolve_name_pub(&mut self, n: &Name) -> R<Value> { self.resolve_name(n) }
+
+    pub(crate) fn call_dot(&mut self, b: Value, m: &Name, a: CallArgs) -> R<Value> {
+        match b {
+            Value::Class(c) => self.call_static(&c, m, a),
+            Value::Module(md) => self.call_module(&md, m, a),
+            _ => rt("wywołanie przez `.` wymaga modułu lub klasy (dla obiektów użyj `->`)"),
+        }
     }
 
     fn check_type(&self, types: &[Name], v: Value, what: &str) -> R<Value> {
@@ -860,10 +927,10 @@ impl Interp {
     }
 }
 
-pub enum Seg { Idx(Value), Push, Prop(Name) }
+pub(crate) enum Seg { Idx(Value), Push, Prop(Name) }
 pub enum Root { Var(Name), Static(Name, Name) }
 
-fn walk(cur: &mut Value, segs: &[Seg], f: &mut dyn FnMut(&mut Value) -> R<()>) -> R<()> {
+pub(crate) fn walk(cur: &mut Value, segs: &[Seg], f: &mut dyn FnMut(&mut Value) -> R<()>) -> R<()> {
     let Some((first, rest)) = segs.split_first() else { return f(cur) };
     match first {
         Seg::Idx(_) | Seg::Push if matches!(cur, Value::Null | Value::Array(_)) => {
