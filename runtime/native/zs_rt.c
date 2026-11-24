@@ -25,6 +25,195 @@ V zs_cur_exc;
 int64_t zs_line = 0;
 static int g_argc; static char **g_argv;
 
+/* ───────── ZAMM (M4): Z# Adaptive Memory Management — areny łańcuchowe, BEZ odśmiecacza ─────────
+ * Model (docs/MEMORY.md): każde wywołanie funkcji dostaje własną *arenę ramki* (łańcuch chunków 4…64 KiB, alokacja = przesunięcie wskaźnika).
+ * Wyjście z ramki (`zs_leave`) zwalnia całą arenę jednym ruchem — bez skanowania sterty, bez pauz, bez zliczania referencji.
+ *   • Poziom (level) wartości = głębokość ramki, która ją zaalokowała (tabela stron `zm_pgl`; duże obiekty: nagłówek). Poziom 0 = trwała (persistent).
+ *   • Inwariant: wartość nigdy nie wskazuje na wartość o *wyższym* poziomie (młodszą). Gdy wartość miałaby uciec do starszej areny —
+ *     `return` (do areny wywołującego), zapis do starszego kontenera (bariera `zm_bar`), pole statyczne, wyjątek (do ramki z `catch`) —
+ *     jest *promowana*: kopiowana głęboko do areny docelowej (`zm_prom`, kolejka zamiast rekurencji). Obiekty mają tożsamość → po promocji
+ *     stary egzemplarz dostaje wskaźnik przekierowujący `fwd` (wszystkie dostępy idą przez `obj_canon`).
+ *   • Duże obiekty (> 16 KiB) to Large Object Space (malloc + lista przy arenie, zwalniane z areną); duże napisy są promowane bez kopiowania.
+ * Strojenie/diagnostyka: ZS_MEM_STATS=1 (raport na stderr przy wyjściu). Runtime jest jednowątkowy. */
+#include <sys/mman.h>
+#define ZM_PAGE 4096u
+#define ZM_MAXRUN 16u
+#define ZM_LARGE ((size_t)(16 * 1024))
+typedef struct ZmChunk { struct ZmChunk *next; uint32_t pages, pad; } ZmChunk;
+typedef struct ZmLarge { struct ZmLarge *prev, *next; uint32_t level, pad; size_t size; } ZmLarge;
+typedef struct { char *cur, *end; ZmChunk *chunks; ZmLarge *large; uint32_t next_pages; size_t used; } ZmArena;
+static char *zm_base, *zm_lim; static uint32_t *zm_pgl; static size_t zm_npages, zm_top;
+static ZmChunk *zm_freel[ZM_MAXRUN + 1]; static size_t zm_free_pages;
+static ZmArena *zm_ar; static uint32_t zm_cap;
+uint32_t zs_depth; static uint32_t zm_tgt;
+static int zm_inited, zm_stats_on;
+static uint64_t zm_n_alloc, zm_b_alloc, zm_b_prom, zm_n_prom, zm_b_rel, zm_n_frames, zm_live, zm_peak, zm_n_unwind;
+static void zm_oom(void) { fputs("zs: brak pamięci\n", stderr); exit(1); }
+static void zm_init(void) {
+    if (zm_inited) return; zm_inited = 1;
+    static const size_t sz[] = {(size_t)64 << 30, (size_t)16 << 30, (size_t)4 << 30, (size_t)1 << 30, (size_t)256 << 20};
+    for (size_t i = 0; i < sizeof sz / sizeof *sz && !zm_base; i++) {
+        void *p = mmap(NULL, sz[i], PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (p != MAP_FAILED) { zm_base = p; zm_lim = zm_base + sz[i]; zm_npages = sz[i] / ZM_PAGE; }
+    }
+    if (!zm_base) zm_oom();
+    void *t = mmap(NULL, zm_npages * sizeof(uint32_t), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (t == MAP_FAILED) zm_oom();
+    zm_pgl = t; zm_cap = 256; zm_ar = calloc(zm_cap, sizeof *zm_ar); if (!zm_ar) zm_oom();
+    const char *e = getenv("ZS_MEM_STATS"); if (e && e[0] == '1') zm_stats_on = 1;
+}
+static inline int zm_in(const void *p) { return (const char *)p >= zm_base && (const char *)p < zm_lim; }
+static inline uint32_t zm_level(const void *p) { return zm_in(p) ? zm_pgl[(size_t)((const char *)p - zm_base) / ZM_PAGE] : ((const ZmLarge *)p)[-1].level; }
+static ZmChunk *zm_take(uint32_t n, uint32_t level) {
+    ZmChunk *c = NULL;
+    if (zm_freel[n]) { c = zm_freel[n]; zm_freel[n] = c->next; zm_free_pages -= n; }
+    else for (uint32_t m = n + 1; m <= ZM_MAXRUN; m++) if (zm_freel[m]) {
+        c = zm_freel[m]; zm_freel[m] = c->next; ZmChunk *rest = (ZmChunk *)((char *)c + (size_t)n * ZM_PAGE);
+        rest->pages = m - n; rest->next = zm_freel[m - n]; zm_freel[m - n] = rest; zm_free_pages -= n; break;
+    }
+    if (!c) { if (zm_top + n > zm_npages) zm_oom(); c = (ZmChunk *)(zm_base + zm_top * ZM_PAGE); zm_top += n; }
+    c->pages = n; c->next = NULL;
+    size_t pg = (size_t)((char *)c - zm_base) / ZM_PAGE; for (uint32_t i = 0; i < n; i++) zm_pgl[pg + i] = level;
+    return c;
+}
+static void zm_put(ZmChunk *c) {
+    uint32_t n = c->pages; zm_free_pages += n;
+    if (zm_free_pages > 32768) madvise(c, (size_t)n * ZM_PAGE, MADV_DONTNEED);   /* zapas wolnych stron > 128 MiB wraca do systemu */
+    c->pages = n; c->next = zm_freel[n]; zm_freel[n] = c;
+}
+static void *zm_slow(ZmArena *A, uint32_t level, size_t n) {
+    if (n > ZM_LARGE) {
+        ZmLarge *L = malloc(sizeof *L + n); if (!L) zm_oom();
+        L->level = level; L->size = n; L->prev = NULL; L->next = A->large; if (A->large) A->large->prev = L; A->large = L;
+        return L + 1;
+    }
+    uint32_t pages = A->next_pages ? A->next_pages : 1;
+    while ((size_t)pages * ZM_PAGE - sizeof(ZmChunk) < n) pages <<= 1;
+    ZmChunk *c = zm_take(pages, level); c->next = A->chunks; A->chunks = c;
+    A->next_pages = pages < ZM_MAXRUN ? pages << 1 : ZM_MAXRUN;
+    A->cur = (char *)c + sizeof *c; A->end = (char *)c + (size_t)pages * ZM_PAGE;
+    void *p = A->cur; A->cur += n; return p;
+}
+static inline void *zm_alloc_at(uint32_t level, size_t n, int zero) {
+    if (!zm_inited) zm_init();
+    n = (n + 15) & ~(size_t)15; if (!n) n = 16;
+    ZmArena *A = &zm_ar[level]; void *p;
+    zm_n_alloc++; zm_b_alloc += n; A->used += n; zm_live += n; if (zm_live > zm_peak) zm_peak = zm_live;
+    if (n <= ZM_LARGE && (uintptr_t)A->cur + n <= (uintptr_t)A->end) { p = A->cur; A->cur += n; } else p = zm_slow(A, level, n);
+    if (zero) memset(p, 0, n);
+    return p;
+}
+static inline void *zm_alloc(size_t n, int atomic) { return zm_alloc_at(zm_tgt, n, !atomic); }
+static void zm_free(void *p) {                      /* jawne zwolnienie dużego bufora (małe żyją do końca areny) */
+    if (!p || zm_in(p)) return;
+    ZmLarge *L = (ZmLarge *)p - 1; ZmArena *A = &zm_ar[L->level];
+    if (L->prev) L->prev->next = L->next; else A->large = L->next;
+    if (L->next) L->next->prev = L->prev;
+    A->used -= L->size; zm_live -= L->size; free(L);
+}
+static void *zm_grow(uint32_t level, void *old, size_t oldn, size_t newn) {
+    void *p = zm_alloc_at(level, newn, 0); if (old) { memcpy(p, old, oldn < newn ? oldn : newn); zm_free(old); } return p;
+}
+static void zm_release(ZmArena *A) {
+    for (ZmChunk *c = A->chunks, *n; c; c = n) { n = c->next; zm_put(c); }
+    for (ZmLarge *L = A->large, *n; L; L = n) { n = L->next; free(L); }
+    zm_live -= A->used; zm_b_rel += A->used;
+    A->chunks = NULL; A->large = NULL; A->cur = A->end = NULL; A->next_pages = 0; A->used = 0;
+}
+/* ── promocja (głęboka kopia do areny `L`) ── */
+typedef struct ZObj { ZStr *cls; ZArr *f; struct ZObj *fwd; } ZObj;
+typedef struct ZFn { V id; V cap; } ZFn;
+static inline ZObj *obj_canon(void *p) { ZObj *x = p; while (x->fwd) x = x->fwd; return x; }
+struct ZArr { int64_t rc, n, cap, next; V *keys; V *vals; int32_t *idx; int64_t icap; };
+static V **zm_wl; static size_t zm_wn, zm_wcap;
+static void zm_wpush(V *s) {
+    if (s->tag < ZS_STR) return;
+    if (zm_wn == zm_wcap) { zm_wcap = zm_wcap ? zm_wcap * 2 : 1024; zm_wl = realloc(zm_wl, zm_wcap * sizeof *zm_wl); if (!zm_wl) zm_oom(); }
+    zm_wl[zm_wn++] = s;
+}
+static ZStr *zm_str_to(ZStr *s, uint32_t L) {
+    uint32_t lv = zm_level(s); if (lv <= L) return s;
+    if (!zm_in(s)) {                                  /* duży napis: zmiana właściciela zamiast kopiowania */
+        ZmLarge *h = (ZmLarge *)s - 1; ZmArena *A = &zm_ar[lv], *B = &zm_ar[L];
+        if (h->prev) h->prev->next = h->next; else A->large = h->next;
+        if (h->next) h->next->prev = h->prev;
+        A->used -= h->size; zm_live -= h->size; B->used += h->size; zm_live += h->size;
+        h->level = L; h->prev = NULL; h->next = B->large; if (B->large) B->large->prev = h; B->large = h; return s;
+    }
+    size_t n = sizeof(ZStr) + (size_t)s->len + 1; ZStr *d = zm_alloc_at(L, n, 0); memcpy(d, s, n); zm_b_prom += n; zm_n_prom++; return d;
+}
+static ZArr *zm_arr_to(ZArr *o, uint32_t L) {
+    ZArr *a = zm_alloc_at(L, sizeof *a, 1); a->rc = 1; a->n = o->n; a->next = o->next; a->cap = o->n < 4 ? 4 : o->n;
+    a->keys = zm_alloc_at(L, sizeof(V) * (size_t)a->cap, 0); a->vals = zm_alloc_at(L, sizeof(V) * (size_t)a->cap, 0);
+    memcpy(a->keys, o->keys, sizeof(V) * (size_t)o->n); memcpy(a->vals, o->vals, sizeof(V) * (size_t)o->n);
+    zm_b_prom += sizeof *a + 2 * sizeof(V) * (size_t)o->n; zm_n_prom++;
+    for (int64_t i = 0; i < a->n; i++) { zm_wpush(&a->keys[i]); zm_wpush(&a->vals[i]); }
+    return a;
+}
+static void zm_prom_one(V *s, uint32_t L) {
+    switch (s->tag) {
+        case ZS_STR: s->u.s = zm_str_to(s->u.s, L); break;
+        case ZS_ARRAY: if (zm_level(s->u.a) > L) s->u.a = zm_arr_to(s->u.a, L); break;
+        case ZS_OBJ: {
+            ZObj *x = obj_canon(s->u.p);
+            if (zm_level(x) > L) {
+                ZObj *n = zm_alloc_at(L, sizeof *n, 1); x->fwd = n; n->fwd = NULL;
+                n->cls = zm_str_to(x->cls, L); n->f = zm_arr_to(x->f, L); zm_n_prom++; x = n;
+            }
+            s->u.p = x; break;
+        }
+        case ZS_EXC: if (zm_level(s->u.x) > L) { ZExc *n = zm_alloc_at(L, sizeof *n, 1); *n = *s->u.x; s->u.x = n; zm_wpush(&n->msg); zm_n_prom++; } break;
+        case ZS_FN: if (zm_level(s->u.p) > L) { ZFn *n = zm_alloc_at(L, sizeof *n, 1); *n = *(ZFn *)s->u.p; s->u.p = n; zm_wpush(&n->id); zm_wpush(&n->cap); zm_n_prom++; } break;
+        default: break;
+    }
+}
+static V zm_prom(V v, uint32_t L) {
+    size_t base = zm_wn; V r = v; zm_prom_one(&r, L);
+    while (zm_wn > base) { V *s = zm_wl[--zm_wn]; zm_prom_one(s, L); }
+    return r;
+}
+/* bariera zapisu: wartość zapisywana do kontenera `owner` nie może być młodsza od niego */
+static inline V zm_bar(V v, const void *owner) {
+    if (v.tag < ZS_STR) return v;
+    if (v.tag == ZS_OBJ) v.u.p = obj_canon(v.u.p);
+    uint32_t lo = zm_level(owner);
+    if (zm_level(v.u.p) > lo) v = zm_prom(v, lo);
+    return v;
+}
+/* ── ramki ── */
+static void zm_unwind(uint32_t to) { while (zs_depth > to) { zm_release(&zm_ar[zs_depth]); zs_depth--; zm_n_unwind++; } zm_tgt = zs_depth; }
+/* regiony iteracji pętli: promocja zmiennej przenoszonej między iteracjami do poziomu `lvl` + zwolnienie aren głębszych niż `lvl` */
+V zs_carry_slow(V v, uint32_t lvl) {
+    if (v.tag == ZS_OBJ) v.u.p = obj_canon(v.u.p);
+    return zm_level(v.u.p) > lvl ? zm_prom(v, lvl) : v;
+}
+V zs_carry_v(V v, uint32_t lvl) { return zs_carry(v, lvl); }   /* wersja dla LLVM (wszystkie tagi) */
+void zs_pop(uint32_t lvl) { if (zs_depth > lvl) zm_unwind(lvl); }
+uint32_t zs_cur_depth(void) { return zs_depth; }
+uint32_t zs_enter(void) {
+    if (!zm_inited) zm_init();
+    if (zs_depth + 2 >= zm_cap) { uint32_t nc = zm_cap * 2; zm_ar = realloc(zm_ar, nc * sizeof *zm_ar); if (!zm_ar) zm_oom(); memset(zm_ar + zm_cap, 0, (nc - zm_cap) * sizeof *zm_ar); zm_cap = nc; }
+    zs_depth++; zm_tgt = zs_depth; zm_n_frames++; return zs_depth;
+}
+V zs_leave(uint32_t fl, V r) {                      /* wyjście z ramki `fl`: zwalnia także otwarte regiony pętli (return w pętli) */
+    if (r.tag >= ZS_STR) {
+        if (r.tag == ZS_OBJ) r.u.p = obj_canon(r.u.p);
+        if (zm_level(r.u.p) >= fl) r = zm_prom(r, fl - 1);
+    }
+    zm_unwind(fl - 1); return r;
+}
+void zs_try_push(ZsHandler *h) { h->prev = zs_h; h->depth = zs_depth; zs_h = h; }
+static void zm_report(void) {
+    if (!zm_stats_on) return;
+    fprintf(stderr, "[zs-zamm] alokacje=%llu (%llu B) ramki=%llu zwolnione=%llu B promocje=%llu (%llu B) odwinięte=%llu żywe=%llu B szczyt=%llu B strony=%zu\n",
+            (unsigned long long)zm_n_alloc, (unsigned long long)zm_b_alloc, (unsigned long long)zm_n_frames, (unsigned long long)zm_b_rel,
+            (unsigned long long)zm_n_prom, (unsigned long long)zm_b_prom, (unsigned long long)zm_n_unwind, (unsigned long long)zm_live, (unsigned long long)zm_peak, zm_top);
+}
+#define gc_alloc(n, a) zm_alloc((n), (a))
+#define gc_alloc_scan(n) zm_alloc((n), 0)
+#define gc_free(p) zm_free(p)
+
+
 /* ───────── pamięć ───────── */
 static void *xmalloc(size_t n) { void *p = malloc(n ? n : 1); if (!p) { fputs("zs: brak pamięci\n", stderr); exit(1); } return p; }
 static void *xrealloc(void *q, size_t n) { void *p = realloc(q, n ? n : 1); if (!p) { fputs("zs: brak pamięci\n", stderr); exit(1); } return p; }
@@ -34,16 +223,14 @@ V zv_null(void) { V v; v.tag = ZS_NULL; v.u.i = 0; return v; }
 V zv_bool(int b) { V v; v.tag = ZS_BOOL; v.u.i = b ? 1 : 0; return v; }
 V zv_int(int64_t i) { V v; v.tag = ZS_INT; v.u.i = i; return v; }
 V zv_float(double f) { V v; v.tag = ZS_FLOAT; v.u.f = f; return v; }
-static ZStr *mkstr(int64_t n) { ZStr *s = xmalloc(sizeof(ZStr) + (size_t)n + 1); s->len = n; s->d[n] = 0; return s; }
+static ZStr *mkstr(int64_t n) { ZStr *s = gc_alloc(sizeof(ZStr) + (size_t)n + 1, 1); s->len = n; s->d[n] = 0; return s; }
 V zv_strn(const char *p, int64_t n) { ZStr *s = mkstr(n); if (n) memcpy(s->d, p, (size_t)n); V v; v.tag = ZS_STR; v.u.s = s; return v; }
 V zv_str(const char *p) { return zv_strn(p, (int64_t)strlen(p)); }
 int64_t zv_i(V v) { return v.u.i; }
 
-typedef struct ZObj { ZStr *cls; ZArr *f; } ZObj;
-typedef struct ZFn { V id; V cap; } ZFn;
 const char *zv_tn(V v) {
     if (v.tag == ZS_FN) return "function";
-    if (v.tag == ZS_OBJ) return ((ZObj *)v.u.p)->cls->d;
+    if (v.tag == ZS_OBJ) return obj_canon(v.u.p)->cls->d;
     switch (v.tag) {
         case ZS_NULL: return "null"; case ZS_BOOL: return "bool"; case ZS_INT: return "int"; case ZS_FLOAT: return "float";
         case ZS_STR: return "string"; case ZS_ARRAY: return "array"; default: return "object";
@@ -97,8 +284,6 @@ static void dump_str(Buf *b, ZStr *s) {
     bputs(b, "\"");
 }
 
-struct ZArr { int64_t rc, n, cap, next; V *keys; V *vals; int32_t *idx; int64_t icap; };
-
 static void text_into(Buf *b, V v, int dumpmode);
 static void dump_into(Buf *b, V v) { text_into(b, v, 1); }
 
@@ -120,7 +305,7 @@ static void text_into(Buf *b, V v, int dumpmode) {
             }
             bputs(b, "]"); break;
         }
-        case ZS_OBJ: bputs(b, "<object "); bputs(b, ((ZObj *)v.u.p)->cls->d); bputs(b, ">"); break;
+        case ZS_OBJ: bputs(b, "<object "); bputs(b, obj_canon(v.u.p)->cls->d); bputs(b, ">"); break;
         case ZS_FN: bputs(b, "<function>"); break;
         default: bputs(b, v.tag == ZS_EXC ? (v.u.x->kind ? "<object Error>" : "<object Exception>") : "<object>"); break;
     }
@@ -158,7 +343,7 @@ static V utf8_lossy(const char *p, int64_t n) {
 }
 
 /* ───────── wyjątki ───────── */
-V zv_exc_new(int kind, V msg) { ZExc *x = xmalloc(sizeof *x); x->kind = kind; x->msg = msg; x->line = 0; V v; v.tag = ZS_EXC; v.u.x = x; return v; }
+V zv_exc_new(int kind, V msg) { ZExc *x = gc_alloc_scan(sizeof *x); x->kind = kind; x->msg = msg; x->line = 0; V v; v.tag = ZS_EXC; v.u.x = x; return v; }
 static V obj_field(V o, const char *name);           /* null gdy brak */
 static void obj_set_field(V o, const char *name, V v);
 void zs_reraise(V exc) {
@@ -173,7 +358,7 @@ void zs_reraise(V exc) {
         fprintf(stderr, "Nieobsłużony wyjątek %s: %s (linia %lld)\n", exc.u.x->kind ? "Error" : "Exception", m.u.s->d, (long long)exc.u.x->line);
         exit(1);
     }
-    zs_cur_exc = exc; longjmp(zs_h->jb, 1);
+    { ZsHandler *h = zs_h; V e = exc; if (e.tag >= ZS_STR) e = zm_prom(e, h->depth); zs_cur_exc = e; zm_unwind(h->depth); longjmp(h->jb, 1); }
 }
 void zs_raise(V exc) {
     if (exc.tag == ZS_OBJ) { V ln = obj_field(exc, "line"); if (ln.tag != ZS_INT || ln.u.i == 0) obj_set_field(exc, "line", zv_int(zs_line)); zs_reraise(exc); }
@@ -197,13 +382,13 @@ static int key_eq(V a, V b) {
     return a.u.s->len == b.u.s->len && memcmp(a.u.s->d, b.u.s->d, (size_t)a.u.s->len) == 0;
 }
 static ZArr *arr_alloc(int64_t cap) {
-    ZArr *a = xmalloc(sizeof *a); a->rc = 1; a->n = 0; a->next = 0; a->cap = cap < 4 ? 4 : cap;
-    a->keys = xmalloc(sizeof(V) * (size_t)a->cap); a->vals = xmalloc(sizeof(V) * (size_t)a->cap);
+    ZArr *a = gc_alloc_scan(sizeof *a); a->rc = 1; a->n = 0; a->next = 0; a->cap = cap < 4 ? 4 : cap;
+    a->keys = gc_alloc_scan(sizeof(V) * (size_t)a->cap); a->vals = gc_alloc_scan(sizeof(V) * (size_t)a->cap);
     a->idx = NULL; a->icap = 0; return a;
 }
 static void arr_reindex(ZArr *a) {
     int64_t want = 16; while (want < a->cap * 2) want <<= 1;
-    free(a->idx); a->icap = want; a->idx = xmalloc(sizeof(int32_t) * (size_t)want); memset(a->idx, 0, sizeof(int32_t) * (size_t)want);
+    zm_free(a->idx); a->icap = want; a->idx = zm_alloc_at(zm_level(a), sizeof(int32_t) * (size_t)want, 0); memset(a->idx, 0, sizeof(int32_t) * (size_t)want);
     for (int64_t i = 0; i < a->n; i++) { uint64_t h = hash_key(a->keys[i]) & (uint64_t)(want - 1); while (a->idx[h]) h = (h + 1) & (uint64_t)(want - 1); a->idx[h] = (int32_t)(i + 1); }
 }
 static int64_t arr_find(ZArr *a, V k) {
@@ -214,9 +399,10 @@ static int64_t arr_find(ZArr *a, V k) {
     return -1;
 }
 static void arr_put(ZArr *a, V k, V v) {
+    v = zm_bar(v, a); k = zm_bar(k, a);
     int64_t i = arr_find(a, k);
     if (i >= 0) { a->vals[i] = v; return; }
-    if (a->n == a->cap) { a->cap *= 2; a->keys = xrealloc(a->keys, sizeof(V) * (size_t)a->cap); a->vals = xrealloc(a->vals, sizeof(V) * (size_t)a->cap); if (a->idx) arr_reindex(a); }
+    if (a->n == a->cap) { { int64_t oc = a->cap; a->cap *= 2; uint32_t lv = zm_level(a); a->keys = zm_grow(lv, a->keys, sizeof(V) * (size_t)oc, sizeof(V) * (size_t)a->cap); a->vals = zm_grow(lv, a->vals, sizeof(V) * (size_t)oc, sizeof(V) * (size_t)a->cap); } if (a->idx) arr_reindex(a); }
     a->keys[a->n] = k; a->vals[a->n] = v; a->n++;
     if (k.tag == ZS_INT && k.u.i >= a->next) a->next = k.u.i + 1;
     if (a->idx) {
@@ -280,7 +466,7 @@ static V index_impl(V a, V k, int quiet) {
         int64_t n = c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4; if (i + n > len) n = len - i;
         return zv_strn(a.u.s->d + i, n);
     }
-    if (a.tag == ZS_NULL) zs_die("indeksowanie wartości null");
+    if (a.tag == ZS_NULL) { if (quiet) return zv_null(); zs_die("indeksowanie wartości null"); }
     zs_die("typ %s nie obsługuje indeksowania", zv_tn(a));
 }
 V zv_index(V a, V k) { return index_impl(a, k, 0); }
@@ -300,6 +486,7 @@ int zv_ident(V a, V b) {
             if (a.u.a == b.u.a) return 1; if (a.u.a->n != b.u.a->n) return 0;
             for (int64_t i = 0; i < a.u.a->n; i++) if (!key_eq(a.u.a->keys[i], b.u.a->keys[i]) || !zv_ident(a.u.a->vals[i], b.u.a->vals[i])) return 0;
             return 1;
+        case ZS_OBJ: return obj_canon(a.u.p) == obj_canon(b.u.p);
         default: return a.u.p == b.u.p;
     }
 }
@@ -388,57 +575,57 @@ V zv_chk(V v, const char *type, const char *what) {
 
 /* ───────── obiekty (klasy sprowadzone do funkcji przez lib/classes.zsharp) ───────── */
 static V obj_field(V o, const char *name) {
-    ZObj *x = (ZObj *)o.u.p; int64_t i = arr_find(x->f, zv_str(name));
+    ZObj *x = obj_canon(o.u.p); int64_t i = arr_find(x->f, zv_str(name));
     return i < 0 ? zv_null() : x->f->vals[i];
 }
-static void obj_set_field(V o, const char *name, V v) { arr_put(((ZObj *)o.u.p)->f, zv_str(name), v); }
+static void obj_set_field(V o, const char *name, V v) { arr_put(obj_canon(o.u.p)->f, zv_str(name), v); }
 V b_zs_obj_new(V cls) {
-    ZObj *o = xmalloc(sizeof(ZObj)); o->cls = cls.u.s; o->f = arr_alloc(4);
+    ZObj *o = gc_alloc_scan(sizeof(ZObj)); o->cls = cls.u.s; o->f = arr_alloc(4);
     V v; v.tag = ZS_OBJ; v.u.p = o; return v;
 }
-V b_zs_obj_class(V o) { return o.tag == ZS_OBJ ? zv_str(((ZObj *)o.u.p)->cls->d) : zv_null(); }
+V b_zs_obj_class(V o) { return o.tag == ZS_OBJ ? zv_str(obj_canon(o.u.p)->cls->d) : zv_null(); }
 V b_zs_obj_get(V o, V name) {
     if (o.tag != ZS_OBJ) {
         if (o.tag == ZS_NULL) zs_die("dostęp do właściwości `%s` wartości null", name.u.s->d);
         zs_die("dostęp do właściwości `%s` typu %s", name.u.s->d, zv_tn(o));
     }
-    ZObj *x = (ZObj *)o.u.p; int64_t i = arr_find(x->f, name);
+    ZObj *x = obj_canon(o.u.p); int64_t i = arr_find(x->f, name);
     if (i < 0) zs_die("obiekt klasy %s nie ma właściwości %s", x->cls->d, name.u.s->d);
     return zv_dup(x->f->vals[i]);
 }
 V b_zs_obj_take(V o, V name) {   /* wyjmuje wartość pola (pole := null), aby zapis w miejscu nie kopiował tablicy */
-    V v = b_zs_obj_get(o, name); ZObj *x = (ZObj *)o.u.p; int64_t i = arr_find(x->f, name);
+    V v = b_zs_obj_get(o, name); ZObj *x = obj_canon(o.u.p); int64_t i = arr_find(x->f, name);
     if (v.tag == ZS_ARRAY) v.u.a->rc--;
     x->f->vals[i] = zv_null(); return v;
 }
 V b_zs_obj_set(V o, V name, V v) {
     if (o.tag != ZS_OBJ) zs_die("zapis właściwości `%s` na wartości typu %s", name.u.s->d, zv_tn(o));
-    arr_put(((ZObj *)o.u.p)->f, name, zv_dup(v)); return v;
+    arr_put(obj_canon(o.u.p)->f, name, zv_dup(v)); return v;
 }
-V b_zs_obj_put(V o, V name, V v) { arr_put(((ZObj *)o.u.p)->f, name, v); return v; }   /* zapis bez zwiększania rc (para z take) */
+V b_zs_obj_put(V o, V name, V v) { arr_put(obj_canon(o.u.p)->f, name, v); return v; }   /* zapis bez zwiększania rc (para z take) */
 V b_zs_no_method(V o, V name) {
     if (o.tag == ZS_OBJ) zs_die("klasa %s nie ma metody %s", zv_tn(o), name.u.s->d);
     zs_die("wywołanie metody `%s` na wartości typu %s", name.u.s->d, zv_tn(o));
 }
-V b_zs_mkfn(V id, V cap) { ZFn *f = xmalloc(sizeof *f); f->id = id; f->cap = cap; V v; v.tag = ZS_FN; v.u.p = f; return v; }
+V b_zs_mkfn(V id, V cap) { ZFn *f = gc_alloc_scan(sizeof *f); f->id = id; f->cap = cap; V v; v.tag = ZS_FN; v.u.p = f; return v; }
 V b_zs_fn_id(V f) { if (f.tag == ZS_FN) return ((ZFn *)f.u.p)->id; if (f.tag == ZS_STR) return f; return zv_null(); }
 V b_zs_fn_cap(V f) { return f.tag == ZS_FN ? ((ZFn *)f.u.p)->cap : zv_null(); }
 V b_is_callable(V f) { return zv_bool(f.tag == ZS_FN); }
 static V g_statics;
 V b_zs_sget(V name) { if (g_statics.tag != ZS_ARRAY) return zv_null(); int64_t i = arr_find(g_statics.u.a, name); return i < 0 ? zv_null() : zv_dup(g_statics.u.a->vals[i]); }
-V b_zs_sset(V name, V v) { if (g_statics.tag != ZS_ARRAY) g_statics = zv_arr_new(8); arr_put(g_statics.u.a, name, zv_dup(v)); return v; }
+V b_zs_sset(V name, V v) { if (g_statics.tag != ZS_ARRAY) { uint32_t sv = zm_tgt; zm_tgt = 0; g_statics = zv_arr_new(8); zm_tgt = sv; } arr_put(g_statics.u.a, name, zv_dup(v)); return v; }
 V b_zs_no_class(V name) { zs_die("nieznana klasa %s", name.u.s->d); }
 
 /* ───────── wyjście ───────── */
-void zs_init(int argc, char **argv) { g_argc = argc; g_argv = argv; zs_cur_exc = zv_null(); }
-void zs_shutdown(void) { fflush(stdout); }
+void zs_init(int argc, char **argv) { g_argc = argc; g_argv = argv; zs_cur_exc = zv_null(); zm_init(); }
+void zs_shutdown(void) { fflush(stdout); zm_report(); }
 static void out_text(FILE *f, V v) { if (v.tag == ZS_STR) fwrite(v.u.s->d, 1, (size_t)v.u.s->len, f); else { Buf b = {0}; text_into(&b, v, 0); fwrite(b.d, 1, b.n, f); free(b.d); } }
 void zs_echo_v(V v, int first) { if (!first) fputc(' ', stdout); out_text(stdout, v); }
 void zs_echo_end(void) { fputc('\n', stdout); }
 void zs_necho_v(V v) { out_text(stdout, v); }
 void zs_eecho_v(V v, int first) { if (first) fflush(stdout); if (!first) fputc(' ', stderr); out_text(stderr, v); }
 void zs_eecho_end(void) { fputc('\n', stderr); }
-V s_exit(V code) { fflush(stdout); exit(code.tag == ZS_INT ? (int)code.u.i : 0); }
+V s_exit(V code) { fflush(stdout); zm_report(); exit(code.tag == ZS_INT ? (int)code.u.i : 0); }
 
 /* ───────── wbudowane ───────── */
 static ZStr *need_s(V v, const char *f, int n) { if (v.tag != ZS_STR) zs_die("%s: argument #%d powinien być tekstem, jest %s", f, n, zv_tn(v)); return v.u.s; }
@@ -559,9 +746,9 @@ V b_reverse(V a) {
 }
 static int cmp_v(const void *p, const void *q) { return zv_cmp(*(const V *)p, *(const V *)q); }
 V b_sort(V a) {
-    ZArr *x = need_a(a, "sort", 1); V *t = xmalloc(sizeof(V) * (size_t)(x->n ? x->n : 1)); memcpy(t, x->vals, sizeof(V) * (size_t)x->n);
+    ZArr *x = need_a(a, "sort", 1); V *t = gc_alloc_scan(sizeof(V) * (size_t)(x->n ? x->n : 1)); memcpy(t, x->vals, sizeof(V) * (size_t)x->n);
     /* sortowanie stabilne (scalanie), błędy porównania jako wyjątek `sort: ...` */
-    V *tmp = xmalloc(sizeof(V) * (size_t)(x->n ? x->n : 1));
+    V *tmp = gc_alloc_scan(sizeof(V) * (size_t)(x->n ? x->n : 1));
     for (int64_t w = 1; w < x->n; w <<= 1) {
         for (int64_t lo = 0; lo < x->n; lo += 2 * w) {
             int64_t mid = lo + w < x->n ? lo + w : x->n, hi = lo + 2 * w < x->n ? lo + 2 * w : x->n, i = lo, j = mid, k = lo;
@@ -570,7 +757,7 @@ V b_sort(V a) {
         }
         memcpy(t, tmp, sizeof(V) * (size_t)x->n);
     }
-    (void)cmp_v; V r = zv_arr_new(x->n); for (int64_t i = 0; i < x->n; i++) zv_append(r, zv_dup(t[i])); free(t); free(tmp); return r;
+    (void)cmp_v; V r = zv_arr_new(x->n); for (int64_t i = 0; i < x->n; i++) zv_append(r, zv_dup(t[i])); gc_free(t); gc_free(tmp); return r;
 }
 V b_push(V a, V v) { ZArr *x = need_a(a, "push", 1); (void)x; V r = zv_wr(zv_dup(a)); zv_append(r, v); return r; }
 V b_dump(V v) { Buf b = {0}; dump_into(&b, v); bputs(&b, "\n"); fwrite(b.d, 1, b.n, stdout); free(b.d); return zv_null(); }
@@ -709,7 +896,7 @@ V m_Directory_list(V p) {
     closedir(d); qsort(nm, n, sizeof *nm, cmp_s); V r = zv_arr_new((int64_t)n); for (size_t i = 0; i < n; i++) { zv_append(r, zv_str(nm[i])); free(nm[i]); } free(nm); return r;
 }
 static char **argv_of(V cmd, V args) {
-    ZStr *c = need_s(cmd, "Process", 1); size_t n = args.tag == ZS_ARRAY ? (size_t)args.u.a->n : 0; char **av = xmalloc(sizeof(char *) * (n + 2));
+    ZStr *c = need_s(cmd, "Process", 1); size_t n = args.tag == ZS_ARRAY ? (size_t)args.u.a->n : 0; char **av = gc_alloc_scan(sizeof(char *) * (n + 2));
     av[0] = c->d; for (size_t i = 0; i < n; i++) { V t = to_text(args.u.a->vals[i]); av[i + 1] = t.u.s->d; } av[n + 1] = NULL; return av;
 }
 V m_Process_exec(V cmd, V args) {
@@ -735,7 +922,7 @@ V m_Process_run(V cmd, V args) {
 
 /* ───────── pomocniki dla backendu LLVM ───────── */
 V zl_float_lit(const char *s) { return zv_float(strtod(s, NULL)); }
-void zl_try_enter(ZsHandler *h) { h->prev = zs_h; zs_h = h; }
+void zl_try_enter(ZsHandler *h) { zs_try_push(h); }
 void zl_try_leave(ZsHandler *h) { zs_h = h->prev; }
 V zl_cur_exc(void) { return zs_cur_exc; }
 void zl_foreach_die(V it) { zs_die("foreach wymaga tablicy, jest %s", zv_tn(it)); }
@@ -765,6 +952,16 @@ V m_System_environ(void) {
 }
 V m_System_cwd(void) { char b[4096]; if (!getcwd(b, sizeof b)) io_die("System.cwd", errno); return zv_str(b); }
 V m_System_chdir(V p) { ZStr *s = need_s(p, "System.chdir", 1); if (chdir(s->d)) io_die(s->d, errno); return zv_null(); }
+/* M4: System.gc() wymusza kolekcję; System.gcStats() -> ["collections","allocated","freed","live","heap","peak"] (bajty) */
+V m_System_gc(void) { return zv_null(); }   /* ZAMM nie ma kolekcji: pamięć wraca z końcem ramki (nic do wymuszenia) */
+V m_System_gcStats(void) {
+    V r = assoc_new();
+    assoc_set(r, "collections", zv_int(0)); assoc_set(r, "allocated", zv_int((int64_t)zm_b_alloc));
+    assoc_set(r, "freed", zv_int((int64_t)zm_b_rel)); assoc_set(r, "live", zv_int((int64_t)zm_live));
+    assoc_set(r, "heap", zv_int((int64_t)(zm_top * ZM_PAGE))); assoc_set(r, "peak", zv_int((int64_t)zm_peak));
+    assoc_set(r, "promoted", zv_int((int64_t)zm_b_prom)); assoc_set(r, "frames", zv_int((int64_t)zm_n_frames)); assoc_set(r, "depth", zv_int((int64_t)zs_depth));
+    return r;
+}
 V m_System_pid(void) { return zv_int((int64_t)getpid()); }
 V m_System_hostname(void) {
     V v = read_trim_file("/proc/sys/kernel/hostname"); if (v.tag == ZS_STR) return v;
