@@ -45,6 +45,8 @@ pub enum ExprKind {
     Match(Box<Expr>, Vec<MatchArm>),
     Await(Box<Expr>),
     InstanceOf(Box<Expr>, Name),
+    /// `...$x` w literale tablicy albo w wywołaniu
+    Spread(Box<Expr>),
 }
 
 #[derive(Debug, Clone)]
