@@ -88,6 +88,7 @@ pub fn expr(e: &Expr) -> String {
         ExprKind::Closure(d) => n("Closure", l, &[func(d)]),
         ExprKind::Match(s, arms) => n("Match", l, &[bx(s), list(arms, |a| n("Arm", 0, &[opt(&a.conds, |c| list(c, expr)), expr(&a.body)]))]),
         ExprKind::Await(x) => n("Await", l, &[bx(x)]),
+        ExprKind::Spread(x) => n("Spread", l, &[bx(x)]),
         ExprKind::InstanceOf(x, c) => n("InstanceOf", l, &[bx(x), esc(c)]),
     }
 }
