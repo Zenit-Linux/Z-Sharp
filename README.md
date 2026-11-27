@@ -1,5 +1,9 @@
 # Z-Sharp 0.0.1 (stage0 seed + rdzeń w Z#: lib + ZAMM + runtime)
 
+> **Szybki start (bez Rusta):** w katalogu z podkatalogami `Z-Sharp`, `zsc`, `zst`, `zzc`, `zsi` uruchom `sh Z-Sharp/bootstrap/bootstrap.sh`
+> (wymaga kompilatora C11 i LLVM >= 21). Szczegóły: `docs/BOOTSTRAP.md`, stan: `docs/STATUS.md`.
+
+
 Rdzeń bootstrapu Z#. Repozytoria `zsc`, `zsi`, `zst`, `zzc` dołączają to repo jako `Z-Sharp/` i importują je przez `import Workspace.<człon>;`.
 
 ```
