@@ -48,17 +48,28 @@ jobs:
         run: npx tsc --noEmit
 
       - name: Build
-        run: npx tsc --outDir dist
+        run: |
+          rm -rf dist
+          if [ -x node_modules/.bin/esbuild ]; then
+            npx esbuild src/*.ts --bundle --format=esm --outdir=dist
+          else
+            npx tsc --noEmit false --module ESNext --moduleResolution node --outDir dist
+          fi
+          ls -la dist
 
       - name: Złóż artefakt strony (układ jak w repozytorium)
         working-directory: .
         run: |
           set -euo pipefail
           rm -rf _site
-          mkdir -p _site/website
+          mkdir -p _site/website/dist
           cp index.html _site/index.html
-          cp -r website/dist _site/website/dist
-          cp -r docs _site/docs
+          if [ -d website/dist ] && [ "$(ls -A website/dist)" ]; then
+            cp -r website/dist/. _site/website/dist/
+          fi
+          if [ -d docs ]; then
+            cp -r docs _site/docs
+          fi
           touch _site/.nojekyll
 
       - uses: actions/configure-pages@v5
