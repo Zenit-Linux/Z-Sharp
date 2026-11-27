@@ -1,0 +1,14 @@
+finally 1
+finally 5
+1 caught too big: 5
+MyErr mine 7
+as Exception mine
+start
+inner-finally
+outer:inner
+done
+[0, "f0", "f1", 2, "f2", "f3"]
+Error: err
+right
+kept
+re: orig
