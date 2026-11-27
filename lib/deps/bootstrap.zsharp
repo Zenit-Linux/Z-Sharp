@@ -1,0 +1,83 @@
+#!/bin/sh
+# Bootstrap Z# BEZ Rusta: stage0 (ziarno) -> stage1 -> stage2 -> stage3 -> stage4 -> narzędzia -> test zgodności.
+#
+#   stage0 : zsc zbudowany z ziarna (SEED=c  : seed/zsc-seed.c  + kompilator C11
+#                                   SEED=ll : seed/zsc-seed.ll + LLVM >= 21 (llc) + kompilator C
+#                                   SEED=js : seed/zsc-seed.js  + Node >= 16
+#                                   SEED=php: seed/zsc-seed.php + PHP >= 8.1
+#                                   SEED=rust: starszy interpreter stage0 (cargo) — tylko zgodność wsteczna)
+#   stageN : zsc(N-1) kompiluje źródła zsc natywnie (LLVM >= 21) -> zscN
+# Kryteria: LLVM IR emitowany dla zsc przez stage1..stage4 jest identyczny, a binarki stage2 == stage3 == stage4.
+# (Gdy ziarno jest nieaktualne, IR ze stage0 może się różnić — to ostrzeżenie; odśwież: UPDATE_SEED=1.)
+#
+# Układ: katalog z podkatalogami Z-Sharp, zsc, zst, zzc, zsi (lub *-main).
+# Zmienne: OUT (domyślnie ../build), SEED, CC, ZS_LLVM_BIN, ZS_LINKER, UPDATE_SEED=1, SKIP_TESTS=1.
+set -eu
+HERE=$(cd "$(dirname "$0")" && pwd); ZS=$(dirname "$HERE"); WS=$(dirname "$ZS")
+OUT=${OUT:-$WS/build}; SEED=${SEED:-c}; CC=${CC:-cc}
+export ZS_HOME=$ZS
+pick() { for d in "$WS/$1" "$WS/$1-main"; do [ -d "$d/src" ] && { echo "$d"; return; }; done; echo "brak katalogu $1" >&2; exit 1; }
+ZSC_DIR=$(pick zsc); ZST_DIR=$(pick zst); ZZC_DIR=$(pick zzc); ZSI_DIR=$(pick zsi)
+step() { printf '\n== %s\n' "$*"; }
+die() { echo "bootstrap: $*" >&2; exit 1; }
+for d in "$ZSC_DIR" "$ZST_DIR" "$ZZC_DIR" "$ZSI_DIR"; do [ -e "$d/Z-Sharp" ] || ln -s "$ZS" "$d/Z-Sharp"; done
+mkdir -p "$OUT"
+wrapper() { printf '#!/bin/sh\nexec %s "$@"\n' "$1" > "$OUT/stage0/zsc"; chmod +x "$OUT/stage0/zsc"; }
+
+step "stage0 (ziarno: $SEED)"
+mkdir -p "$OUT/stage0"
+case "$SEED" in
+  c)   $CC -O1 -w -std=gnu11 "$HERE/seed/zsc-seed.c" -o "$OUT/stage0/zsc" -lm ;;
+  ll)  LLC=$(command -v llc-21 || command -v llc) || die "brak llc (LLVM >= 21)"
+       $LLC -O1 -filetype=obj -relocation-model=pic "$HERE/seed/zsc-seed.ll" -o "$OUT/stage0/seed.o"
+       $CC -O2 -w -std=gnu11 -I"$ZS/runtime/include" -c "$ZS/runtime/native/zs_rt.c" -o "$OUT/stage0/rt.o"
+       $CC "$OUT/stage0/seed.o" "$OUT/stage0/rt.o" -o "$OUT/stage0/zsc" -lm ;;
+  js)  command -v node >/dev/null || die "brak node"; wrapper "node \"$HERE/seed/zsc-seed.js\"" ;;
+  php) command -v php >/dev/null || die "brak php"; wrapper "php \"$HERE/seed/zsc-seed.php\"" ;;
+  rust) (cd "$ZS" && cargo build --release); wrapper "\"$ZS/target/release/zsc0\" run \"$ZSC_DIR/src/main.zsharp\"" ;;
+  *)   die "SEED musi być c|ll|js|php|rust" ;;
+esac
+
+prev="$OUT/stage0/zsc"
+for n in 1 2 3 4; do
+  step "stage$n"; mkdir -p "$OUT/stage$n"
+  "$prev" build "$ZSC_DIR/src/main.zsharp" -o "$OUT/stage$n/zsc" >/dev/null
+  "$OUT/stage$n/zsc" build "$ZSC_DIR/src/main.zsharp" --emit ll -o "$OUT/stage$n/zsc.ll" >/dev/null
+  prev="$OUT/stage$n/zsc"
+done
+
+step "punkt stały"
+for n in 2 3 4; do cmp -s "$OUT/stage1/zsc.ll" "$OUT/stage$n/zsc.ll" || die "LLVM IR stage$n różni się od stage1"; done
+echo "   LLVM IR zsc identyczny dla stage1..stage4 ($(wc -l < "$OUT/stage4/zsc.ll") linii)"
+for n in 2 3; do cmp -s "$OUT/stage$n/zsc" "$OUT/stage$((n+1))/zsc" || die "binarka stage$n != stage$((n+1))"; done
+echo "   binarki stage2 == stage3 == stage4"
+"$OUT/stage0/zsc" build "$ZSC_DIR/src/main.zsharp" --emit ll -o "$OUT/stage0/zsc.ll" >/dev/null 2>&1 || true
+if cmp -s "$OUT/stage0/zsc.ll" "$OUT/stage4/zsc.ll"; then echo "   ziarno aktualne (stage0 emituje ten sam IR)"; else echo "   OSTRZEŻENIE: ziarno nieaktualne względem źródeł (odśwież: UPDATE_SEED=1)"; fi
+
+step "narzędzia (kompilator stage4) i instalacja"
+mkdir -p "$OUT/bin" "$OUT/share/z-sharp/runtime" "$OUT/share/z-sharp/zst"
+cp "$OUT/stage4/zsc" "$OUT/bin/zsc"
+for t in zst zzc zsi; do d=$(pick $t); "$OUT/stage4/zsc" build "$d/src/main.zsharp" -o "$OUT/bin/$t" >/dev/null; echo "   $t"; done
+"$OUT/stage4/zsc" build "$ZS/wrapper/main.zsharp" -o "$OUT/bin/z#" >/dev/null; echo "   z#"
+cp -R "$ZS/runtime/native" "$ZS/runtime/include" "$OUT/share/z-sharp/runtime/"
+cp -R "$ZST_DIR/runtime" "$OUT/share/z-sharp/zst/"
+[ -d "$ZS/stdlib" ] && cp -R "$ZS/stdlib" "$OUT/share/z-sharp/"
+echo "   zainstalowano w $OUT (bin/, share/z-sharp/)"
+
+if [ "${UPDATE_SEED:-0}" = 1 ]; then
+  step "odświeżanie ziaren"
+  cp "$OUT/stage4/zsc.ll" "$HERE/seed/zsc-seed.ll"
+  for t in c js php; do ext=$t; "$OUT/bin/zst" --to $t "$ZSC_DIR/src/main.zsharp" -o "$HERE/seed/zsc-seed.$ext"; done
+  (cd "$HERE/seed" && sha256sum zsc-seed.* > SHA256SUMS); echo "   gotowe"
+fi
+
+if [ "${SKIP_TESTS:-0}" != 1 ]; then
+  step "test zgodności (wyłącznie narzędzia natywne, bez stage0)"
+  export PATH="$OUT/bin:$PATH" ZSC="$OUT/bin/zsc" ZZC="$OUT/bin/zzc" ZSI="$OUT/bin/zsi" ZST="$OUT/bin/zst"
+  for m in zsc zzc zsi zst-c zst-js zst-php; do
+    if [ "$m" = zst-js ] && ! command -v node >/dev/null; then echo "   pominięto $m (brak node)"; continue; fi
+    if [ "$m" = zst-php ] && ! command -v php >/dev/null; then echo "   pominięto $m (brak php)"; continue; fi
+    "$ZS/tests/run_conformance.sh" $m | tail -1
+  done
+fi
+echo; echo "bootstrap: OK -> $OUT/bin"
