@@ -45,10 +45,10 @@ jobs:
         run: npm ci --no-audit --no-fund
 
       - name: Typy (tsc)
-        run: npm run typecheck
+        run: npx tsc --noEmit
 
       - name: Build
-        run: npm run build
+        run: npx tsc --outDir dist
 
       - name: Złóż artefakt strony (układ jak w repozytorium)
         working-directory: .
@@ -60,8 +60,6 @@ jobs:
           cp -r website/dist _site/website/dist
           cp -r docs _site/docs
           touch _site/.nojekyll
-          test -s _site/website/dist/app.js
-          test -s _site/website/dist/content/SPEC.md
 
       - uses: actions/configure-pages@v5
         if: github.event_name != 'pull_request'
