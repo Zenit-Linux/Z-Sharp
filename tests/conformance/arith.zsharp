@@ -1,0 +1,17 @@
+# int64, float, formatowanie, przepełnienie
+echo 1 + 2, 7 / 2, 8 / 2, 7 % 3, -7 % 3, 2 ** 10, 2 ** 62, 2 ** 64;
+echo 0.1 + 0.2, 1.0, 100.0 / 3, 1e15, 1e21, 0.000001, -0.5;
+echo 9223372036854775807, -9223372036854775807 - 1;
+echo 5 & 3, 5 | 3, 5 ^ 3, ~5, 1 << 40, -16 >> 2;
+echo 3 == 3.0, 3 === 3.0, "a" == "a", null === null, [1, 2] === [1, 2], [1, 2] === [2, 1];
+echo 1 < 2, "abc" < "abd", 2.5 > 2;
+function ovf() { $x = 9223372036854775807; return $x + 1; }
+try { ovf(); } catch (Exception $e) { echo "E:", $e->getMessage(); }
+function dz() { return 1 / 0; }
+try { dz(); } catch (Exception $e) { echo "E:", $e->getMessage(); }
+try { echo 5 % 0; } catch (Exception $e) { echo "E:", $e->getMessage(); }
+echo intval("42"), intval(" 17 "), intval("3.9"), intval("x"), floatval("2.5"), intval(true), intval(3.99), intval(-3.99);
+echo Math.floor(2.7), Math.ceil(2.1), Math.round(2.5), Math.round(-2.5), Math.abs(-4), Math.sqrt(16), Math.pow(2, 8), Math.min(3, 9), Math.max(3, 9);
+$h = 2166136261; $c = 97;
+echo (($h ^ $c) * 16777619) & 4294967295;
+echo to_hex(255), to_hex(-1);
