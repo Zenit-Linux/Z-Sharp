@@ -1,0 +1,18 @@
+[1, 2, 3] [99, 2, 3, 4] 3 4
+["x" => 1, "y" => 2, 5 => "five", 7 => "seven", 8 => "next", "z" => 3] ["x", "y", 5, 7, 8, "z"] [1, 2, "five", "seven", "next", 3] true true false
+["a" => ["b" => [1, 2], "c" => [1, [2, [3, 4]]]]]
+[1, 2] ["changed", 2]
+[1 => "t", "08" => "s", 8 => "i", -3 => "neg"]
+[0 => 15, 1 => 40, 2 => 30, "new" => "dflt"] 1
+[1, 2, 3, 4, 5] [5, 4, 3, 2, 1] [3]
+[2, 3] [2, 3] [2, 3]
+[-1, 1, 2, 3, 10] ["C", "a", "b", "é"] [1, 2.5, 3]
+true false true
+[1, 2] [1, 2, 7] ["a" => 1]
+0 5
+1 6
+2 7
+[1, 2, 3, 10, 20, 30]
+E: brak klucza "missing"
+dflt deep
+E: nie można indeksować wartości typu string przy zapisie
