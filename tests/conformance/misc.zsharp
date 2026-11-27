@@ -1,0 +1,34 @@
+# różne: typeof, is_*, null, argumenty, statyczne, wielolinijkowe, rekurencja
+echo typeof(1), typeof(1.5), typeof("s"), typeof([]), typeof(null), typeof(true);
+echo is_int(1), is_int(1.0), is_float(1.0), is_string(""), is_bool(false), is_array([]), is_null(null);
+function typed(int $a, string $b = "dflt"): string { return $b . $a; }
+echo typed(5), typed(6, "x");
+try { typed("no"); } catch (Exception $e) { echo "E:", $e->getMessage(); }
+function fact($n) { return $n <= 1 ? 1 : $n * fact($n - 1); }
+echo fact(20);
+try { echo fact(21); } catch (Exception $e) { echo "E:", $e->getMessage(); }
+function fib($n) { return $n < 2 ? $n : fib($n - 1) + fib($n - 2); }
+echo fib(22);
+function depth($n) { return $n == 0 ? 0 : 1 + depth($n - 1); }
+echo depth(1000);
+echo System.args()[0] !== "", count(System.args()) >= 1;
+echo System.env("ZS_SURELY_UNSET_VAR_12345") === null, System.os(), System.dirname("/a/b/c.zs"), System.dirname("c.zs"), System.dirname("/c");
+$t = System.time(); echo is_float($t), $t > 1.0e9;
+$tmp = System.env("TMPDIR") ?? "/tmp";
+$dir = $tmp . "/zs-conf-" . System.pid();
+Directory.create($dir);
+File.write($dir . "/f.txt", "line1\nżółć\n");
+File.append($dir . "/f.txt", 42);
+echo File.read($dir . "/f.txt"), File.exists($dir . "/f.txt"), File.exists($dir . "/nope"), Directory.exists($dir), Directory.list($dir);
+$st = File.stat($dir . "/f.txt"); echo $st["kind"], $st["size"];
+File.rename($dir . "/f.txt", $dir . "/g.txt");
+echo Directory.list($dir);
+try { File.read($dir . "/missing"); } catch (Exception $e) { echo "E:", contains($e->getMessage(), "No such file"); }
+File.delete($dir . "/g.txt"); Directory.remove($dir);
+echo Directory.exists($dir);
+$r = Process.run("sh", ["-c", "echo out; echo err 1>&2; exit 3"]);
+echo $r["status"], $r["stdout"], $r["stderr"];
+echo Process.exec("sh", ["-c", "exit 4"]);
+necho("no", "newline"); echo "";
+eecho("to stderr");
+exit(0);
