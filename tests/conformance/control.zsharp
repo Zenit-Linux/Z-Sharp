@@ -1,0 +1,50 @@
+# pętle, break/continue wielopoziomowe, switch z przechodzeniem, do-while, ternary
+$out = [];
+for ($i = 0; $i < 5; $i++) {
+    if ($i == 1) { continue; }
+    if ($i == 4) { break; }
+    $out[] = $i;
+}
+echo $out;
+$pairs = [];
+for ($i = 0; $i < 3; $i++) {
+    for ($j = 0; $j < 3; $j++) {
+        if ($j == 1) { continue 2; }
+        if ($i == 2) { break 2; }
+        $pairs[] = $i . $j;
+    }
+}
+echo $pairs;
+$n = 0;
+while (true) { $n++; if ($n > 3) { break; } }
+echo $n;
+$k = 10;
+do { $k++; } while ($k < 5);
+echo $k;
+function sw($x) {
+    $r = [];
+    switch ($x) {
+        case 1: $r[] = "one";
+        case 2: $r[] = "two"; break;
+        case "3": $r[] = "three"; break;
+        default: $r[] = "dflt";
+    }
+    return $r;
+}
+echo sw(1), sw(2), sw(3), sw("3"), sw(9);
+function sw2($x) {
+    foreach ([1, 2, 3] as $v) {
+        if ($v == 2) { continue; }
+        switch ($v) {
+            default: if ($v == $x) { return "found" . $v; }
+        }
+    }
+    return "none";
+}
+echo sw2(3), sw2(2), sw2(7);
+echo 5 > 3 ? "y" : "n", 0 ?: "elvis", "" ?: "e2", null ?? "nn", 1 && 0, 1 || 0, true xor true;
+$x = 5; $y = ($x > 3) ? ($x > 4 ? "a" : "b") : "c";
+echo $y;
+$t = 0;
+foreach ([1, 2, 3, 4] as $v) { if ($v % 2 == 0) { continue; } $t += $v; }
+echo $t;
