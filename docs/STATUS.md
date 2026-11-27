@@ -1,19 +1,43 @@
-# Status Z# i mapa drogowa (stan: sesja „niezależność")
+# Status Z# (po sesji „niezależność od stage0”)
 
-Legenda: ✅ działa i jest testowane · 🟡 częściowo (podzbiór/ograniczenia) · ❌ brak
+Legenda: ✅ działa i jest testowane · 🟡 częściowo · ❌ brak. Platforma weryfikacji: Linux x86-64, LLVM 21.1.8.
 
 ## Narzędzia
 
-| Komponent | Rola | Stan | Co działa | Czego brak | Weryfikacja |
+| Komponent | Rola | Stan | Co działa | Znane ograniczenia | Weryfikacja |
 |---|---|---|---|---|---|
-| **Z-Sharp** (rdzeń) | lexer, parser, sema, IR, zbc, manifest | ✅ | parytet z ziarnem Rust, punkt stały s1=s2=s3 | SSA, ZAMM lowering | `scripts/tests/run_all.zsharp`, `scripts/fixpoint.zsharp` |
-| stage0 (Rust) | ziarno: interpreter AST + `bundle` | ✅ | run/exec/bundle, pełny język | — (celowo ziarno) | cargo test, golden |
-| runtime natywny (C) | wspólny dla C/LLVM/gcc | 🟡 | wartości, tablice (hasz+COW), napisy UTF-8, wyjątki, ~60 wbudowanych, File/Dir/Process/System | obiekty/klasy, domknięcia, konserwatywny GC | testy różnicowe |
-| **zsc** (kompilator) | AOT do natywnego | 🟡 | backend C ✅ i **LLVM** ✅ (`--backend llvm`, `--target`), standalone ✅ | moduły z kodem top-level → jawne `E01xx`; działają: **domknięcia, funkcje strzałkowe, named args, spread, pola statyczne, `Std.*`**, **klasy (pola, metody, `new`, konstruktor, `extends`, `parent.`, stałe, metody statyczne, interfejsy, `instanceof`), klasy wyjątków (`extends Exception/Error`, catch po klasie), `import` modułów (funkcje i klasy), wariadyczne `...$x`, operatory bitowe** | `zsc/tests/native/run_diff.sh` 30/30 |
-| **zsi** (interpreter) | uruchamianie | 🟡 | launcher, `-e`, `--compile` (standalone), `--emit-zbc`, `--check` | własna VM bajtkodowa, JIT | ręcznie + `scripts/fixpoint.zsharp` |
-| **zst** (transpilator) | cele php/js/c | 🟡 | js ✅ i c ✅ (podzbiór, parytet), php składniowy (niski parytet) | php semantyczny, klasy/domknięcia w js/c, py/go | `zst/tests/run_diff.sh` |
-| **zzc** (frontend gcc) | gcc przez C | 🟡 | sterownik gcc: -O/-g/-flto/-S/-c, cross przez `--gcc`, runtime | prawdziwy frontend cc1/GENERIC, klasy, moduły | ręcznie (`z# build --backend gcc`) |
-| **wrapper/ → z#** | jedno polecenie | ✅ | new/init/build/run/check/test/transpile/clean/doctor, 3 backendy | zależności ścieżkowe/rejestr, parser pełnego manifestu | `wrapper/tests/run.sh` 34/34 |
+| **zsc** | kompilator, **wyłącznie backend LLVM >= 21** | ✅ | `build/run/check/analyze/runtime/toolchain`, emisje `exe/obj/asm/bc/ll/ir/zbc`, `-O0..-Oz`, `--target`; brak ścieżki C; klasy, domknięcia, wyjątki, moduły | wbudowane spoza podzbioru natywnego → `E0103`; tylko x86-64/Linux sprawdzone | `zsc/tests/run.sh` (20 kontroli), `tests/run_conformance.sh zsc` |
+| **zst** | transpilator | ✅ | cele **js, php, c, cpp, rust** (pełny język przez linker modułów + IR), `php-src` (starszy, składniowy); `--run`, `--check`, bundle jednoplikowy | `Socket.*` tylko w c (i zsc); js: int64 przez BigInt (wolniej powyżej 2^53); rust/cpp: wolna kompilacja dużych programów | `zst/tests/run.sh`, samohosting `zsc` przez każdy cel |
+| **zzc** | frontend gcc (Z# → IR → C → gcc) | ✅ | pełny język (klasy, domknięcia, importy), cache obiektu runtime kluczowany flagami, `-O/-g/-flto/-S/-c/-fsanitize`, `run`, `--dry-run` | to sterownik gcc, nie wtyczka `cc1`; jeden plik wejściowy (reszta przez `import`) | `zzc/tests/run.sh` |
+| **zsi** | uruchamianie | ✅ | **bez stage0**: kompilacja natywna przez `zsc` + trwały cache (ciepłe uruchomienie ≈ 6 ms), `-e`, `--check`, `--compile`, `--emit-zbc`, `args[0]` jak w interpreterze | brak własnej VM; wykonanie `.zbc` tylko przez `--legacy` (stage0) | `zsi/tests/run.sh` |
+| runtime natywny (C) | wspólny dla zsc/zzc/zst c | ✅ | patrz `docs/SPEC.md` § „Zachowanie runtime natywnego” | brak zrównoleglenia | testy zgodności |
+| runtimes zst | `zs_runtime.{js,php,rs,hpp}` | ✅ | pełny zestaw wbudowanych i modułów `Math/System/File/Directory/Process` | `Socket.*` → błąd wykonania | testy zgodności |
+| stage0 (Rust) | **ziarno legacy** | 🟡 | nadal buduje się i działa | niepotrzebny do bootstrapu | `SEED=rust` |
+| **z#** (wrapper) | jedno polecenie | ✅ | buduje się natywnie kompilatorem stage4 | nie zmieniany w tej sesji | — |
+
+## Bootstrap
+
+Zobacz `docs/BOOTSTRAP.md`. Skrót: ziarno (`c|ll|js|php`) → stage1 → stage2 → stage3 → stage4, identyczny IR i binarki, narzędzia
+zbudowane natywnie, test zgodności tylko narzędziami natywnymi. **Stage0 nie jest potrzebny.**
+
+## Testy
+
+`tests/conformance/*.zs` (7 programów: arytmetyka/int64, napisy UTF-8, tablice/COW, sterowanie, klasy/domknięcia, wyjątki, system/pliki/procesy)
+z zapisanymi wynikami `.out`/`.rc`. Uruchamiane drogami: `zsc`, `zzc`, `zsi`, `zst-{js,php,c,cpp,rust}` (`tests/run_conformance.sh`).
+Uwaga: odwołania do `zsc/tests/native/run_diff.sh` w starszych dokumentach dotyczą skryptu, którego nie ma w archiwum; zastępuje go powyższy zestaw.
+
+## Różnice względem interpretera stage0 (świadome decyzje)
+
+Zachowanie natywne jest definicją odniesienia (patrz SPEC):
+`upper/lower` tylko ASCII; `replace` z pustym wzorcem zwraca tekst bez zmian; nieznana funkcja to błąd kompilacji (nie wykonania);
+`Process.run` nieistniejącego polecenia daje status 127; argumenty `echo` są obliczane przed wypisaniem; odczyt niezdefiniowanej zmiennej to błąd wykonania.
+
+## Czego nie ma / nie zweryfikowano
+
+- Platformy inne niż Linux x86-64, kompilacja skrośna, LLVM inny niż 21.1.8.
+- Python/Go jako cele `zst`.
+- `Socket.*` w celach js/php/rust/cpp.
+- Prawdziwy frontend `cc1` dla gcc (zzc jest sterownikiem).
 
 ## Bootstrap
 
