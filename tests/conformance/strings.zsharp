@@ -1,0 +1,18 @@
+# napisy bajtowe UTF-8
+$s = "zażółć gęślą jaźń";
+echo strlen($s), count($s), strlen("é"), strlen("😀");
+echo substr($s, 0, 2), "|", substr($s, 2, 3), "|", substr($s, -4), "|", substr($s, 3), "|", substr("abc", 1, -1);
+echo index_of($s, "gęś"), index_of($s, "zzz"), contains($s, "ółć"), starts_with($s, "za"), ends_with($s, "jaźń");
+echo upper("abc"), lower("ABC"), trim("  \t x y \n"), repeat("ab", 3), repeat("x", 0);
+echo replace("a-b-c", "-", "+"), join(["a", 1, 2.5, true, null], ","), join([], ",");
+echo split("a,b,,c", ","), split("żó", ""), chars("aé😀");
+echo reverse("abé"), reverse([1, 2, 3]);
+echo pad_left("7", 3, "0"), pad_right("ab", 5, "."), pad_left("żż", 4), pad_right("x", 0);
+echo ord("A"), ord("ż"), chr(65), chr(380), chr(128512), chr(-1) === "";
+echo $s[0], $s[2], "ż" . 1 . 2.0 . true . null . [1, 2];
+echo is_digit("5x"), is_digit("x5"), is_alpha("ż"), is_alnum("_"), is_space(" "), is_hex_digit("f"), is_hex_digit("g");
+dump("a\"b\\c\nd\te"); dump([1, "x" => [true, null, 1.5], 3 => "z"]);
+echo strval(12), strval(1.0), strval(false), strval([]), boolval("0"), boolval("a"), boolval([]), boolval(0.0);
+try { echo $s[1]; } catch (Exception $e) { echo "E:", $e->getMessage(); }
+try { echo $s[999]; } catch (Exception $e) { echo "E:", $e->getMessage(); }
+echo $s[1] ?? "quiet", $s[999] ?? "none";
