@@ -617,7 +617,10 @@ V b_zs_sset(V name, V v) { if (g_statics.tag != ZS_ARRAY) { uint32_t sv = zm_tgt
 V b_zs_no_class(V name) { zs_die("nieznana klasa %s", name.u.s->d); }
 
 /* ───────── wyjście ───────── */
-void zs_init(int argc, char **argv) { g_argc = argc; g_argv = argv; zs_cur_exc = zv_null(); zm_init(); }
+void zs_init(int argc, char **argv) {
+    /* ZS_ARG0: launcher (zsi) podaje ścieżkę skryptu jako argv[0], jak interpreter; zmienna nie przecieka do procesów potomnych */
+    { const char *a0 = getenv("ZS_ARG0"); if (a0 && *a0 && argc > 0) { argv[0] = strdup(a0); unsetenv("ZS_ARG0"); } }
+    g_argc = argc; g_argv = argv; zs_cur_exc = zv_null(); zm_init(); }
 void zs_shutdown(void) { fflush(stdout); zm_report(); }
 static void out_text(FILE *f, V v) { if (v.tag == ZS_STR) fwrite(v.u.s->d, 1, (size_t)v.u.s->len, f); else { Buf b = {0}; text_into(&b, v, 0); fwrite(b.d, 1, b.n, f); free(b.d); } }
 void zs_echo_v(V v, int first) { if (!first) fputc(' ', stdout); out_text(stdout, v); }
@@ -926,6 +929,7 @@ void zl_try_enter(ZsHandler *h) { zs_try_push(h); }
 void zl_try_leave(ZsHandler *h) { zs_h = h->prev; }
 V zl_cur_exc(void) { return zs_cur_exc; }
 void zl_foreach_die(V it) { zs_die("foreach wymaga tablicy, jest %s", zv_tn(it)); }
+V zl_undef_var(const char *name) { zs_die("niezdefiniowana zmienna $%s", name); return zv_null(); }
 
 
 /* ───────── rozszerzenia systemowe (Std.Os / Std.Time / Std.Net) ───────── */
