@@ -31,6 +31,7 @@ class LlEmitter {
     public $curFunc;
     public $term;       # czy bieżący blok jest zakończony
     public $vol;        # "volatile " w funkcjach z try
+    public $known;      # zmienne zadeklarowane w bieżącej funkcji (odczyt innej = błąd w czasie wykonania)
     public $slotN;
 
     public func __construct($ir) {
@@ -439,10 +440,20 @@ class LlEmitter {
         if ($k === ":Str") {
             $i = $this->strSlot($e[2]);
             $p = $this->r();
-            $this->line($p . " = getelementptr inbounds [" . "STRCOUNT" . " x { i64, i64 }], ptr @S, i64 0, i64 " . $i);
+            $this->line($p . " = getelementptr inbounds { i64, i64 }, ptr @S, i64 " . $i);
             return $this->loadFrom($p);
         }
-        if ($k === ":Var") { return $this->load($e[2]); }
+        if ($k === ":Var") {
+            if (!in_array($e[2], $this->known)) {
+                $this->setLine($e[1]);
+                return $this->rt("zl_undef_var", "V", [["ptr", $this->cstr($e[2])]]);
+            }
+            return $this->load($e[2]);
+        }
+        if ($k === ":New") {
+            $msg = count($e[3]) > 0 ? $this->expr($e[3][0][3]) : $this->emptyStr();
+            return $this->rt("zv_exc_new", "V", [["i32", $e[2] === "Error" ? "1" : "0"], ["V", $msg]]);
+        }
         if ($k === ":Array") {
             $arr = $this->rt("zv_arr_new", "V", [["i64", "" . count($e[2])]]);
             foreach ($e[2] as $it) {
@@ -713,8 +724,10 @@ class LlEmitter {
         if ($k === ":Expr") { $this->setLine($line); $this->expr($s[2]); return; }
         if ($k === ":Echo") {
             $this->setLine($line);
+            $vals = [];
+            foreach ($s[2] as $e) { $vals[] = $this->expr($e); }
             $first = 1;
-            foreach ($s[2] as $e) { $x = $this->expr($e); $this->rt("zs_echo_v", "void", [["V", $x], ["i32", "" . $first]]); $first = 0; }
+            foreach ($vals as $x) { $this->rt("zs_echo_v", "void", [["V", $x], ["i32", "" . $first]]); $first = 0; }
             $this->rt("zs_echo_end", "void", []);
             return;
         }
@@ -941,7 +954,7 @@ class LlEmitter {
     func emptyStr() {
         $i = $this->strSlot("");
         $p = $this->r();
-        $this->line($p . " = getelementptr inbounds [STRCOUNT x { i64, i64 }], ptr @S, i64 0, i64 " . $i);
+        $this->line($p . " = getelementptr inbounds { i64, i64 }, ptr @S, i64 " . $i);
         return $this->loadFrom($p);
     }
 
@@ -956,6 +969,7 @@ class LlEmitter {
     }
 
     func initLocals($locals, $params) {
+        $this->known = $locals;
         foreach ($locals as $n) {
             $this->allocas[] = "  " . $this->ident($n) . " = alloca { i64, i64 }, align 8";
         }
@@ -1060,7 +1074,7 @@ class LlEmitter {
         $i = 0;
         foreach ($this->strList as $s) {
             $o[] = "  %r" . $i . " = call { i64, i64 } @zv_strn(ptr @.s" . $i . ", i64 " . strlen($s) . ")";
-            $o[] = "  %p" . $i . " = getelementptr inbounds [" . $sc . " x { i64, i64 }], ptr @S, i64 0, i64 " . $i;
+            $o[] = "  %p" . $i . " = getelementptr inbounds { i64, i64 }, ptr @S, i64 " . $i;
             $o[] = "  store { i64, i64 } %r" . $i . ", ptr %p" . $i . ", align 8";
             $i++;
         }
@@ -1089,8 +1103,7 @@ class LlEmitter {
             $o[] = "  ret i32 %rc";
         }
         $o[] = "}";
-        $text = join($o, "\n") . "\n";
-        return replace($text, "STRCOUNT", "" . $sc);
+        return join($o, "\n") . "\n";
     }
 
     func decls() {
@@ -1109,6 +1122,7 @@ class LlEmitter {
         $d[] = "declare void @zl_try_leave(ptr)";
         $d[] = "declare { i64, i64 } @zl_cur_exc()";
         $d[] = "declare void @zl_foreach_die(" . $v . ")";
+        $d[] = "declare { i64, i64 } @zl_undef_var(ptr)";
         $d[] = "declare i32 @_setjmp(ptr) #0";
         $d[] = "@zs_line = external global i64, align 8";
         $d[] = "declare i32 @zv_truthy(" . $v . ")";
