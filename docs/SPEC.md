@@ -1171,3 +1171,19 @@ stage0 plan jest taki ze bedzie napisany w rust (bedzie to sam zsc) natomiast zs
 
 
 > **Uwaga (M4):** założenie „bez GC / ZAMM" jest zrealizowane w runtime natywnym (chained arenas, promocja ucieczek, regiony pętli) — patrz `docs/MEMORY.md`.
+
+## Zachowanie runtime natywnego (definicja odniesienia)
+
+Od sesji „niezależność od stage0” definicją zachowania jest runtime natywny (`runtime/native/zs_rt.c`) i jego odpowiedniki w celach `zst`.
+Szczegóły, które różniły się od dawnego interpretera:
+
+- **`echo`/`necho`/`eecho`**: wszystkie argumenty są obliczane przed wypisaniem pierwszego.
+- **`upper`, `lower`**: tylko litery ASCII; pozostałe bajty bez zmian.
+- **`replace($s, "", $x)`**: zwraca `$s` bez zmian.
+- **Nieznana funkcja**: błąd kompilacji `E0103` w `zsc/zzc/zst`.
+- **Odczyt niezdefiniowanej zmiennej**: błąd wykonania `niezdefiniowana zmienna $x`.
+- **`new Exception/Error`** jest zwykłym wyrażeniem (można przypisać do zmiennej i rzucić później).
+- **Liczby całkowite**: int64, przepełnienie `+ - * ** unary -` to wyjątek `przepełnienie liczby całkowitej`; `/` daje int tylko gdy dzielenie jest dokładne.
+- **Napisy**: bajty UTF-8; `strlen`/`substr`/`index_of`/indeksowanie po bajtach, wynik `substr` jest poprawiany do poprawnego UTF-8 (jak `from_utf8_lossy`).
+- **`Process.run`** nieistniejącego polecenia: `status` 127 i komunikat w `stderr`.
+- **`Socket.*`**: dostępne w celu c i w `zsc`; w pozostałych celach `zst` → błąd wykonania.
