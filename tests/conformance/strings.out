@@ -1,0 +1,17 @@
+26 26 2 4
+za | ż� | źń | �ółć gęślą jaźń | b
+11 -1 true true true
+ABC abc x y ababab 
+a+b+c a,1,2.5,true,null 
+["a", "b", "", "c"] ["ż", "ó"] ["a", "é", "😀"]
+éba [3, 2, 1]
+007 ab...   żż x
+65 197 A ż 😀 true
+z ż ż12.0truenull[1, 2]
+true false true true true true false
+"a\"b\\c\nd\te"
+[0 => 1, "x" => [true, null, 1.5], 3 => "z"]
+12 1.0 false [] false true false false
+a
+E: indeks 999 poza zakresem tekstu (długość 26)
+a none
