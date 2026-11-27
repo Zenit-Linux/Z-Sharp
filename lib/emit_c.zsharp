@@ -21,6 +21,7 @@ class Emitter {
     public $tries;      # stos [rodzaj catch|finally, uchwyt, instrukcje finally]
     public $hid;
     public $fnCounts;   # ZAMM: liczba wystąpień zmiennych w bieżącej funkcji
+    public $known;      # zmienne zadeklarowane w bieżącej funkcji
     public $rdStack;    # ZAMM: stos regionów pętli (lista zmiennych przenoszonych albo null, gdy pętla w try)
 
     public func __construct($ir) {
@@ -212,14 +213,18 @@ class Emitter {
         $a = $this->args($list, false);
         if ($name === "eecho") {
             $s = "({ ";
+            $i = 0;
+            foreach ($a as $x) { $s .= "V _ea" . $i . " = " . $x . "; "; $i++; }
             $first = 1;
-            foreach ($a as $x) { $s .= "zs_eecho_v(" . $x . ", " . $first . "); "; $first = 0; }
+            for ($j = 0; $j < $i; $j++) { $s .= "zs_eecho_v(_ea" . $j . ", " . $first . "); "; $first = 0; }
             if (count($a) === 0) { $s .= "fflush(stdout); "; }
             return $s . "zs_eecho_end(); zv_null(); })";
         }
         if ($name === "necho") {
             $s = "({ ";
-            foreach ($a as $x) { $s .= "zs_necho_v(" . $x . "); "; }
+            $i = 0;
+            foreach ($a as $x) { $s .= "V _na" . $i . " = " . $x . "; "; $i++; }
+            for ($j = 0; $j < $i; $j++) { $s .= "zs_necho_v(_na" . $j . "); "; }
             return $s . "zv_null(); })";
         }
         if ($name === "push") {
@@ -254,7 +259,14 @@ class Emitter {
         if ($k === ":Int") { return "zv_int(INT64_C(" . $e[2] . "))"; }
         if ($k === ":Float") { return "zv_float(" . $this->floatLit($e[2]) . ")"; }
         if ($k === ":Str") { return $this->strRef($e[2]); }
-        if ($k === ":Var") { return $this->ident($e[2]); }
+        if ($k === ":Var") {
+            if (!in_array($e[2], $this->known)) { return "(L(" . $e[1] . "), zl_undef_var(\"" . $this->cesc($e[2]) . "\"))"; }
+            return $this->ident($e[2]);
+        }
+        if ($k === ":New") {
+            $msg = count($e[3]) > 0 ? $this->expr($e[3][0][3]) : $this->strRef("");
+            return "zv_exc_new(" . ($e[2] === "Error" ? 1 : 0) . ", " . $msg . ")";
+        }
         if ($k === ":Array") {
             $a = $this->t("arr");
             $s = "({ V " . $a . " = zv_arr_new(" . count($e[2]) . "); ";
@@ -437,8 +449,10 @@ class Emitter {
         if ($k === ":Expr") { $out[] = $p . "L(" . $line . "); (void)(" . $this->expr($s[2]) . ");"; }
         else if ($k === ":Echo") {
             $out[] = $p . "L(" . $line . "); {";
+            $i = 0;
+            foreach ($s[2] as $e) { $out[] = $p . "    V _ev" . $i . " = " . $this->expr($e) . ";"; $i++; }
             $first = 1;
-            foreach ($s[2] as $e) { $out[] = $p . "    zs_echo_v(" . $this->expr($e) . ", " . $first . ");"; $first = 0; }
+            for ($j = 0; $j < $i; $j++) { $out[] = $p . "    zs_echo_v(_ev" . $j . ", " . $first . ");"; $first = 0; }
             $out[] = $p . "    zs_echo_end(); }";
         }
         else if ($k === ":Block") { $out[] = $p . "{"; foreach ($this->block($s[2], $ind + 1) as $l) { $out[] = $l; } $out[] = $p . "}"; }
@@ -594,6 +608,7 @@ class Emitter {
     }
 
     func decls($locals, $params, $vol) {
+        $this->known = $locals;
         $out = [];
         $ty = $vol ? "volatile V " : "V ";
         foreach ($locals as $n) {
