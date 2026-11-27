@@ -1,5 +1,22 @@
 # Zmiany (wersja pozostaje 0.0.1)
 
+## Sesja „niezależność od stage0”
+- **bootstrap**: `bootstrap/bootstrap.sh` — stage0 (ziarno `c|ll|js|php`) → stage1..stage4, identyczny LLVM IR i binarki, narzędzia natywne, test zgodności. Rust niepotrzebny.
+- **zsc**: wyłącznie backend LLVM >= 21 (`opt`→`llc`→linker), moduł `llvmtool`, wykrywanie/wymuszanie wersji, cache obiektu runtime, emisje `exe/obj/asm/bc/ll/ir/zbc`, `-O*`, `--target`; usunięta ścieżka C.
+- **lib/emit_llvm**: błąd — tekstowa podmiana znacznika `STRCOUNT` psuła literały napisów (np. w `zsc`); GEP po typie elementu.
+- **lib/ir, emit_llvm, emit_c**: `new Exception/Error` jako wyrażenie; odczyt niezdefiniowanej zmiennej → błąd wykonania (`zl_undef_var`); argumenty `echo` obliczane przed wypisaniem.
+- **runtime**: `ZS_ARG0` (launcher podaje `args()[0]`), `zl_undef_var`.
+- **zst**: pełne cele js, php (IR, nie składniowo), c, **cpp**, **rust** (wspólny emiter spłaszczający `flat.zsharp`), runtimes `zs_runtime.{js,php,rs,hpp}`, bundle, `--run`, `--check`.
+- **zzc**: linker modułów (klasy, domknięcia, importy), cache obiektu runtime, `run`, `--dry-run`.
+- **zsi**: uruchamianie bez stage0 (natywnie + cache), `--legacy` dla stage0.
+- **testy**: `tests/conformance`, `tests/run_conformance.sh`, `tests/run.sh` w każdym narzędziu.
+
+## Poprawki budowy stage0
+- `stage0/Cargo.toml`: zależność `runtime` wskazywała pakiet o nazwie `zs-runtime` — dodano `package = "zs-runtime"` (inaczej `cargo build` kończy się błędem „no matching package found”).
+- `stage0/zs-parser/src/ast.rs`, `dump.rs`: dodano brakujący wariant `ExprKind::Spread` używany przez parser, interpreter i VM (inaczej błąd E0599 / E0004).
+
+# Zmiany (wersja pozostaje 0.0.1)
+
 ## Sesja „zenitd jako poligon: extern w stage0"
 - **stage0**: wywołania `extern "c"` w interpreterze (`zs-interp/src/ffi.rs`): dlsym + do 6 argumentów całkowitych; `string` ↔ `char *` (null ↔ NULL). `zsc0 run`, `exec` i bundle uruchamiają teraz kod z libc (dotąd: błąd „linkowanie extern tylko w zsc").
 - **stage0**: `zsc0 bundle <pakiet.zbc> -o <wyjście>` — brakowało go w `main.rs`, mimo że `scripts/fixpoint.zsharp` go wołał (etap „standalone zsc" kończył się błędem).
