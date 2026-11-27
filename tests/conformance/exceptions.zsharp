@@ -1,0 +1,41 @@
+# wyjątki: try/catch/finally, przechodzenie przez funkcje, return w finally-owym kontekście
+function thrower($n) { if ($n > 2) { throw new Exception("too big: " . $n); } return $n; }
+function wrap($n) {
+    try { return thrower($n); }
+    catch (Exception $e) { return "caught " . $e->getMessage(); }
+    finally { echo "finally", $n; }
+}
+echo wrap(1), wrap(5);
+class MyErr extends Exception { public $code2 = 7; }
+function custom() { throw new MyErr("mine"); }
+try { custom(); } catch (MyErr $e) { echo "MyErr", $e->getMessage(), $e->code2; }
+try { custom(); } catch (Exception $e) { echo "as Exception", $e->getMessage(); }
+$log = [];
+function nested() {
+    global_log("start");
+    try {
+        try { throw new Exception("inner"); }
+        finally { global_log("inner-finally"); }
+    } catch (Exception $e) { global_log("outer:" . $e->getMessage()); }
+    return "done";
+}
+function global_log($m) { echo $m; }
+echo nested();
+function loopy() {
+    $r = [];
+    for ($i = 0; $i < 4; $i++) {
+        try {
+            if ($i == 1) { continue; }
+            if ($i == 3) { break; }
+            $r[] = $i;
+        } finally { $r[] = "f" . $i; }
+    }
+    return $r;
+}
+echo loopy();
+try { throw new Error("err"); } catch (Error $e) { echo "Error:", $e->getMessage(); }
+try { throw new Exception("e"); } catch (Error $e) { echo "wrong"; } catch (Exception $e) { echo "right"; }
+$saved = new Exception("kept");
+try { throw $saved; } catch (Exception $e) { echo $e->getMessage(); }
+function rethrow() { try { throw new Exception("orig"); } catch (Exception $e) { throw $e; } }
+try { rethrow(); } catch (Exception $e) { echo "re:", $e->getMessage(); }
