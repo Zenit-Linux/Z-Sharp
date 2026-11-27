@@ -1,42 +1,10 @@
-# klasy, dziedziczenie, statyki, stałe, domknięcia
-class Animal {
-    public $name;
-    public static $count = 0;
-    const KIND = "animal";
-    function __construct($name) { $this->name = $name; self.count++; }
-    function speak() { return $this->name . " makes a sound"; }
-    function describe() { return $this->speak() . " (" . self.KIND . ")"; }
-    static func total() { return self.count; }
-}
-class Dog extends Animal {
-    public $tricks = [];
-    function speak() { return $this->name . " barks"; }
-    function learn($t) { $this->tricks[] = $t; return $this; }
-    function loud() { return upper(parent.speak()); }
-}
-$d = new Dog("Rex");
-$d->learn("sit")->learn("roll");
-echo $d->describe(), $d->tricks, $d->loud(), Animal.total();
-$a = new Animal("Generic");
-echo $a->speak(), Animal.total(), Dog.total();
-$d2 = $d;
-$d2->name = "Max";
-echo $d->name;
-$c = 0;
-$inc = func() { $c = $c + 1; return $c; };
-echo $inc(), $inc(), $c;
-$mul = func($x) { return func($y) { return $x * $y; }; };
-$triple = $mul(3);
-echo $triple(14), $mul(2)(8);
-$fns = [];
-for ($i = 0; $i < 3; $i++) { $fns[] = fn() => $i * $i; }
-echo $fns[0](), $fns[1](), $fns[2]();
-function apply($f, $v) { return $f($v); }
-echo apply(func($z) { return $z + 1; }, 41), apply(fn($z) => $z * 2, 21);
-class Box { public $items = []; function add($x) { $this->items[] = $x; } function all() { return $this->items; } }
-$b = new Box(); $b->add(1); $b->add([2, 3]);
-$snapshot = $b->all();
-$b->add(4);
-echo $snapshot, $b->all(), count($b->items);
-try { $nope = null; echo $nope->x; } catch (Exception $e) { echo "E:", $e->getMessage(); }
-try { $d->fly(); } catch (Exception $e) { echo "E:", $e->getMessage(); }
+Rex barks (animal) ["sit", "roll"] REX MAKES A SOUND 1
+Generic makes a sound 2 2
+Max
+1 1 0
+42 16
+0 1 4
+42 42
+[1, [2, 3]] [1, [2, 3], 4] 3
+E: dostęp do właściwości `x` wartości null
+E: klasa Dog nie ma metody fly
