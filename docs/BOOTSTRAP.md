@@ -1,57 +1,53 @@
-# Bootstrap Z# (0.0.1)
+# Bootstrap Z# bez stage0 (Rust)
 
-| Etap | Co | Stan |
+Z# buduje się sam, a droga startowa **nie wymaga Rusta**. Wystarczy jedno z czterech ziaren w `bootstrap/seed/`.
+
+```
+sh bootstrap/bootstrap.sh                 # SEED=c (domyślnie): potrzebny tylko kompilator C11 + LLVM >= 21 (llc/opt/clang)
+SEED=ll  sh bootstrap/bootstrap.sh        # ziarno = LLVM IR kompilatora (llc >= 21 + kompilator C dla runtime)
+SEED=js  sh bootstrap/bootstrap.sh        # ziarno = zsc przetranspilowany do JS (Node >= 16)
+SEED=php sh bootstrap/bootstrap.sh        # ziarno = zsc przetranspilowany do PHP (PHP >= 8.1)
+SEED=rust sh bootstrap/bootstrap.sh       # starszy interpreter stage0 (cargo) — tylko zgodność wsteczna
+```
+
+Układ: katalog z podkatalogami `Z-Sharp`, `zsc`, `zst`, `zzc`, `zsi` (nazwy z sufiksem `-main` też są rozpoznawane).
+Wynik: `$OUT/bin/{zsc,zst,zzc,zsi,z#}` oraz `$OUT/share/z-sharp/` (runtime, stdlib). Narzędzia same znajdują runtime
+względem swojej binarki, więc `ZS_HOME` nie jest potrzebne po instalacji.
+
+## Etapy
+
+| Etap | Co | Z czego |
 |---|---|---|
-| **stage0** | interpreter AST w Rust (`zsc0`): `run` (źródła) i `exec` (pakiet `.zbc`) | działa |
-| **stage1-front** | lekser + parser w Z# (`lib/lexer.zsharp`, `lib/parser.zsharp`) | działa; parytet z Rust (`scripts/tests/*_parity.zsharp`), w tym samoparsowanie |
-| **stage1-sem** | analiza semantyczna + analiza ucieczki (`lib/sema.zsharp`) → klasy ZAMM | działa; 0 ostrzeżeń na własnych źródłach |
-| **stage1-pack** | `.zbc` (`lib/zbc.zsharp`): program bez źródeł, deterministyczny | działa |
-| **punkt stały** | `zsc` (z `.zbc`) kompiluje samego siebie: s1 == s2 == s3 | **działa** (`scripts/fixpoint.zsharp`) |
-| **stage1-core** | ZAMM (`zamm/*.zsharp`) i runtime (`runtime/main.zsharp`) napisane w Z#, 1:1 z referencją w Rust | działa; `tests/zamm_test.zsharp` (39 asercji), `tests/runtime_test.zsharp` (16) |
-| **stage1-ir** | Z# IR strukturalne (`lib/ir.zsharp`): lowering, walidacja, lokalne, `--emit ir` | działa (SSA i bytecode VM: do zrobienia) |
-| **stage2** | backend C (`lib/emit_c.zsharp`) → `cc` + własny runtime w C (`runtime/native/zs_rt.c`, bez Rusta): `zsc build` daje binarkę natywną | działa dla podzbioru; testy różnicowe interpreter↔natywny (`zsc/tests/native/run_diff.sh`) |
-| **stage2-llvm** | backend LLVM (`lib/emit_llvm.zsharp`): tekstowy `.ll` → `clang`, ten sam runtime, `--target <triple>` | działa dla podzbioru; te same testy różnicowe (C i LLVM: 12/12) |
-| **stage3-bundle** | `zsc0 bundle`: binarka = runtime + wbudowany pakiet `.zbc`; `zsc`, `zsi`, `zst`, `zzc`, `z#` jako pojedyncze pliki wykonywalne bez źródeł | działa (`scripts/fixpoint.zsharp` kończy się budową standalone `zsc`) |
-| **stage3-native** | `zsc` skompilowany **natywnie** (C/LLVM) kompiluje `zsc` | **działa**: `scripts/stage3.zsharp` (zsc2→zsc3→zsc4, C identyczny z interpreterem) |
+| stage0 | `zsc` zbudowany z **ziarna** | `seed/zsc-seed.{c,ll,js,php}` |
+| stage1 | `zsc` zbudowany natywnie (LLVM) | stage0 kompiluje źródła `zsc/src` |
+| stage2 | j.w. | stage1 kompiluje źródła `zsc/src` |
+| stage3 | j.w. | stage2 |
+| stage4 | j.w. | stage3 |
+| narzędzia | `zst`, `zzc`, `zsi`, `z#` | kompiluje je stage4 |
+| test | zgodność (7 programów × 6–8 dróg) | tylko narzędzia natywne |
 
-## Co dokładnie dowodzi punkt stały
-* s1: `zsc` uruchomiony **ze źródeł** (parsowanych przez Rust) pakuje własne źródła.
-* s2: `zsc` uruchomiony **z s1.zbc** — kompilator wykonuje się bez parsowania własnych źródeł w Rust — pakuje te same źródła.
-* s3: to samo z s2.zbc. Warunek: s1 == s2 == s3 bajt w bajt.
+Kryteria przejścia (sprawdza skrypt):
 
-To jest bootstrap **frontendu i pakera** (stage1). Wykonawcą nadal jest Rust (`zsc0 exec`), tak jak VM dla Lua/Python.
-Pełny bootstrap (stage3) wymaga backendu, który emituje kod niezależny od stage0 — to następny krok: Z# IR, bytecode/VM lub LLVM.
+1. LLVM IR emitowany dla `zsc` przez stage1, stage2, stage3 i stage4 jest **identyczny** (≈193 tys. linii).
+2. Binarki stage2 = stage3 = stage4 (bit w bit).
+3. Ziarno jest aktualne, gdy stage0 emituje ten sam IR (w przeciwnym razie ostrzeżenie; odśwież `UPDATE_SEED=1`).
 
-## Format `.zbc`
-Tekst: `ZBC 1`, potem sekcje `@@module <ścieżka importu>` i `@@entry`, jedna instrukcja AST (S-expression, `docs/AST.md`) na linię.
-Ograniczenie: pakowane są importy najwyższego poziomu pliku; klucz modułu = ścieżka importu zapisana w kodzie (konflikt → błąd).
+Zweryfikowane: wszystkie cztery ziarna (`c`, `ll`, `js`, `php`) prowadzą do **tej samej binarki** `zsc`.
+Dodatkowo `zsc` przetranspilowany przez `zst` do **JS, PHP, C, C++ i Rust** kompiluje samego siebie do identycznego IR
+(samohosting każdego celu `zst`).
 
-## `main` nie jest wymagane
-Program może składać się z samego kodu najwyższego poziomu. Jeśli zdefiniowano `func main` i nie wywołano go jawnie,
-runtime wywołuje je po kodzie najwyższego poziomu; zwrócona liczba całkowita to kod wyjścia procesu.
+## Co znaczy „porzucenie stage0”
 
-## Weryfikacja
-`scripts/bootstrap.zsharp`: build, testy Rust (manifest, ZAMM, runtime, czytnik AST), test złoty, `nomain`, parytet leksera/parsera,
-sema (złoty + 0 ostrzeżeń), manifesty, narzędzia, punkt stały, `zsi` na `.zbc`, ABI C.
+- Rust nie jest potrzebny do zbudowania ani używania żadnego narzędzia. `stage0/` i `Cargo.toml` pozostają w repozytorium
+  wyłącznie jako ścieżka zgodności wstecznej (`SEED=rust`, `zsi --legacy`) oraz jako źródło oczekiwanych wyników starszych testów.
+- Oczekiwane wyniki testów zgodności (`tests/conformance/*.out`, `*.rc`) są zapisane w repozytorium; testy ich nie generują.
+- Aktualizacja ziaren: `UPDATE_SEED=1 sh bootstrap/bootstrap.sh` (używa stage4 i `zst`).
+- Zależności zewnętrzne: kompilator C11 (runtime `zs_rt.c`) oraz **LLVM >= 21** (`opt`, `llc`, `clang` jako sterownik linkera).
+  Runtime w C jest jedynym kodem nie-Z# na drodze kompilacji; `zsc` kompiluje go raz do cache i nie generuje C dla programów.
 
-## Bootstrap rdzenia (lib + zamm + runtime)
-| człon | w Z# | ziarno w Rust | weryfikacja |
-|---|---|---|---|
-| lexer, parser | `lib/lexer.zsharp`, `lib/parser.zsharp` | `stage0/zs-lexer`, `zs-parser` | parytet pozycji tokenów i AST (`scripts/tests/*_parity.zsharp`) |
-| manifest (`Z#.toml`) | `lib/manifest.zsharp` | `stage0/zs-manifest` | `tests/manifest_test.zsharp` + parytet wyjścia `zsc0 manifest` (`scripts/tests/manifest_parity (zsc0 manifest)`) |
-| sema, zbc, ir, emit_c | `lib/*.zsharp` | — (tylko Z#) | golden sema, punkt stały, testy różnicowe |
-| ZAMM | `zamm/*.zsharp` | `stage0/zamm` | `tests/zamm_test.zsharp` odpowiada `zamm/tests/zamm.rs` |
-| runtime | `runtime/main.zsharp` | `stage0/runtime` | `tests/runtime_test.zsharp` odpowiada `runtime/tests/abi.rs` |
+## Ograniczenia (stan zweryfikowany)
 
-Model pamięci w Z#: stage0 nie ma surowej pamięci, więc ZAMM w Z# działa na **symulowanej przestrzeni adresowej** (`zamm/chunk.zsharp`:
-adresy chunków, rzadka mapa komórek, poison `0xDD`). Cała logika (przesuwanie wskaźnika, wyrównanie, rewind, pula, LOS, generacje uchwytów,
-`pop_frame_returning`) jest prawdziwym kodem Z#; różnica względem Rusta to brak bajtów (komórka = wartość; napisy w komórkach to znaki, rozmiar w bajtach UTF-8).
-`scripts/core_status.zsharp` pokazuje, ile każdego członu jest w Z#, a ile w ziarnie.
-
-## Backend natywny (zsc)
-`zsc build x.zs` → AST → sema → IR → C (`emit_c`) → `cc` + `libzs_runtime.a`. Kolejność ewaluacji lewa→prawa, tablice mają semantykę wartości,
-komunikaty błędów i numery linii są takie jak w stage0 (testowane różnicowo). Konstrukcje spoza podzbioru kończą się błędem `E0101…E0107`. Wyjątki: `setjmp/longjmp`, lokalne `volatile` w funkcjach z `try`, hierarchia jak w stage0 (`Error extends Exception`).
-
-## Dwa rodzaje „niezależności" (uczciwie)
-1. **Standalone (jest):** wykonywalny plik zawiera runtime (kopię stage0) i program jako `.zbc`. Odbiorca nie potrzebuje źródeł ani zsc0, ale w pliku nadal wykonuje się interpreter z Rusta.
-2. **Natywna (częściowo):** kod natywny z C lub LLVM na runtime napisanym w C — bez Rusta w ogóle. Dziś tylko dla podzbioru języka (funkcje/tablice/napisy/wyjątki). Samokompilacja `zsc` natywnie wymaga klas, modułów i domknięć w backendach — patrz `docs/STATUS.md`.
+- Sprawdzone wyłącznie na **Linux x86-64** z LLVM **21.1.8**, gcc/g++ 13.3, Node 22, PHP 8.3.6, rustc 1.75.
+  macOS, Windows, aarch64 i kompilacja skrośna (`--target`) nie były testowane.
+- Odrzucenie za starego LLVM jest przetestowane (`zsc/tests/run.sh`); `--allow-older-llvm` obniża próg do 17 bez gwarancji.
+- Samohosting przez cel Rust i C++ działa, ale budowa trwa dłużej (kilkadziesiąt sekund do kilkunastu minut zależnie od `-O`).
