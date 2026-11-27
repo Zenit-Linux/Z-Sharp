@@ -200,6 +200,7 @@ class Lowerer {
             return;
         }
         if ($k === ":Call") { $this->checkCall($e); return; }
+        if ($k === ":New") { $this->checkNew($e); return; }
         $this->err($line, "E0102", "wyrażenie " . substr($k, 1) . " niedostępne w backendzie natywnym 0.0.1");
     }
 
