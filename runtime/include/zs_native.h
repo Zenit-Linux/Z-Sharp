@@ -121,5 +121,6 @@ void zl_try_enter(ZsHandler *h);
 void zl_try_leave(ZsHandler *h);
 V zl_cur_exc(void);
 void zl_foreach_die(V it) __attribute__((noreturn));
+V zl_undef_var(const char *name);
 
 #endif
