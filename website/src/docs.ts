@@ -1,12 +1,17 @@
 import { DOCS } from "./data";
 import { renderMarkdown, type Rendered } from "./markdown";
 
+declare global { interface Window { __ZS_CONTENT__?: Record<string, string>; } }
+
 const cache = new Map<string, Promise<string>>();
 
 /** Dokumenty są kopiowane przez scripts/build.mjs do website/dist/content/. Ścieżka względem index.html. */
 export const CONTENT_BASE = "website/dist/content/";
 
 export function loadText(file: string): Promise<string> {
+  // dokumenty wbudowane przez scripts/build.mjs — działa bez serwera (file://) i bez dodatkowych żądań
+  const embedded = typeof window !== "undefined" ? window.__ZS_CONTENT__?.[file] : undefined;
+  if (embedded !== undefined) return Promise.resolve(embedded);
   let p = cache.get(file);
   if (!p) {
     p = fetch(CONTENT_BASE + file).then((r) => {
