@@ -8,5 +8,5 @@ zs-lexer = { path = "zs-lexer" }
 zs-parser = { path = "zs-parser" }
 zs-interp = { path = "zs-interp" }
 zs-manifest = { path = "zs-manifest" }
-runtime =  { path = "runtime" }
+zs-runtime = { path = "runtime" }
 zamm = { path = "zamm" }
