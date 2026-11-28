@@ -47,14 +47,12 @@ jobs:
       - name: Typy (tsc)
         run: npx tsc --noEmit
 
-      - name: Build
+      - name: Testy strony
+        run: npm test
+
+      - name: Build (dist/app.js, dist/app.css, dokumenty wbudowane)
         run: |
-          rm -rf dist
-          if [ -x node_modules/.bin/esbuild ]; then
-            npx esbuild src/*.ts --bundle --format=esm --outdir=dist
-          else
-            npx tsc --noEmit false --module ESNext --moduleResolution node --outDir dist
-          fi
+          npm run build
           ls -la dist
 
       - name: Złóż artefakt strony (układ jak w repozytorium)
@@ -64,9 +62,8 @@ jobs:
           rm -rf _site
           mkdir -p _site/website/dist
           cp index.html _site/index.html
-          if [ -d website/dist ] && [ "$(ls -A website/dist)" ]; then
-            cp -r website/dist/. _site/website/dist/
-          fi
+          test -s website/dist/app.js && test -s website/dist/app.css
+          cp -r website/dist/. _site/website/dist/
           if [ -d docs ]; then
             cp -r docs _site/docs
           fi
