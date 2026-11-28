@@ -3,7 +3,7 @@ const KEY = "zsharp-theme";
 
 export function currentTheme(): Theme {
   try { const s = localStorage.getItem(KEY); if (s === "light" || s === "dark") return s; } catch { /* brak dostępu do storage */ }
-  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
 
 export function applyTheme(t: Theme): void {
